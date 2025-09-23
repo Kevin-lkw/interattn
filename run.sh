@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=3 python train.py config/train_shakespeare_char.py

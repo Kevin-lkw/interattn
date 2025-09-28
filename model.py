@@ -14,7 +14,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from setattn import build_set_aggr,build_set_policy
+from setattn import CausalSetAttention, FastCausalSetAttention
+from linearattn import CausalLinearAttention
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -26,70 +27,6 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSetAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # set
-        self.set_number = config.set_number
-        self.set_policy = build_set_policy(config.set_policy,self.set_number)
-        self.set_aggr = build_set_aggr(config.set_aggr)
-        # print("initialize Set Attention, setnumber = ",self.set_number, "," \
-        #     ", set_poilcy = ",config.set_policy, ", set_aggr = ",config.set_aggr)
-    def forward(self,x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # implement set attnetion
-        output = torch.zeros_like(q)  # (B, nh, T, hs)
-        import time;
-        # t0=time.time()
-        self.set_aggr.reset()
-        for t in range(T):
-            k_t = k[:, :, t, :]  # (B, nh, hs)
-            v_t = v[:, :, t, :]  # (B, nh, hs)
-            q_t = q[:, :, t, :]  # (B, nh, hs)
-
-            # Divide [0, t] into `set_number` groups using the set policy
-            sets = self.set_policy.divide(t)  # List[List[int]]
-            self.set_aggr.insert(k_t,v_t)
-            keys,vals = self.set_aggr(sets,q_t) # List of tensor (B,nh,hs)
-
-            # Stack aggregated K and V: (B, nh, num_sets, hs)
-            # print("len = ",len(keys),"shape = ",keys[0].shape)
-
-            K = torch.stack(keys, dim=2)
-            V = torch.stack(vals, dim=2)
-
-            # Scaled dot-product attention
-            q_t_exp = q_t.unsqueeze(2)  # (B, nh, 1, hs)
-            att = torch.matmul(q_t_exp, K.transpose(-2, -1)) / (K.size(-1) ** 0.5)  # (B, nh, 1, num_sets)
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-
-            out_t = torch.matmul(att, V)  # (B, nh, 1, hs)
-            output[:, :, t, :] = out_t.squeeze(2)  # Store result
-
-        # Merge heads and project output
-        out = output.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
-        out = self.resid_dropout(self.c_proj(out))
-        t1=time.time()
-        # print("time",t1-t0)
-        return out
-        
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -164,6 +101,10 @@ class Block(nn.Module):
             self.attn = CausalSelfAttention(config)
         elif config.attn == 'set':
             self.attn = CausalSetAttention(config)
+        elif config.attn == 'linear':
+            self.attn = CausalLinearAttention(config)
+        elif config.attn == 'fastset':
+            self.attn = FastCausalSetAttention(config)
         else :
             raise NotImplementedError
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)

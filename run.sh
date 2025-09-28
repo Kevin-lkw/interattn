@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=3 python train.py config/train_shakespeare_char.py
+CUDA_VISIBLE_DEVICES=0 python train.py config/setattn.py

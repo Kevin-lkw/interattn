@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 class CausalLinearAttention(nn.Module):
     def __init__(self, config):
         super().__init__()

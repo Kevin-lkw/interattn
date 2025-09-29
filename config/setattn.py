@@ -36,7 +36,7 @@ warmup_iters = 100 # not super necessary potentially
 # device = 'cpu'  # run on cpu only
 # compile = False # do not torch compile the model
 
-attn = 'fastset'
+attn = 'fixset' # could be 'set' or 'linear' or 'fastset' or 'fixset'
 set_number = 1
 set_policy = 'bfs'
 set_aggr = 'linear'

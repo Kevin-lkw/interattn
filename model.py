@@ -132,6 +132,9 @@ class GPTConfig:
     set_policy: str = None
     set_aggr: str = None
     set_number: int = None
+    level: int = None
+    levelrand: bool = None
+    levelmax: int = None
 class GPT(nn.Module):
 
     def __init__(self, config):

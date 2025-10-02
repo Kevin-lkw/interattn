@@ -29,7 +29,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from data.load import load_data
 
 @hydra.main(config_path="config", config_name="setattn", version_base=None)
@@ -88,6 +88,9 @@ def main(cfg: DictConfig):
     set_policy = cfg.attn.set_policy
     set_aggr = cfg.attn.set_aggr
     set_number = cfg.attn.set_number
+    level = cfg.attn.level
+    levelrand = cfg.attn.levelrand
+    levelmax = cfg.attn.levelmax
 
     # various inits, derived attributes, I/O setup
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -134,7 +137,8 @@ def main(cfg: DictConfig):
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                     bias=bias, vocab_size=None, dropout=dropout,
-                    attn=attn, set_policy=set_policy, set_aggr=set_aggr, set_number=set_number)
+                    attn=attn, set_policy=set_policy, set_aggr=set_aggr, set_number=set_number,
+                    level = level, levelrand = levelrand, levelmax = levelmax)
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch
@@ -218,7 +222,7 @@ def main(cfg: DictConfig):
     # logging
     if wandb_log and master_process:
         import wandb
-        wandb.init(project=wandb_project, name=wandb_run_name, config=cfg)
+        wandb.init(project=wandb_project, name = wandb_run_name, config=OmegaConf.to_container(cfg, resolve=True))
 
     # training loop
     X, Y = dataset.sample_batch('train') # fetch the very first batch
@@ -267,7 +271,7 @@ def main(cfg: DictConfig):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        if iter_num % log_interval == 0 and master_process:
+        if iter_num % log_interval == 0 and master_process and iter_num > 0:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             # lossf = loss.item() * gradient_accumulation_steps
@@ -279,6 +283,8 @@ def main(cfg: DictConfig):
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}")
+            if wandb_log:
+                wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr, 'mfu': running_mfu}, step=iter_num)
         iter_num += 1
         local_iter_num += 1
 

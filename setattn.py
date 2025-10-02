@@ -6,7 +6,7 @@ from typing import Optional, Tuple, List
 from collections import deque
 import time
 class FixSetLinearAttention(nn.Module):
-    def __init__(self, config, L=1, levelrand = False):
+    def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -16,9 +16,9 @@ class FixSetLinearAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.L = L
-        self.levelrand = levelrand
-        self.levelmax = 7
+        self.level = config.level
+        self.levelrand = config.levelrand
+        self.levelmax = config.levelmax
         self.v_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
     def phi(self, x):
         return x
@@ -49,7 +49,7 @@ class FixSetLinearAttention(nn.Module):
         v_cum = torch.cumsum(v, dim=2)  # (B, nh, T, hs)
 
         sets = []
-        setlevel = torch.randint(0,self.levelmax+1) if self.levelrand else self.L 
+        setlevel = torch.randint(0,self.levelmax+1,()) if self.levelrand else self.level
         L = 2**setlevel
         # assert T % L == 0, "sequence length must be multiple of 2^L"
         while L <= T:

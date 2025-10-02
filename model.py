@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from setattn import CausalSetAttention, FastCausalSetAttention, FixSetAttention
+from setattn import CausalSetAttention, FastCausalSetAttention, FixSetAttention, FixSetLinearAttention
 from linearattn import CausalLinearAttention
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -103,6 +103,8 @@ class Block(nn.Module):
             self.attn = CausalSetAttention(config)
         elif config.attn == 'fixset':
             self.attn = FixSetAttention(config)
+        elif config.attn == 'fixsetlinear':
+            self.attn = FixSetLinearAttention(config)
         elif config.attn == 'linear':
             self.attn = CausalLinearAttention(config)
         elif config.attn == 'fastset':
@@ -182,7 +184,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, acc = False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -200,6 +202,12 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if acc:
+                with torch.no_grad():
+                    mask = targets != -1
+                    num_correct = (logits.argmax(-1) == targets) * mask
+                    acc = num_correct.sum() / mask.sum()
+                return logits, loss, acc
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

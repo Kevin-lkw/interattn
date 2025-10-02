@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 python sample.py --out_dir=out-shakespeare-char
+CUDA_VISIBLE_DEVICES=1 python sample.py --out_dir=out-shakespeare-char

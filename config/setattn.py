@@ -10,7 +10,7 @@ log_interval = 1 # don't print too too often
 always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
-wandb_project = 'shakespeare-char'
+wandb_project = 'shakespeare-char_fixattn'
 wandb_run_name = 'mini-gpt'
 
 dataset = 'shakespeare_char'
@@ -36,7 +36,7 @@ warmup_iters = 100 # not super necessary potentially
 # device = 'cpu'  # run on cpu only
 # compile = False # do not torch compile the model
 
-attn = 'fixset' # could be 'set' or 'linear' or 'fastset' or 'fixset'
+attn = 'fixsetlinear' # could be 'set' or 'linear' or 'fastset' or 'fixset'
 set_number = 1
 set_policy = 'bfs'
 set_aggr = 'linear'

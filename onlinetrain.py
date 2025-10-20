@@ -32,7 +32,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from data.load import load_data
 
-@hydra.main(config_path="config", config_name="setattn", version_base=None)
+@hydra.main(config_path="config", config_name="setattn_mqar", version_base=None)
 def main(cfg: DictConfig):
     # 1) I/O
     out_dir = cfg.out_dir
@@ -46,8 +46,11 @@ def main(cfg: DictConfig):
     # 2) wandb
     wandb_log = cfg.wandb.log
     wandb_project = cfg.wandb.project
-    wandb_run_name = cfg.wandb.run_name
-
+    wandb_run_name = cfg.data.dataset + '-' + cfg.attn.type
+    if cfg.attn.type.startswith('setattn'):
+        wandb_run_name += f'-L{cfg.attn.level}'
+    if cfg.wandb.run_name != None:
+        wandb_run_name += cfg.wandb.run_name
     # 3) data
     dataset = cfg.data.dataset
     batch_size = cfg.data.batch_size
@@ -85,9 +88,6 @@ def main(cfg: DictConfig):
 
     # 9) attn
     attn = cfg.attn.type
-    set_policy = cfg.attn.set_policy
-    set_aggr = cfg.attn.set_aggr
-    set_number = cfg.attn.set_number
     level = cfg.attn.level
     levelrand = cfg.attn.levelrand
     levelmax = cfg.attn.levelmax
@@ -126,7 +126,7 @@ def main(cfg: DictConfig):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    dataset = load_data(dataset, batch_size, cfg.data.training_length, randomize=cfg.data.randomize, device=device)
+    dataset = load_data(dataset, batch_size, cfg.data, device=device)
 
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0
@@ -137,8 +137,7 @@ def main(cfg: DictConfig):
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                     bias=bias, vocab_size=None, dropout=dropout,
-                    attn=attn, set_policy=set_policy, set_aggr=set_aggr, set_number=set_number,
-                    level = level, levelrand = levelrand, levelmax = levelmax)
+                    attn=attn, level = level, levelrand = levelrand, levelmax = levelmax)
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch
@@ -232,6 +231,7 @@ def main(cfg: DictConfig):
     running_mfu = -1.0
     sum_loss = 0
     sum_acc = 0
+    total_sample_time = 0
     while True:
 
         # determine and set the learning rate for this iteration
@@ -254,7 +254,10 @@ def main(cfg: DictConfig):
                 sum_acc += acc.item()
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            t0 = time.time()
             X, Y = dataset.sample_batch('train')
+            t1 = time.time()
+            total_sample_time += t1 - t0
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
         # clip the gradient
@@ -283,6 +286,8 @@ def main(cfg: DictConfig):
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}")
+            print(f"sample time per iter: {total_sample_time:.4f} sec")
+            total_sample_time = 0
             if wandb_log:
                 wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr, 'mfu': running_mfu}, step=iter_num)
         iter_num += 1

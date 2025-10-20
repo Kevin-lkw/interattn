@@ -9,16 +9,16 @@ log_interval: 50
 always_save_checkpoint: false
 
 wandb:
-  log: true
-  project: fixattn
-  run_name: setKV-L1-large-20
+  log: false
+  project: setattn-copy
+  run_name: copy
 
 data:
-  dataset: parity
+  dataset: copy
   training_length: 20
   randomize: true
   gradient_accumulation_steps: 1
-  batch_size: 512
+  batch_size: 1024
   block_size: 256
 
 model:
@@ -29,7 +29,7 @@ model:
 
 optim:
   learning_rate: 1e-3
-  max_iters: 50000
+  max_iters: 10000
   lr_decay_iters: 5000
   min_lr: 1e-4
   beta2: 0.99
@@ -38,10 +38,7 @@ lr_decay:
   warmup_iters: 100
 
 attn:
-  type: setattn_linear  
-  set_number: 1
-  set_policy: bfs
-  set_aggr: linear
+  type: vanilla  
   level: 1
   levelrand: false
   levelmax: 4

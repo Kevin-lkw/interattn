@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from setattn import CausalSetAttention, FastCausalSetAttention, FixSetAttention, FixSetLinearAttention
+from setattn import SetAttention_Linear
 from linearattn import CausalLinearAttention
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -99,16 +99,10 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         if config.attn == 'vanilla':
             self.attn = CausalSelfAttention(config)
-        elif config.attn == 'set':
-            self.attn = CausalSetAttention(config)
-        elif config.attn == 'fixset':
-            self.attn = FixSetAttention(config)
-        elif config.attn == 'fixsetlinear':
-            self.attn = FixSetLinearAttention(config)
+        elif config.attn == 'setattn_linear':
+            self.attn = SetAttention_Linear(config)
         elif config.attn == 'linear':
             self.attn = CausalLinearAttention(config)
-        elif config.attn == 'fastset':
-            self.attn = FastCausalSetAttention(config)
         else :
             raise NotImplementedError
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -129,9 +123,6 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     attn: str = 'vanilla'
-    set_policy: str = None
-    set_aggr: str = None
-    set_number: int = None
     level: int = None
     levelrand: bool = None
     levelmax: int = None
@@ -210,6 +201,7 @@ class GPT(nn.Module):
                     mask = targets != -1
                     num_correct = (logits.argmax(-1) == targets) * mask
                     acc = num_correct.sum() / mask.sum()
+                    # import ipdb; ipdb.set_trace()
                 return logits, loss, acc
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

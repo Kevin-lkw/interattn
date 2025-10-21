@@ -16,7 +16,6 @@ data:
   dataset: openwebtext
   gradient_accumulation_steps: 40
   batch_size: 12
-  block_size: 1024
 
 model:
   n_layer: 12
@@ -24,6 +23,7 @@ model:
   n_embd: 768
   dropout: 0.0
   bias: false
+  block_size: 1024
 
 optim:
   learning_rate: 6e-4

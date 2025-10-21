@@ -12,3 +12,4 @@ env/
 venv/
 outputs/
 wandb/
+out*

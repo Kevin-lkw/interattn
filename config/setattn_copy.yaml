@@ -2,7 +2,7 @@
 defaults:
   - base
 
-out_dir: out-shakespeare-char
+out_dir: out-copy
 eval_interval: 250
 eval_iters: 200
 log_interval: 50
@@ -19,13 +19,15 @@ data:
   randomize: true
   gradient_accumulation_steps: 1
   batch_size: 1024
-  block_size: 256
-
+  test: true
+  test_samples: 
+  
 model:
   n_layer: 4
   n_head: 4
   n_embd: 64
   dropout: 0.2
+  block_size: 256
 
 optim:
   learning_rate: 1e-3
@@ -38,7 +40,10 @@ lr_decay:
   warmup_iters: 100
 
 attn:
-  type: vanilla  
+  type: setattn_linear  
   level: 1
-  levelrand: false
   levelmax: 4
+  levelrand: true
+  k_mapping: False
+  v_mapping: False
+  smaller_sets: False

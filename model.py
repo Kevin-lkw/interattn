@@ -125,7 +125,9 @@ class GPTConfig:
     attn: str = 'vanilla'
     level: int = None
     levelrand: bool = None
-    levelmax: int = None
+    k_mapping: bool = False
+    v_mapping: bool = False
+    smaller_sets: bool = False
 class GPT(nn.Module):
 
     def __init__(self, config):

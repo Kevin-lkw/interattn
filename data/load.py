@@ -1,6 +1,6 @@
 from data.regular.parity import ParityCheck
-from data.retrieval.copy import Copy
-from data.retrieval.MQAR import MQAR
+from data.retrieval.task_copy import Copy
+from data.retrieval.task_MQAR import MQAR
 
 def load_data(dataset_name, batch_size, config, device):
     length = config.training_length

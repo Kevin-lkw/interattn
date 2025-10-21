@@ -18,9 +18,13 @@ class SetAttention_Linear(nn.Module):
         self.dropout = config.dropout
         self.level = config.level
         self.levelrand = config.levelrand
-        self.levelmax = config.levelmax
-        self.v_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
-        self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
+        self.k_mapping = config.k_mapping
+        self.v_mapping = config.v_mapping
+        self.smaller_sets = config.smaller_sets
+        if self.k_mapping:
+            self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
+        if self.v_mapping:
+            self.v_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
     def phi(self, x):
         return x
     
@@ -43,22 +47,29 @@ class SetAttention_Linear(nn.Module):
         v = v.view(B, T, nh, hs).transpose(1, 2)
         q_phi = self.phi(q)  # (B, nh, T, hs)
         k_phi = self.phi(k)  # (B, nh, T, hs)
-        # kv = k_phi.unsqueeze(-1) * v.unsqueeze(-2)  # outer product: (B, nh, T, hs, hs)
-        # kv = kv.view(B, nh, T, hs*hs)
-        # v = self.v_proj(kv)  # (B, nh, T, hs) slow!
-        # k = self.k_proj(kv)  # (B, nh, T, hs) slow!
+        if self.k_mapping or self.v_mapping:
+            kv = k_phi.unsqueeze(-1) * v.unsqueeze(-2)  # outer product: (B, nh, T, hs, hs)
+            kv = kv.view(B, nh, T, hs*hs)
+            if self.k_mapping:
+                k_phi = self.k_proj(kv).view(B, nh, T, hs)  # (B, nh, T, hs)
+            if self.v_mapping:
+                v = self.v_proj(kv).view(B, nh, T, hs)  # (B, nh, T, hs)
         k_cum = torch.cumsum(k_phi, dim=2)  # (B, nh, T, hs)
         v_cum = torch.cumsum(v, dim=2)  # (B, nh, T, hs)
 
         sets = []
-        setlevel = torch.randint(0,self.levelmax+1,()) if self.levelrand else self.level
-        L = 2**setlevel
-        # assert T % L == 0, "sequence length must be multiple of 2^L"
-        while L <= T:
-            step = L
-            for i in range(T // L):
-                sets.append([i*step, (i+1)*step-1])
-            L *= 2
+        levelmax = math.floor(math.log2(T))
+        setlevel = torch.randint(0,levelmax+1,()) if self.levelrand else self.level
+        if self.smaller_sets:
+            for l in range(0, setlevel+1):
+                step = 2**l
+                for i in range(0, T // step, 2):
+                    sets.append([i*step, (i+1)*step-1])
+        else:   
+            for l in range(setlevel, levelmax+1):
+                step = 2**l
+                for i in range(T // step):
+                    sets.append([i*step, (i+1)*step-1])
         nsets = len(sets)
         t_idx = torch.arange(T, device=x.device)  # (T,)
 
@@ -81,7 +92,15 @@ class SetAttention_Linear(nn.Module):
             # for inference. First few steps may not have any sets.
             att_logits = torch.zeros(B, nh, T, 0, device=x.device, dtype=x.dtype)  # (B,nh,T,0)   
             V = torch.zeros(B, nh, 0, hs, device=x.device, dtype=x.dtype)  # (B,nh,0,hs) 
-        
+
+        if setlevel == 0 or self.smaller_sets:
+            # no tail
+            att = F.softmax(att_logits, dim=-1)  # (B,nh,T,nset)
+            att = self.attn_dropout(att)
+            out = att @ V  # (B,nh,T,hs)
+            out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+            out = self.resid_dropout(self.c_proj(out))
+            return out
         # process tail
         Lmin = 2**setlevel
         tail_len = t_idx % (Lmin) + 1

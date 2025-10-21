@@ -1,11 +1,11 @@
 import torch as t
 import numpy as np
-from torch import Tensor
-from data import task
+# from torch import Tensor
+# from data import task
 """
 Adapted from https://github.com/HazyResearch/zoology/blob/main/zoology/data/associative_recall.py
 """
-class MQAR(task.GeneralizationTask):
+class MQAR():
     """Task: multi-query associative recall, adapted to Copy interface.
        Input:  [K1 V1 K2 V2 ... Kn Vn | 0 ... 0 (with some query keys inserted)]
        Target: [-1 ... -1              | -1 ... -1 (only query positions = corresponding values)]
@@ -21,8 +21,16 @@ class MQAR(task.GeneralizationTask):
         self.random_non_queries = random_non_queries
         self.randomize = randomize
         self.device = device
-
-    def sample_batch(self, split=None, batch_size=None, length=None):
+        self.train_generator = np.random.default_rng(0)
+        self.test_generator = np.random.default_rng(1)
+        self.train_torch_generator = t.Generator()
+        self.train_torch_generator.manual_seed(0)
+        self.test_torch_generator = t.Generator()
+        self.test_torch_generator.manual_seed(1)
+    
+    def sample_batch(self, split, batch_size=None, length=None):
+        gen = self.train_generator if split == 'train' else self.test_generator
+        torch_gen = self.train_torch_generator if split == 'train' else self.test_torch_generator
         batch_size = batch_size or self.batch_size
         length = length or self.length
 
@@ -37,10 +45,12 @@ class MQAR(task.GeneralizationTask):
         key_choices = np.arange(1, key_vocab_size)
         value_choices = np.arange(key_vocab_size, self.vocab_size)
 
+        def choice_arr(arr):
+            return gen.choice(arr, size=self.num_kv_pairs, replace=False)
         keys_unshuffled = np.tile(key_choices, (batch_size, 1))
-        keys = np.apply_along_axis(np.random.choice, 1, keys_unshuffled , replace=False, size=self.num_kv_pairs)
+        keys = np.apply_along_axis(choice_arr, 1, keys_unshuffled)
         values_unshuffled = np.tile(value_choices, (batch_size, 1))
-        values = np.apply_along_axis(np.random.choice, 1, values_unshuffled, replace=False, size=self.num_kv_pairs)
+        values = np.apply_along_axis(choice_arr, 1, values_unshuffled)
 
         kvs = np.zeros((batch_size, context_size), dtype=np.int64)
         kvs[:, 0::2] = keys
@@ -51,7 +61,9 @@ class MQAR(task.GeneralizationTask):
         p = self.power_a * np.arange(1, space + 1) ** (self.power_a - 1)
         p = p / p.sum()
         x = np.stack([np.arange(space, dtype=int)] * batch_size)
-        gaps = np.apply_along_axis(np.random.choice, 1, x, replace=False, p=p, size=self.num_kv_pairs)
+        def choice_arr_p(arr):
+            return gen.choice(arr, size=self.num_kv_pairs, replace=False, p=p)
+        gaps = np.apply_along_axis(choice_arr_p, 1, x)
 
         # ----- Step 3: fill queries and labels -----
         queries = np.zeros((batch_size, length - context_size + 1), dtype=np.int64)
@@ -66,7 +78,7 @@ class MQAR(task.GeneralizationTask):
         # replace all the 0 with random values if needed
         if self.random_non_queries:
             mask = (X == 0)
-            X[mask] = t.randint(0, self.vocab_size, X.shape, device=self.device)[mask]
+            X[mask] = t.randint(0, self.vocab_size, X.shape, generator = torch_gen, device=self.device)[mask]
         # import ipdb; ipdb.set_trace()
         return X, Y
 
@@ -81,3 +93,17 @@ class MQAR(task.GeneralizationTask):
     @property
     def vocabulary_size(self) -> int:
         return self.vocab_size
+
+if __name__ == "__main__":
+    print("=== 测试1: 单个类设置种子 ===")
+    mqar = MQAR(batch_size=1, length=20, randomize=False, device='cpu', num_kv_pairs=4)
+    a1, b1 = mqar.sample_batch('test')
+    print(f"MQAR 第一次: X={a1}, Y={b1}")
+
+    mqbr = MQAR(batch_size=1, length=20, randomize=False, device='cpu', num_kv_pairs=4)
+    print("\n=== 测试2: 重新生成 ===")
+    a2, b2 = mqbr.sample_batch('test')
+    print(f"MQAR 第二次: X={a2}, Y={b2}")
+
+    print("\n=== 验证确定性 ===")
+    print(f"MQAR 两次相同: {t.allclose(a1, a2)} and {t.allclose(b1, b2)}")

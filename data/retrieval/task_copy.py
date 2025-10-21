@@ -14,18 +14,24 @@ class Copy(task.GeneralizationTask):
     self.randomize = randomize
     self.device = device
     self.range = 26 
+    self.train_torch_generator = t.Generator(device=device)
+    self.train_torch_generator.manual_seed(0)
+    self.test_torch_generator = t.Generator(device=device)
+    self.test_torch_generator.manual_seed(1)
+
   def sample_batch(self, split, batch_size: int = None, length: int = None) -> task.Batch:
     """Creates sequences of the form [x1, ..., xL, 2, x1, ..., xL].
        Target Y masks the first (L+1) tokens as -1 and expects model
        to predict the copy part after the separator.
     """
+    gen = self.train_torch_generator if split == 'train' else self.test_torch_generator
     batch_size = batch_size or self.batch_size
     length = length or self.length
     if self.randomize:
-      length = t.randint(1, self.length + 1, ()).item()
+      length = t.randint(1, self.length + 1, (), generator=gen,device=self.device).item()
 
     # Generate 01 sequences
-    seq = t.randint(0, self.range, (batch_size, length), device=self.device)
+    seq = t.randint(0, self.range, (batch_size, length), generator=gen, device=self.device)
     # alphabet: 0 ... rg-1
     # SEP token: rg
     # BOS token: rg+1

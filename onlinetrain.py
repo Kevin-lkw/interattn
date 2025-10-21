@@ -54,8 +54,8 @@ def main(cfg: DictConfig):
     # 3) data
     dataset = cfg.data.dataset
     batch_size = cfg.data.batch_size
-    block_size = cfg.data.block_size
     gradient_accumulation_steps = cfg.data.gradient_accumulation_steps
+    test_samples = cfg.data.test_samples
 
     # 4) model
     n_layer = cfg.model.n_layer
@@ -63,6 +63,7 @@ def main(cfg: DictConfig):
     n_embd = cfg.model.n_embd
     dropout = cfg.model.dropout
     bias = cfg.model.bias
+    block_size = cfg.model.block_size
 
     # 5) optim
     learning_rate = cfg.optim.learning_rate
@@ -89,8 +90,11 @@ def main(cfg: DictConfig):
     # 9) attn
     attn = cfg.attn.type
     level = cfg.attn.level
-    levelrand = cfg.attn.levelrand
     levelmax = cfg.attn.levelmax
+    levelrand = cfg.attn.levelrand
+    k_mapping = cfg.attn.k_mapping
+    v_mapping = cfg.attn.v_mapping
+    smaller_sets = cfg.attn.smaller_sets
 
     # various inits, derived attributes, I/O setup
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -137,7 +141,8 @@ def main(cfg: DictConfig):
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                     bias=bias, vocab_size=None, dropout=dropout,
-                    attn=attn, level = level, levelrand = levelrand, levelmax = levelmax)
+                    attn=attn, level = level, levelrand = levelrand,
+                    k_mapping = k_mapping, v_mapping = v_mapping, smaller_sets = smaller_sets)
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch
@@ -290,15 +295,49 @@ def main(cfg: DictConfig):
             total_sample_time = 0
             if wandb_log:
                 wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr, 'mfu': running_mfu}, step=iter_num)
+            if lossf < best_val_loss or always_save_checkpoint:
+                best_val_loss = lossf
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': cfg,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         iter_num += 1
         local_iter_num += 1
 
         # termination conditions
         if iter_num > max_iters:
             break
-
+    
     if ddp:
         destroy_process_group()
+
+    """
+    test model part
+    """
+    print("Evaluating best model on test set...")
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    best_model = ckpt['model']
+    best_model_args = ckpt['model_args']
+    if best_model is not None:
+        best_model_args['levelrand'] = False  # turn off level randomization for testing
+        for level in range(0, levelmax+1):
+            best_model_args['level'] = level
+            eval_model = GPT(GPTConfig(**best_model_args))
+            eval_model.load_state_dict(best_model)
+            eval_model.to(device)
+            eval_model.eval()
+            X, Y = dataset.sample_batch('test',batch_size=test_samples) # fetch the very first batch
+            with torch.no_grad():
+                logits, loss, acc = eval_model(X, Y, acc = True)
+            print(f"level = {level}, test loss {loss.item():.4f}, test acc {acc.item():.3f}")
 
 if __name__ == "__main__":
     main()

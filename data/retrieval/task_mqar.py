@@ -5,21 +5,18 @@ import numpy as np
 """
 Adapted from https://github.com/HazyResearch/zoology/blob/main/zoology/data/associative_recall.py
 """
-class MQAR():
+class mqar():
     """Task: multi-query associative recall, adapted to Copy interface.
        Input:  [K1 V1 K2 V2 ... Kn Vn | 0 ... 0 (with some query keys inserted)]
        Target: [-1 ... -1              | -1 ... -1 (only query positions = corresponding values)]
     """
-    def __init__(self, batch_size: int, length: int, randomize: bool, device: str,
+    def __init__(self, device: str,
                  num_kv_pairs: int, vocab_size: int = 1024, power_a: float = 0.01,
                  random_non_queries: bool = True):
-        self.batch_size = batch_size
-        self.length = length                # full input sequence length
         self.num_kv_pairs = num_kv_pairs
         self.vocab_size = vocab_size
         self.power_a = power_a
         self.random_non_queries = random_non_queries
-        self.randomize = randomize
         self.device = device
         self.train_generator = np.random.default_rng(0)
         self.test_generator = np.random.default_rng(1)
@@ -28,7 +25,7 @@ class MQAR():
         self.test_torch_generator = t.Generator()
         self.test_torch_generator.manual_seed(1)
     
-    def sample_batch(self, split, batch_size=None, length=None):
+    def sample_batch(self, split, batch_size, length: int, randomize: bool):
         gen = self.train_generator if split == 'train' else self.test_generator
         torch_gen = self.train_torch_generator if split == 'train' else self.test_torch_generator
         batch_size = batch_size or self.batch_size
@@ -96,13 +93,13 @@ class MQAR():
 
 if __name__ == "__main__":
     print("=== 测试1: 单个类设置种子 ===")
-    mqar = MQAR(batch_size=1, length=20, randomize=False, device='cpu', num_kv_pairs=4)
-    a1, b1 = mqar.sample_batch('test')
+    dataset = mqar(batch_size=1, length=20, randomize=False, device='cpu', num_kv_pairs=4)
+    a1, b1 = dataset.sample_batch('test')
     print(f"MQAR 第一次: X={a1}, Y={b1}")
 
-    mqbr = MQAR(batch_size=1, length=20, randomize=False, device='cpu', num_kv_pairs=4)
+    dataset2 = mqar(batch_size=1, length=20, randomize=False, device='cpu', num_kv_pairs=4)
     print("\n=== 测试2: 重新生成 ===")
-    a2, b2 = mqbr.sample_batch('test')
+    a2, b2 = dataset2.sample_batch('test')
     print(f"MQAR 第二次: X={a2}, Y={b2}")
 
     print("\n=== 验证确定性 ===")

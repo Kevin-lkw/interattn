@@ -15,14 +15,16 @@ wandb:
 
 data:
   dataset: MQAR
-  training_length: 128
+  training_length: 256
+  training_randomize: False
   num_kv_pair: 16
   power_a: 0.01
   random_non_queries: False
-  randomize: False
   gradient_accumulation_steps: 1
   batch_size: 128
   test: true 
+  test_length: 256
+  test_randomize: false
   test_samples: 100
 
 model:
@@ -34,7 +36,7 @@ model:
 
 optim:
   learning_rate: 1e-3
-  max_iters: 10000
+  max_iters: 20000
   lr_decay_iters: 5000
   min_lr: 1e-4
   beta2: 0.99
@@ -46,7 +48,7 @@ attn:
   type: setattn_linear  
   level: 1
   levelmax: 8
-  levelrand: false
+  levelrand: true
   k_mapping: False
   v_mapping: False
   smaller_sets: False

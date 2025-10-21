@@ -46,16 +46,17 @@ def main(cfg: DictConfig):
     # 2) wandb
     wandb_log = cfg.wandb.log
     wandb_project = cfg.wandb.project
-    wandb_run_name = cfg.data.dataset + '-' + cfg.attn.type
-    if cfg.attn.type.startswith('setattn'):
-        wandb_run_name += f'-L{cfg.attn.level}'
-    if cfg.wandb.run_name != None:
-        wandb_run_name += cfg.wandb.run_name
+    wandb_run_name = cfg.wandb.run_name
+
     # 3) data
     dataset = cfg.data.dataset
     batch_size = cfg.data.batch_size
     gradient_accumulation_steps = cfg.data.gradient_accumulation_steps
     test_samples = cfg.data.test_samples
+    training_length = cfg.data.training_length
+    training_randomize = cfg.data.training_randomize
+    test_length = cfg.data.test_length
+    test_randomize = cfg.data.test_randomize
 
     # 4) model
     n_layer = cfg.model.n_layer
@@ -130,7 +131,7 @@ def main(cfg: DictConfig):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    dataset = load_data(dataset, batch_size, cfg.data, device=device)
+    dataset = load_data(dataset, cfg.data, device=device)
 
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0
@@ -229,7 +230,7 @@ def main(cfg: DictConfig):
         wandb.init(project=wandb_project, name = wandb_run_name, config=OmegaConf.to_container(cfg, resolve=True))
 
     # training loop
-    X, Y = dataset.sample_batch('train') # fetch the very first batch
+    X, Y = dataset.sample_batch('train', batch_size=batch_size, length=training_length, randomize=training_randomize) # fetch the very first batch
     t0 = time.time()
     local_iter_num = 0 # number of iterations in the lifetime of this process
     raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -260,7 +261,7 @@ def main(cfg: DictConfig):
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             t0 = time.time()
-            X, Y = dataset.sample_batch('train')
+            X, Y = dataset.sample_batch('train', batch_size=batch_size, length=training_length, randomize=training_randomize)
             t1 = time.time()
             total_sample_time += t1 - t0
             # backward pass, with gradient scaling if training in fp16
@@ -334,10 +335,12 @@ def main(cfg: DictConfig):
             eval_model.load_state_dict(best_model)
             eval_model.to(device)
             eval_model.eval()
-            X, Y = dataset.sample_batch('test',batch_size=test_samples) # fetch the very first batch
+            X, Y = dataset.sample_batch('test',batch_size=test_samples, length = test_length, randomize = test_randomize) # fetch the very first batch
             with torch.no_grad():
                 logits, loss, acc = eval_model(X, Y, acc = True)
             print(f"level = {level}, test loss {loss.item():.4f}, test acc {acc.item():.3f}")
+            if wandb_log:
+                wandb.log({'test_loss': loss.item(), 'test_acc': acc.item(), 'level': level}, step=level)
 
 if __name__ == "__main__":
     main()

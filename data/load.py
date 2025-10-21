@@ -1,19 +1,16 @@
 from data.regular.parity import ParityCheck
 from data.retrieval.task_copy import Copy
-from data.retrieval.task_MQAR import MQAR
+from data.retrieval.task_mqar import mqar
 
-def load_data(dataset_name, batch_size, config, device):
-    length = config.training_length
-    randomize = config.randomize
+def load_data(dataset_name, config, device):
     if dataset_name == 'parity':
-        dataset = ParityCheck(batch_size, length, randomize, device)
+        dataset = ParityCheck(device)
     elif dataset_name == 'copy':
-        dataset = Copy(batch_size, length, randomize, device)
+        dataset = Copy(device)
     elif dataset_name == 'MQAR':
         # randomize is set to False for MQAR task
-        assert randomize == False
-        dataset = MQAR(batch_size, length, randomize, device=device, 
-                       num_kv_pairs= config.num_kv_pair, power_a=config.power_a, random_non_queries = config.random_non_queries)
+        dataset = mqar(device=device, 
+                num_kv_pairs= config.num_kv_pair, power_a=config.power_a, random_non_queries = config.random_non_queries)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     

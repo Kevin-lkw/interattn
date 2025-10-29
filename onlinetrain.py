@@ -49,8 +49,9 @@ def main(cfg: DictConfig):
     wandb_run_name = cfg.wandb.run_name
 
     # 3) data
-    dataset = cfg.data.dataset
+    dataset_name = cfg.data.dataset
     batch_size = cfg.data.batch_size
+    block_size = cfg.data.block_size
     gradient_accumulation_steps = cfg.data.gradient_accumulation_steps
     test_samples = cfg.data.test_samples
     training_length = cfg.data.training_length
@@ -64,7 +65,7 @@ def main(cfg: DictConfig):
     n_embd = cfg.model.n_embd
     dropout = cfg.model.dropout
     bias = cfg.model.bias
-    block_size = cfg.model.block_size
+    post_LN = cfg.model.post_LN
 
     # 5) optim
     learning_rate = cfg.optim.learning_rate
@@ -96,6 +97,7 @@ def main(cfg: DictConfig):
     k_mapping = cfg.attn.k_mapping
     v_mapping = cfg.attn.v_mapping
     smaller_sets = cfg.attn.smaller_sets
+    feature_map = cfg.attn.feature_map
 
     # various inits, derived attributes, I/O setup
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -122,16 +124,16 @@ def main(cfg: DictConfig):
 
     if master_process:
         os.makedirs(out_dir, exist_ok=True)
-    torch.manual_seed(1337 + seed_offset)
-    torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-    torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+    torch.manual_seed(0 + seed_offset)
+    torch.cuda.manual_seed(0 + seed_offset)
+
     device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
     # note: float16 data type will automatically use a GradScaler
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    dataset = load_data(dataset, cfg.data, device=device)
+    dataset = load_data(dataset_name, cfg.data, device=device)
 
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0
@@ -141,9 +143,9 @@ def main(cfg: DictConfig):
     meta_vocab_size = dataset.vocabulary_size
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                    bias=bias, vocab_size=None, dropout=dropout,
+                    bias=bias, vocab_size=None, dropout=dropout, post_LN=post_LN,
                     attn=attn, level = level, levelrand = levelrand,
-                    k_mapping = k_mapping, v_mapping = v_mapping, smaller_sets = smaller_sets)
+                    k_mapping = k_mapping, v_mapping = v_mapping, smaller_sets = smaller_sets, feature_map=feature_map)
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch
@@ -234,7 +236,6 @@ def main(cfg: DictConfig):
     t0 = time.time()
     local_iter_num = 0 # number of iterations in the lifetime of this process
     raw_model = model.module if ddp else model # unwrap DDP container if needed
-    running_mfu = -1.0
     sum_loss = 0
     sum_acc = 0
     total_sample_time = 0
@@ -288,14 +289,11 @@ def main(cfg: DictConfig):
             sum_loss = 0
             accf = sum_acc / log_interval
             sum_acc = 0
-            if local_iter_num >= 5: # let the training loop settle a bit
-                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}")
-            print(f"sample time per iter: {total_sample_time:.4f} sec")
+            # print(f"sample time per iter: {total_sample_time:.4f} sec")
             total_sample_time = 0
             if wandb_log:
-                wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr, 'mfu': running_mfu}, step=iter_num)
+                wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr}, step=iter_num)
             if lossf < best_val_loss or always_save_checkpoint:
                 best_val_loss = lossf
                 if iter_num > 0:
@@ -340,7 +338,7 @@ def main(cfg: DictConfig):
                 logits, loss, acc = eval_model(X, Y, acc = True)
             print(f"level = {level}, test loss {loss.item():.4f}, test acc {acc.item():.3f}")
             if wandb_log:
-                wandb.log({'test_loss': loss.item(), 'test_acc': acc.item(), 'level': level}, step=level)
+                wandb.log({'test_loss': loss.item(), 'test_acc': acc.item()}, step=level)
 
 if __name__ == "__main__":
     main()

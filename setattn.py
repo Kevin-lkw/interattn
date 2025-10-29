@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple, List
-from collections import deque
-import time
+from fla.layers import LinearAttention
 class SetAttention_Linear(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -21,13 +19,30 @@ class SetAttention_Linear(nn.Module):
         self.k_mapping = config.k_mapping
         self.v_mapping = config.v_mapping
         self.smaller_sets = config.smaller_sets
+        self.feature_map = config.feature_map
         if self.k_mapping:
             self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
         if self.v_mapping:
             self.v_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
     def phi(self, x):
-        return x
-    
+        if self.feature_map == 'identity':
+            return x
+        elif self.feature_map == 'relu':
+            return F.relu(x)
+        elif self.feature_map == 'elu_plus':
+            return F.elu(x) + 1  # 保证正值
+        elif self.feature_map == 'softplus':
+            return F.softplus(x)
+        elif self.feature_map == 'exp':
+            return torch.exp(x)
+        elif self.feature_map == 'sigmoid':
+            return torch.sigmoid(x)
+        elif self.feature_map == 'swish':
+            return x * torch.sigmoid(x)
+        else:
+            raise ValueError(f"Unsupported feature_map: {self.feature_map}")
+
+
     def get_slice(self, x, l_idx, r_idx):
         r = x[:, :, r_idx, :]  # (B, nh, nset, hs)
         l = x[:, :, l_idx-1, :] 
@@ -126,4 +141,42 @@ class SetAttention_Linear(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
         out = self.resid_dropout(self.c_proj(out))
         return out
+
+
+class SetAttention_Linear_fla(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        
+        # 基础配置
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.level = config.level
+        self.levelrand = config.levelrand
+        self.k_mapping = config.k_mapping
+        self.v_mapping = config.v_mapping
+        self.smaller_sets = config.smaller_sets
+        
+        # FLA LinearAttention 配置
+        self.mode = getattr(config, 'linear_attn_mode', 'fused_chunk')
+        self.feature_map = getattr(config, 'feature_map', 'elu')
+        self.expand_k = getattr(config, 'expand_k', 1.0)
+        self.expand_v = getattr(config, 'expand_v', 1.0)
+        
+        # 创建 FLA LinearAttention 实例用于集合内聚合
+        self.linear_attn = LinearAttention(
+            mode=self.mode,
+            hidden_size=config.n_embd // config.n_head,  # 每个头的维度
+            expand_k=self.expand_k,
+            expand_v=self.expand_v,
+            num_heads=1,  # 每次处理一个头
+            feature_map=self.feature_map,
+            tie_feature_map_qk=True,
+            output_norm='identity',  # 我们自己处理归一化
+            norm_q=False,
+            norm_k=False,
+            do_feature_map_norm=getattr(config, 'do_feature_map_norm', False)
+        )
+    
     

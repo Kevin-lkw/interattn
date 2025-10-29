@@ -20,9 +20,9 @@ class mqar():
         self.device = device
         self.train_generator = np.random.default_rng(0)
         self.test_generator = np.random.default_rng(1)
-        self.train_torch_generator = t.Generator()
+        self.train_torch_generator = t.Generator(device=device)
         self.train_torch_generator.manual_seed(0)
-        self.test_torch_generator = t.Generator()
+        self.test_torch_generator = t.Generator(device=device)
         self.test_torch_generator.manual_seed(1)
     
     def sample_batch(self, split, batch_size, length: int, randomize: bool):

@@ -13,3 +13,4 @@ venv/
 outputs/
 wandb/
 out*
+a.py

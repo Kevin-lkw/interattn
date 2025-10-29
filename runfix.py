@@ -11,21 +11,21 @@ params = {
 # 所有组合（8个）
 keys = list(params.keys())
 combinations = list(itertools.product(*params.values()))
-task = "mqar"
+task = "copy"
 
-for combo in combinations:
-    args = dict(zip(keys, combo))
-    name = f"k{int(args['k_mapping'])}_v{int(args['v_mapping'])}_s{int(args['smaller_sets'])}"
+for level in range(1):
+    name = f"fix-L{level}-k0v0s0"
     cmd = [
         "CUDA_VISIBLE_DEVICES=7",  # 你的设备环境变量
         "python", "onlinetrain.py",
         f"--config-name=setattn_{task}",
-        f"out_dir=out-{task}-dp1/{name}",
+        f"out_dir=out-{task}/vanilla",
         f"wandb.log=true",
-        f"wandb.run_name={task}_{name}_dp1",
-        f"attn.k_mapping={str(args['k_mapping'])}",
-        f"attn.v_mapping={str(args['v_mapping'])}",
-        f"attn.smaller_sets={str(args['smaller_sets'])}",
+        f"wandb.run_name={task}_vanilla",
+        "model.n_layer=8","model.n_head=8","model.n_embd=128",
+        "attn.type=vanilla",
+        "attn.levelrand=false",
+        f"attn.level={level}",
     ]
 
     # 拼成单条命令字符串

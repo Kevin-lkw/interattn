@@ -19,20 +19,21 @@ data:
   training_randomize: False
   num_kv_pair: 16
   power_a: 0.01
-  random_non_queries: False
+  random_non_queries: True
   gradient_accumulation_steps: 1
   batch_size: 128
   test: true 
   test_length: 256
   test_randomize: false
   test_samples: 100
+  block_size: 256
 
 model:
   n_layer: 4
   n_head: 4
   n_embd: 64
-  dropout: 0.2
-  block_size: 256
+  dropout: 0.1
+  post_LN: False
 
 optim:
   learning_rate: 1e-3
@@ -52,3 +53,4 @@ attn:
   k_mapping: False
   v_mapping: False
   smaller_sets: False
+  feature_map: 'identity'

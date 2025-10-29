@@ -96,6 +96,7 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.post_LN = config.post_LN
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         if config.attn == 'vanilla':
             self.attn = CausalSelfAttention(config)
@@ -109,8 +110,14 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.post_LN:
+            x = self.ln_1(x)
+            x = x + self.attn(x)
+            x = self.ln_2(x)
+            x = x + self.mlp(x)
+        else :
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -128,9 +135,12 @@ class GPTConfig:
     k_mapping: bool = False
     v_mapping: bool = False
     smaller_sets: bool = False
+    post_LN: bool = False
+    feature_map: str = 'identity' 
 class GPT(nn.Module):
 
     def __init__(self, config):
+        print("Initializing GPT model...",config)
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -149,7 +159,6 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -305,23 +314,7 @@ class GPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
+    
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """

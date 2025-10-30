@@ -14,7 +14,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from setattn import SetAttention_Linear
+from setattn.setattn import SetAttention_Linear
+from setattn.custom_linear_attn import SetAttention_Linear_fla
 from linearattn import CausalLinearAttention
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -102,6 +103,8 @@ class Block(nn.Module):
             self.attn = CausalSelfAttention(config)
         elif config.attn == 'setattn_linear':
             self.attn = SetAttention_Linear(config)
+        elif config.attn == 'setattn_linear_fla':
+            self.attn = SetAttention_Linear_fla(config)
         elif config.attn == 'linear':
             self.attn = CausalLinearAttention(config)
         else :

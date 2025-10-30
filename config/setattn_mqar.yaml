@@ -5,7 +5,7 @@ defaults:
 out_dir: out-MQAR
 eval_interval: 250
 eval_iters: 200
-log_interval: 50
+log_interval: 10
 always_save_checkpoint: false
 
 wandb:
@@ -46,7 +46,7 @@ lr_decay:
   warmup_iters: 100
 
 attn:
-  type: setattn_linear  
+  type: setattn_linear_fla
   level: 1
   levelmax: 8
   levelrand: true

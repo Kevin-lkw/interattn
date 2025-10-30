@@ -2,7 +2,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from fla.layers import LinearAttention
+
+def get_sets(T: int, levelrand: bool, level: int, smaller_sets: bool, device):
+    sets = []
+    levelmax = math.floor(math.log2(T))
+    setlevel = torch.randint(0,levelmax+1,()) if levelrand else level
+    if smaller_sets:
+        for l in range(0, setlevel+1):
+            step = 2**l
+            for i in range(0, T // step, 2):
+                sets.append([i*step, (i+1)*step-1])
+    else:   
+        for l in range(setlevel, levelmax+1):
+            step = 2**l
+            for i in range(T // step):
+                sets.append([i*step, (i+1)*step-1])
+    # create causal mask
+    t_idx = torch.arange(T, device=device)  # (T,)
+    r_idx = torch.tensor([r for _,r in sets], device=device)  # (nset,)
+    mask = t_idx.unsqueeze(-1) >= r_idx.unsqueeze(0)  # (T,nset)
+    return sets, setlevel, levelmax, mask
+
 class SetAttention_Linear(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -72,22 +92,9 @@ class SetAttention_Linear(nn.Module):
         k_cum = torch.cumsum(k_phi, dim=2)  # (B, nh, T, hs)
         v_cum = torch.cumsum(v, dim=2)  # (B, nh, T, hs)
 
-        sets = []
-        levelmax = math.floor(math.log2(T))
-        setlevel = torch.randint(0,levelmax+1,()) if self.levelrand else self.level
-        if self.smaller_sets:
-            for l in range(0, setlevel+1):
-                step = 2**l
-                for i in range(0, T // step, 2):
-                    sets.append([i*step, (i+1)*step-1])
-        else:   
-            for l in range(setlevel, levelmax+1):
-                step = 2**l
-                for i in range(T // step):
-                    sets.append([i*step, (i+1)*step-1])
+        sets, setlevel, levelmax, mask = get_sets(T, self.levelrand, self.level, self.smaller_sets, x.device)
         nsets = len(sets)
         t_idx = torch.arange(T, device=x.device)  # (T,)
-
         if nsets > 0:
             # construct K V and mask for sets
             bounds = torch.tensor(sets, device=x.device)  # (nset,2)
@@ -96,7 +103,7 @@ class SetAttention_Linear(nn.Module):
             V = self.get_slice(v_cum, l_idx, r_idx)  # (B, nh, nset, hs, hs)
             # V = torch.randn(B, nh, nsets, hs, device=x.device, dtype=x.dtype)
             # generate mask according to bounds
-            mask = t_idx.unsqueeze(-1) >= r_idx.unsqueeze(0)  # (T,nset)
+            
             mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,T,nset)
             # compute logits
             # q: (B,nh,T,hs) K: (B,nh,nset,hs) -> (B,nh,T,nset)
@@ -143,40 +150,6 @@ class SetAttention_Linear(nn.Module):
         return out
 
 
-class SetAttention_Linear_fla(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        
-        # 基础配置
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        self.level = config.level
-        self.levelrand = config.levelrand
-        self.k_mapping = config.k_mapping
-        self.v_mapping = config.v_mapping
-        self.smaller_sets = config.smaller_sets
-        
-        # FLA LinearAttention 配置
-        self.mode = getattr(config, 'linear_attn_mode', 'fused_chunk')
-        self.feature_map = getattr(config, 'feature_map', 'elu')
-        self.expand_k = getattr(config, 'expand_k', 1.0)
-        self.expand_v = getattr(config, 'expand_v', 1.0)
-        
-        # 创建 FLA LinearAttention 实例用于集合内聚合
-        self.linear_attn = LinearAttention(
-            mode=self.mode,
-            hidden_size=config.n_embd // config.n_head,  # 每个头的维度
-            expand_k=self.expand_k,
-            expand_v=self.expand_v,
-            num_heads=1,  # 每次处理一个头
-            feature_map=self.feature_map,
-            tie_feature_map_qk=True,
-            output_norm='identity',  # 我们自己处理归一化
-            norm_q=False,
-            norm_k=False,
-            do_feature_map_norm=getattr(config, 'do_feature_map_norm', False)
-        )
+
     
     

@@ -261,10 +261,7 @@ def main(cfg: DictConfig):
                 sum_acc += acc.item()
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            t0 = time.time()
             X, Y = dataset.sample_batch('train', batch_size=batch_size, length=training_length, randomize=training_randomize)
-            t1 = time.time()
-            total_sample_time += t1 - t0
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
         # clip the gradient
@@ -277,10 +274,6 @@ def main(cfg: DictConfig):
         # flush the gradients as soon as we can, no need for this memory anymore
         optimizer.zero_grad(set_to_none=True)
 
-        # timing and logging
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
         if iter_num % log_interval == 0 and master_process and iter_num > 0:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -289,7 +282,9 @@ def main(cfg: DictConfig):
             sum_loss = 0
             accf = sum_acc / log_interval
             sum_acc = 0
-            print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}")
+            dt = time.time() - t0
+            t0 = time.time()
+            print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}, dt {dt:.4f}")
             # print(f"sample time per iter: {total_sample_time:.4f} sec")
             total_sample_time = 0
             if wandb_log:

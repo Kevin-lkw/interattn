@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-自定义 LinearAttention 实现，继承自 FLA 库
+Unfinished. Do not found cu_seqlen method
+
 """
 
 import torch
@@ -9,9 +10,10 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Optional, Tuple
 
-from fla.layers.linear_attn import LinearAttention
-from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
-from setattn.setattn import get_sets
+from fla.layers.mamba import Mamba
+from fla.layers.mamba2 import Mamba2
+
+from setattn.setattn_legacy import get_sets
 
 class CustomLinearAttention(LinearAttention):
     def __init__(self, **kwargs):
@@ -89,7 +91,7 @@ class CustomLinearAttention(LinearAttention):
         
         return o, final_state
 
-class SetAttention_Linear_fla(nn.Module):
+class SetAttention_Linear(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -210,7 +212,7 @@ Faster Implementation using cu_seqlens
 correctness verified against above implementation, 20x faster than above
 TODO:can be further optimized by fusing two forward
 """ 
-class SetAttention_Linear_fla_fast(nn.Module):
+class SetAttention_Linear_Fast(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0

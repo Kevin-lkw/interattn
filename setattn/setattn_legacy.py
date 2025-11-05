@@ -1,3 +1,7 @@
+"""
+legacy implementation of Set Attention
+only supports linear attention with cumulative sum
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +27,7 @@ def get_sets(T: int, levelrand: bool, level: int, smaller_sets: bool, device):
     mask = t_idx.unsqueeze(-1) >= r_idx.unsqueeze(0)  # (T,nset)
     return sets, setlevel, levelmax, mask
 
-class SetAttention_Linear(nn.Module):
+class SetAttention_Linear_Legacy(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0

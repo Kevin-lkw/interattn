@@ -1,6 +1,6 @@
 import torch
 from copy import deepcopy
-from setattn.custom_linear_attn import SetAttention_Linear_fla, SetAttention_Linear_fla_fast
+from setattn.setattn_linear import SetAttention_Linear, SetAttention_Linear_Slow
 # 假设这两个类已经定义在当前作用域中
 # from your_module import SetAttention_Linear_fla, SetAttention_Linear_fla_fast
 
@@ -22,8 +22,8 @@ config = DummyConfig()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 两个模型
-model_ref = SetAttention_Linear_fla(config).to(device)
-model_fast = SetAttention_Linear_fla_fast(config).to(device)
+model_ref = SetAttention_Linear(config).to(device)
+model_fast = SetAttention_Linear_Slow(config).to(device)
 
 # 同步参数（保证完全一致）
 model_fast.load_state_dict(deepcopy(model_ref.state_dict()))

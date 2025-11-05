@@ -20,8 +20,8 @@ data:
   num_kv_pair: 16
   power_a: 0.01
   random_non_queries: True
-  gradient_accumulation_steps: 1
-  batch_size: 16
+  gradient_accumulation_steps: 8
+  batch_size: 32
   test: true 
   test_length: 256
   test_randomize: false
@@ -46,7 +46,7 @@ lr_decay:
   warmup_iters: 100
 
 attn:
-  type: setattn_linear_fla_fast
+  type: vanilla
   level: 1
   levelmax: 8
   levelrand: true

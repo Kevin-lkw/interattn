@@ -23,7 +23,7 @@ class Copy(task.GeneralizationTask):
     """
     gen = self.train_torch_generator if split == 'train' else self.test_torch_generator
     if randomize :
-      length = t.randint(1, length + 1, (), generator=gen,device=self.device).item()
+      length = t.randint(1, length + 1, (), generator=gen, device=self.device).item()
 
     # Generate 01 sequences
     seq = t.randint(0, self.range, (batch_size, length), generator=gen, device=self.device)

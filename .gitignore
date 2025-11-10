@@ -14,3 +14,4 @@ outputs/
 wandb/
 out*
 a.py
+data/formal_language/data

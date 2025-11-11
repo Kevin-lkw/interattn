@@ -8,17 +8,17 @@ from torch.utils.data import Dataset
 import pandas as pd
 import unicodedata
 from collections import OrderedDict
-from utils.dyck_generator import DyckLanguage
-from utils.reset_dyck_generator import RDyck1Language
-from utils.data_generator import CounterLanguage
-from utils.shuffle_generator import ShuffleLanguage
-from utils.parity_generator import ParityLanguage
-import utils.starfree_generator as starfree_generator
-import utils.nonstarfree_generator as nonstarfree_generator
-import utils.crl_generator as crl_generator
-import utils.tomita_generator as tomita_generator
-from utils.boolean_expr_generator import NAryBooleanExpLang
-from utils.sentence_processing import sents_to_idx
+from data.formal_language.utils.dyck_generator import DyckLanguage
+from data.formal_language.utils.reset_dyck_generator import RDyck1Language
+from data.formal_language.utils.data_generator import CounterLanguage
+from data.formal_language.utils.shuffle_generator import ShuffleLanguage
+from data.formal_language.utils.parity_generator import ParityLanguage
+import data.formal_language.utils.starfree_generator as starfree_generator
+import data.formal_language.utils.nonstarfree_generator as nonstarfree_generator
+import data.formal_language.utils.crl_generator as crl_generator
+import data.formal_language.utils.tomita_generator as tomita_generator
+from data.formal_language.utils.boolean_expr_generator import NAryBooleanExpLang
+from data.formal_language.utils.sentence_processing import sents_to_idx
 
 class DyckCorpus(object):
 	def __init__(self, p_val, q_val, num_par, lower_window, upper_window, size, min_depth=0, max_depth=-1, debug=False):
@@ -200,30 +200,30 @@ class CAB_n_ABDCorpus(object):
 		return inputs, outputs
 
 class Sampler(object):
-	def __init__(self, corpus, voc, batch_size, bptt=None):
+	def __init__(self, corpus, voc, batch_size):
 		self.voc = voc
 		self.batch_size = batch_size
 		self.Lang = corpus.Lang
 		self.data = corpus.source
 		self.targets = corpus.target
-		self.bptt= bptt
 		self.num_batches = np.ceil(len(self.data)/ batch_size)
 		self.noutputs = corpus.noutputs
 
 	def get_batch(self, i):
+        # remove transpose.
+        # source shape:(batch_size, seq_len)
+        # target shape:(batch_size, seq_len, noutputs)
 		batch_size = min(self.batch_size, len(self.data) - 1 -i)
 
 		word_batch = self.data[i: i+batch_size]
 		target_batch = self.targets[i: i+batch_size]
 		word_lens = torch.tensor([len(x) for x in word_batch], dtype= torch.long)
-
 		batch_ids = sents_to_idx(self.voc, word_batch)
-		source = batch_ids[:,:-1].transpose(0,1)
+		source = batch_ids[:,:-1]
 		max_length = word_lens.max().item()
 		target_tensors = [self.Lang.lineToTensorOutput(line)[:len(word)] for line,word in zip(target_batch, word_batch)]
 		target_tensors_padded = [torch.cat([t, torch.zeros(max_length - len(t), self.noutputs)]).unsqueeze(0) for t in target_tensors]
-		target = torch.cat(target_tensors_padded).transpose(0,1)
-
+		target = torch.cat(target_tensors_padded)
 		return source, target, word_lens
 
 	def batchify(self, data, bsz):

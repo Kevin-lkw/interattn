@@ -26,11 +26,14 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.optim.lr_scheduler import LinearLR
 
 from model import GPTConfig, GPT
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from data.load import load_data
+from data.formal_language.generate_data import load_data
+from data.formal_language.dataloader import Sampler
+from data.formal_language.utils.helper import Voc
 
 @hydra.main(config_path="config", config_name="setattn_mqar", version_base=None)
 def main(cfg: DictConfig):
@@ -53,11 +56,6 @@ def main(cfg: DictConfig):
     batch_size = cfg.data.batch_size
     block_size = cfg.data.block_size
     gradient_accumulation_steps = cfg.data.gradient_accumulation_steps
-    test_samples = cfg.data.test_samples
-    training_length = cfg.data.training_length
-    training_randomize = cfg.data.training_randomize
-    test_length = cfg.data.test_length
-    test_randomize = cfg.data.test_randomize
 
     # 4) model
     n_layer = cfg.model.n_layer
@@ -133,14 +131,21 @@ def main(cfg: DictConfig):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    dataset = load_data(dataset_name, cfg.data, device=device)
+    assert dataset_name == 'formal', "This training script only supports the formal dataset."
+    train_corpus,valid_corpus_bins = load_data(config=cfg.data,num_bins=cfg.data.num_bins)
+    voc = Voc()
+    voc.create_vocab_dict(train_corpus)
+    voc.noutputs = train_corpus.noutputs
 
+    train_loader = Sampler(train_corpus, voc, cfg.data.batch_size)
+    val_loader_bins = [Sampler(val_corpus_bin, voc, cfg.data.batch_size) for val_corpus_bin in valid_corpus_bins]
+    
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0
     best_val_loss = 1e9
 
     # attempt to derive vocab_size from the dataset
-    meta_vocab_size = dataset.vocabulary_size
+    meta_vocab_size = voc.nwords
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                     bias=bias, vocab_size=None, dropout=dropout, post_LN=post_LN,
@@ -154,6 +159,7 @@ def main(cfg: DictConfig):
         if meta_vocab_size is None:
             print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
         model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+        model_args['n_outputs'] = voc.noutputs
         gptconf = GPTConfig(**model_args)
         model = GPT(gptconf)
     elif init_from == 'resume':
@@ -230,110 +236,90 @@ def main(cfg: DictConfig):
     if wandb_log and master_process:
         import wandb
         wandb.init(project=wandb_project, name = wandb_run_name, config=OmegaConf.to_container(cfg, resolve=True))
-
-    # training loop
-    X, Y = dataset.sample_batch('train', batch_size=batch_size, length=training_length, randomize=training_randomize) # fetch the very first batch
-    t0 = time.time()
-    local_iter_num = 0 # number of iterations in the lifetime of this process
-    raw_model = model.module if ddp else model # unwrap DDP container if needed
-    sum_loss = 0
-    sum_acc = 0
-    total_sample_time = 0
-    while True:
-
-        # determine and set the learning rate for this iteration
-        lr = get_lr(iter_num) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-
-        # forward backward update, with optional gradient accumulation to simulate larger batch size
-        # and using the GradScaler if data type is float16
-        for micro_step in range(gradient_accumulation_steps):
-            if ddp:
-                # in DDP training we only need to sync gradients at the last micro step.
-                # the official way to do this is with model.no_sync() context manager, but
-                # I really dislike that this bloats the code and forces us to repeat code
-                # looking at the source of that context manager, it just toggles this variable
-                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-            with ctx:
-                logits, loss, acc = model(X, Y, acc = True)
-                sum_loss += loss.item()
-                sum_acc += acc.item()
-                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-            # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = dataset.sample_batch('train', batch_size=batch_size, length=training_length, randomize=training_randomize)
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
-        # clip the gradient
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        # step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)
-        scaler.update()
-        # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
-
-        if iter_num % log_interval == 0 and master_process and iter_num > 0:
-            # get loss as float. note: this is a CPU-GPU sync point
-            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-            # lossf = loss.item() * gradient_accumulation_steps
-            lossf = sum_loss / log_interval
-            sum_loss = 0
-            accf = sum_acc / log_interval
-            sum_acc = 0
-            dt = time.time() - t0
+    for epoch in range(cfg.optim.epochs):
+        print(f"Epoch {epoch+1}/{cfg.optim.epochs}")
+        epoch_loss = 0
+        epoch_acc = 0
+        epoch_iter_num = 0 # number of iterations in the lifetime of this epoch
+        for i in range(0, len(train_loader.data), batch_size):
+            X, Y, _ = train_loader.get_batch(i)
+            X = X.to(device)
+            Y = Y.to(device)
             t0 = time.time()
-            print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}, dt {dt:.4f}")
-            # print(f"sample time per iter: {total_sample_time:.4f} sec")
-            total_sample_time = 0
-            if wandb_log:
-                wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr}, step=iter_num)
-            if lossf < best_val_loss or always_save_checkpoint:
-                best_val_loss = lossf
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': cfg,
-                    }
-                    print(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-        iter_num += 1
-        local_iter_num += 1
+            local_iter_num = 0 # number of iterations in the lifetime of this process
+            raw_model = model.module if ddp else model # unwrap DDP container if needed
+            sum_loss = 0
+            sum_acc = 0
+            lr = get_lr(iter_num) if decay_lr else learning_rate
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            # forward backward update, with optional gradient accumulation to simulate larger batch size
+            # and using the GradScaler if data type is float16
+            for micro_step in range(gradient_accumulation_steps):
+                if ddp:
+                    # in DDP training we only need to sync gradients at the last micro step.
+                    # the official way to do this is with model.no_sync() context manager, but
+                    # I really dislike that this bloats the code and forces us to repeat code
+                    # looking at the source of that context manager, it just toggles this variable
+                    model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+                with ctx:
+                    logits, loss, acc = model(X, Y, acc = True, loss_type = cfg.data.loss_type)
+                    sum_loss += loss.item()
+                    sum_acc += acc.item()
+                    epoch_loss += loss.item()
+                    epoch_acc += acc.item()
+                    epoch_iter_num += 1
+                    loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
-        # termination conditions
-        if iter_num > max_iters:
-            break
-    
+                # backward pass, with gradient scaling if training in fp16
+                scaler.scale(loss).backward()
+            # clip the gradient
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # step the optimizer and scaler if training in fp16
+            scaler.step(optimizer)
+            scaler.update()
+            # flush the gradients as soon as we can, no need for this memory anymore
+            optimizer.zero_grad(set_to_none=True)
+            
+
+            if iter_num % log_interval == 0 and master_process and iter_num > 0:
+                # get loss as float. note: this is a CPU-GPU sync point
+                # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+                # lossf = loss.item() * gradient_accumulation_steps
+                lossf = sum_loss / log_interval
+                sum_loss = 0
+                accf = sum_acc / log_interval
+                sum_acc = 0
+                dt = time.time() - t0
+                t0 = time.time()
+                print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}, dt {dt:.4f}")
+                if wandb_log:
+                    wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr}, step=iter_num)
+                if lossf < best_val_loss or always_save_checkpoint:
+                    best_val_loss = lossf
+                    if iter_num > 0:
+                        checkpoint = {
+                            'model': raw_model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'model_args': model_args,
+                            'iter_num': iter_num,
+                            'best_val_loss': best_val_loss,
+                            'config': cfg,
+                        }
+                        print(f"saving checkpoint to {out_dir}")
+                        torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            iter_num += 1
+        
+        print(f"Epoch {epoch+1} completed. Avg Loss: {epoch_loss/epoch_iter_num:.4f}, Avg Acc: {epoch_acc/epoch_iter_num:.4f}")
+        epoch_iter_num = 0
+        epoch_loss = 0
+        epoch_acc = 0
+
     if ddp:
         destroy_process_group()
 
-    """
-    test model part
-    """
-    print("Evaluating best model on test set...")
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    best_model = ckpt['model']
-    best_model_args = ckpt['model_args']
-    if best_model is not None:
-        best_model_args['levelrand'] = False  # turn off level randomization for testing
-        for level in range(0, levelmax+1):
-            best_model_args['level'] = level
-            eval_model = GPT(GPTConfig(**best_model_args))
-            eval_model.load_state_dict(best_model)
-            eval_model.to(device)
-            eval_model.eval()
-            X, Y = dataset.sample_batch('test',batch_size=test_samples, length = test_length, randomize = test_randomize) # fetch the very first batch
-            with torch.no_grad():
-                logits, loss, acc = eval_model(X, Y, acc = True)
-            print(f"level = {level}, test loss {loss.item():.4f}, test acc {acc.item():.3f}")
-            if wandb_log:
-                wandb.log({'test_loss': loss.item(), 'test_acc': acc.item()}, step=level)
 
 if __name__ == "__main__":
     main()

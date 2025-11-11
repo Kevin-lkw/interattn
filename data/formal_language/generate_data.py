@@ -3,8 +3,8 @@ import json
 import copy
 import pickle
 
-from args import build_parser
-from dataloader import DyckCorpus, CounterCorpus, ShuffleCorpus, ParityCorpus, CRLCorpus, StarFreeCorpus, NonStarFreeCorpus, TomitaCorpus, BooleanExprCorpus, RDyckCorpus, CAB_n_ABDCorpus
+from data.formal_language.args import build_parser
+from data.formal_language.dataloader import DyckCorpus, CounterCorpus, ShuffleCorpus, ParityCorpus, CRLCorpus, StarFreeCorpus, NonStarFreeCorpus, TomitaCorpus, BooleanExprCorpus, RDyckCorpus, CAB_n_ABDCorpus
 
 star_free_langs = ['AAstarBBstar', 'ABStar']
 
@@ -20,6 +20,7 @@ def load_data(config, num_bins = 2):
 	'''
 	if config.mode == 'train':
 		#logger.debug('Loading Training Data...')
+
 
 		'''Load Datasets'''
 		if config.lang == 'Dyck':
@@ -273,7 +274,8 @@ def load_data(config, num_bins = 2):
 				lower_window = upper_window
 				upper_window = upper_window + config.len_incr
 
-
+		else :
+			raise NotImplementedError(f"Language {config.lang} not implemented.")
 
 	msg = 'Training and Validation Data Loaded'
 	print(msg)

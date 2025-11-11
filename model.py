@@ -124,6 +124,7 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_outputs: int = None
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -153,12 +154,14 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        print(config.vocab_size,config.n_outputs)
+        if config.n_outputs is not None:
+            self.lm_head = nn.Linear(config.n_embd, config.n_outputs, bias=False)
+        else:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            # Only tie weights when input and output vocab sizes are the same
+            # https://paperswithcode.com/method/weight-tying
+            self.transformer.wte.weight = self.lm_head.weight
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -189,7 +192,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, acc = False):
+    def forward(self, idx, targets=None, acc = False, loss_type = 'cross_entropy'):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -198,6 +201,7 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -206,13 +210,24 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if loss_type == 'cross_entropy':
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            elif loss_type == 'mse':
+                loss = F.mse_loss(logits, targets)
+            else:
+                raise ValueError(f"Unsupported loss_type: {loss_type}")
             if acc:
-                with torch.no_grad():
-                    mask = targets != -1
-                    num_correct = (logits.argmax(-1) == targets) * mask
-                    acc = num_correct.sum() / mask.sum()
-                    # import ipdb; ipdb.set_trace()
+                if loss_type == 'cross_entropy':
+                    with torch.no_grad():
+                        mask = targets != -1
+                        num_correct = (logits.argmax(-1) == targets) * mask
+                        acc = num_correct.sum() / mask.sum()
+                elif loss_type == 'mse':
+                    with torch.no_grad():
+                        mse_threshold = 0.5  # Define a threshold for considering a prediction as correct
+                        num_correct = ((logits - targets).abs() < mse_threshold).all(dim=-1).all(dim=-1).sum()
+                        acc = num_correct / targets.size(0)
+                        # import ipdb; ipdb.set_trace()
                 return logits, loss, acc
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

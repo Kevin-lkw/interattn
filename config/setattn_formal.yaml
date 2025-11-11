@@ -1,0 +1,63 @@
+# conf/setattn.yaml
+defaults:
+  - base
+
+out_dir: out-formal
+eval_interval: 250
+eval_iters: 200
+log_interval: 50
+always_save_checkpoint: false
+
+wandb:
+  log: false
+  project: setattn-MQAR
+  run_name: null
+
+data:
+  dataset: formal
+  num_kv_pair: 16
+  power_a: 0.01
+  random_non_queries: True
+  gradient_accumulation_steps: 1
+  batch_size: 32
+  block_size: 256
+  # for dataloader
+  mode: train
+  p_val: 0.5
+  q_val: 0.5
+  lang: Parity
+  num_pair: null
+  lower_window: 2
+  upper_window: 50
+  training_size: 10000
+  test_size: 2000
+  len_incr: 50
+  num_bins: 3
+  debug: false
+  loss_type: mse
+model:
+  n_layer: 4
+  n_head: 4
+  n_embd: 64
+  dropout: 0.1
+  post_LN: False
+
+optim:
+  learning_rate: 1e-3
+  epochs: 100
+  lr_decay_iters: 5000
+  min_lr: 1e-4
+  beta2: 0.99
+
+lr_decay:
+  warmup_iters: 100
+
+attn:
+  type: vanilla
+  level: 1
+  levelmax: 8
+  levelrand: true
+  k_mapping: False
+  v_mapping: False
+  smaller_sets: False
+  feature_map: 'identity'

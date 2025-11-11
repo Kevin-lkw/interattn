@@ -145,6 +145,8 @@ class Voc:
 		return self.id2w[idx]
 
 	def create_vocab_dict(self, corpus, debug=False):
+		# last 10 sentences to get all letters
+        # seems ok
 		sents= corpus.source[-10:]
 		merged_sent = ''.join(sents)
 		all_letters = list(set(list(merged_sent)))

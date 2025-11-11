@@ -16,6 +16,7 @@ data:
   dataset: openwebtext
   gradient_accumulation_steps: 40
   batch_size: 12
+  loss_type: cross_entropy
 
 model:
   n_layer: 12

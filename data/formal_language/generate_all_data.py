@@ -91,7 +91,7 @@ def main():
         # Shuffle Languages
         ("Shuffle", "Shuffle-2", 10000, 2, 50, 2000, 3, 50, {"num_par": 2, "p_val": 0.5, "q_val": 0.25}),
         ("Shuffle", "Shuffle-4", 10000, 2, 100, 2000, 3, 50, {"num_par": 4, "p_val": 0.5, "q_val": 0.25}),
-        ("Shuffle", "Shuffle-6", 10000, 2, 1000, 2000, 3, 50, {"num_par": 6, "p_val": 0.5, "q_val": 0.25}),
+        ("Shuffle", "Shuffle-6", 10000, 2, 100, 2000, 3, 50, {"num_par": 6, "p_val": 0.5, "q_val": 0.25}),
         
         # Boolean Languages
         ("Boolean", "Boolean-3", 10000, 2, 50, 2000, 3, 50, {"num_par": 3, "p_val": 0.5}),

@@ -1,1 +1,1 @@
- CUDA_VISIBLE_DEVICES=7 python onlinetrain.py --config-name=setattn_mqar out_dir=out-tmp 
+ CUDA_VISIBLE_DEVICES=7 python offlinetrain.py --config-name=setattn_formal out_dir=out-tmp 

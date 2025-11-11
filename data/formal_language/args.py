@@ -61,7 +61,6 @@ def build_parser():
 	# parser.add_argument('-emb_size', type=int, default=256, help='Embedding dimensions of encoder and decoder inputs')
 	# parser.add_argument('-beam_width', type=int, default=10, help='Specify the beam width for decoder')
 	parser.add_argument('-max_length', type=int, default=35, help='Specify max decode steps: Max length string to output')
-	parser.add_argument('-bptt', type=int, default=35, help='Specify bptt length')
 
 	parser.add_argument('-use_emb', dest='use_emb', action='store_true', help='use_emb Weights ')
 	parser.add_argument('-no-use_emb', dest='use_emb', action='store_false', help='use_emb Weights')

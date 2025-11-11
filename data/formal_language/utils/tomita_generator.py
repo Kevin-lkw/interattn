@@ -3,7 +3,7 @@ import torch
 from collections import Counter
 import ipdb as pdb
 from abc import ABC, abstractmethod 
-from utils.crl_generator import DFA
+from data.formal_language.utils.crl_generator import DFA
 
 class TomitaLanguage(ABC):
 

@@ -18,6 +18,8 @@ def load_data(config, num_bins = 2):
 		Returns:
 			dataobject (dict) 
 	'''
+	# minus 1 for bin0 in training range
+	num_bins = num_bins - 1
 	if config.mode == 'train':
 		#logger.debug('Loading Training Data...')
 

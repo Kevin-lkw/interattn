@@ -236,6 +236,8 @@ def main(cfg: DictConfig):
     if wandb_log and master_process:
         import wandb
         wandb.init(project=wandb_project, name = wandb_run_name, config=OmegaConf.to_container(cfg, resolve=True))
+    sum_loss = 0
+    sum_acc = 0
     for epoch in range(cfg.optim.epochs):
         print(f"Epoch {epoch+1}/{cfg.optim.epochs}")
         epoch_loss = 0
@@ -245,11 +247,10 @@ def main(cfg: DictConfig):
             X, Y, _ = train_loader.get_batch(i)
             X = X.to(device)
             Y = Y.to(device)
+            # import ipdb; ipdb.set_trace()
             t0 = time.time()
-            local_iter_num = 0 # number of iterations in the lifetime of this process
             raw_model = model.module if ddp else model # unwrap DDP container if needed
-            sum_loss = 0
-            sum_acc = 0
+
             lr = get_lr(iter_num) if decay_lr else learning_rate
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
@@ -313,6 +314,10 @@ def main(cfg: DictConfig):
             iter_num += 1
         
         print(f"Epoch {epoch+1} completed. Avg Loss: {epoch_loss/epoch_iter_num:.4f}, Avg Acc: {epoch_acc/epoch_iter_num:.4f}")
+        early_stop_eps = 0.01
+        if epoch_acc/epoch_iter_num >= 1.0 - early_stop_eps:
+            print(f"Early stopping at epoch {epoch+1} as accuracy reached {epoch_acc/epoch_iter_num:.4f}")
+            break
         epoch_iter_num = 0
         epoch_loss = 0
         epoch_acc = 0

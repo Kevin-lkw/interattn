@@ -154,7 +154,6 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        print(config.vocab_size,config.n_outputs)
         if config.n_outputs is not None:
             self.lm_head = nn.Linear(config.n_embd, config.n_outputs, bias=False)
         else:
@@ -213,7 +212,18 @@ class GPT(nn.Module):
             if loss_type == 'cross_entropy':
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             elif loss_type == 'mse':
-                loss = F.mse_loss(logits, targets)
+                # targets shape: [B, T, n_outputs]
+                # Create mask: valid positions where not all values are -1
+                # import ipdb; ipdb.set_trace()
+                mask = (targets != -1).any(dim=-1).float()  # [B, T]
+                mask = mask.unsqueeze(-1)  # [B, T, 1] for broadcasting
+                
+                # Compute MSE only on valid (non-padding) positions
+                squared_diff = (logits - targets) ** 2  # [B, T, n_outputs]
+                masked_squared_diff = squared_diff * mask  # Zero out padding positions
+                
+                # Average over valid positions only
+                loss = masked_squared_diff.sum() / (mask.sum() * targets.size(-1))
             else:
                 raise ValueError(f"Unsupported loss_type: {loss_type}")
             if acc:
@@ -224,10 +234,20 @@ class GPT(nn.Module):
                         acc = num_correct.sum() / mask.sum()
                 elif loss_type == 'mse':
                     with torch.no_grad():
-                        mse_threshold = 0.5  # Define a threshold for considering a prediction as correct
-                        num_correct = ((logits - targets).abs() < mse_threshold).all(dim=-1).all(dim=-1).sum()
-                        acc = num_correct / targets.size(0)
-                        # import ipdb; ipdb.set_trace()
+                        # Create mask for valid positions
+                        if targets.dim() == 3:  # [B, T, n_outputs]
+                            mask = (targets != -1).any(dim=-1)  # [B, T]
+                            # For MSE, consider "correct" if all output dimensions are close enough
+                            mse_threshold = 0.5
+                            # Each position is correct only if ALL output dimensions are within threshold
+                            is_correct = ((logits - targets).abs() < mse_threshold).all(dim=-1)  # [B, T]
+                            masked_correct = is_correct * mask  # [B, T]
+                            valid_per_sample = mask.sum(dim=1)  # [B]
+                            correct_per_sample = masked_correct.sum(dim=1)  # [B]
+                            all_correct_per_sample = (correct_per_sample == valid_per_sample).float()  # [B]
+                            acc = all_correct_per_sample.mean()
+                        else:
+                            raise ValueError("MSE accuracy requires 3D targets [B, T, n_outputs]")
                 return logits, loss, acc
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

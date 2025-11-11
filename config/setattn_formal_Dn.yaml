@@ -1,0 +1,34 @@
+# conf/setattn.yaml
+defaults:
+  - setattn_formal
+
+out_dir: out-formal-AAStar
+
+wandb:
+  log: false
+  project: setattn-formal-parity
+  run_name: null
+
+data:
+  # for dataloader
+  mode: train
+  lang: D_n
+  num_par: 2 # n in D_n,2,3,4,12
+  lower_window: 2
+  upper_window: 100
+  training_size: 10000
+  test_size: 2000
+  len_incr: 100
+  num_bins: 2
+  debug: false
+  loss_type: mse
+
+attn:
+  type: vanilla
+  level: 1
+  levelmax: 8
+  levelrand: true
+  k_mapping: False
+  v_mapping: False
+  smaller_sets: False
+  feature_map: 'identity'

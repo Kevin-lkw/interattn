@@ -222,7 +222,8 @@ class Sampler(object):
 		source = batch_ids[:,:-1]
 		max_length = word_lens.max().item()
 		target_tensors = [self.Lang.lineToTensorOutput(line)[:len(word)] for line,word in zip(target_batch, word_batch)]
-		target_tensors_padded = [torch.cat([t, torch.zeros(max_length - len(t), self.noutputs)]).unsqueeze(0) for t in target_tensors]
+		# Use -1 for padding instead of 0
+		target_tensors_padded = [torch.cat([t, -torch.ones(max_length - len(t), self.noutputs)]).unsqueeze(0) for t in target_tensors]
 		target = torch.cat(target_tensors_padded)
 		return source, target, word_lens
 

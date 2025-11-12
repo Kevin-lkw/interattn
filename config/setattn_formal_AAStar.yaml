@@ -24,12 +24,3 @@ data:
   debug: false
   loss_type: mse
 
-attn:
-  type: vanilla
-  level: 1
-  levelmax: 8
-  levelrand: true
-  k_mapping: False
-  v_mapping: False
-  smaller_sets: False
-  feature_map: 'identity'

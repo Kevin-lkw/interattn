@@ -237,6 +237,7 @@ class GPT(nn.Module):
                         # Create mask for valid positions
                         if targets.dim() == 3:  # [B, T, n_outputs]
                             mask = (targets != -1).any(dim=-1)  # [B, T]
+                            # import ipdb; ipdb.set_trace()
                             # For MSE, consider "correct" if all output dimensions are close enough
                             mse_threshold = 0.5
                             # Each position is correct only if ALL output dimensions are within threshold

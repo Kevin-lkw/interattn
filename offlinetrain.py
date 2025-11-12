@@ -131,7 +131,6 @@ def main(cfg: DictConfig):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    assert dataset_name == 'formal', "This training script only supports the formal dataset."
     train_corpus,valid_corpus_bins = load_data(config=cfg.data,num_bins=cfg.data.num_bins)
     voc = Voc()
     voc.create_vocab_dict(train_corpus)
@@ -238,8 +237,8 @@ def main(cfg: DictConfig):
         wandb.init(project=wandb_project, name = wandb_run_name, config=OmegaConf.to_container(cfg, resolve=True))
     sum_loss = 0
     sum_acc = 0
-    for epoch in range(cfg.optim.epochs):
-        print(f"Epoch {epoch+1}/{cfg.optim.epochs}")
+    for epoch in range(1,cfg.optim.epochs+1):
+        print(f"Epoch {epoch}/{cfg.optim.epochs}")
         epoch_loss = 0
         epoch_acc = 0
         epoch_iter_num = 0 # number of iterations in the lifetime of this epoch
@@ -313,14 +312,36 @@ def main(cfg: DictConfig):
                         torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
             iter_num += 1
         
-        print(f"Epoch {epoch+1} completed. Avg Loss: {epoch_loss/epoch_iter_num:.4f}, Avg Acc: {epoch_acc/epoch_iter_num:.4f}")
-        early_stop_eps = 0.01
-        if epoch_acc/epoch_iter_num >= 1.0 - early_stop_eps:
-            print(f"Early stopping at epoch {epoch+1} as accuracy reached {epoch_acc/epoch_iter_num:.4f}")
-            break
+        print(f"Epoch {epoch} completed. Avg Loss: {epoch_loss/epoch_iter_num:.4f}, Avg Acc: {epoch_acc/epoch_iter_num:.4f}")
+        
+        if epoch % cfg.eval_epoch == 0:
+            # perform validation
+            model.eval()
+            with torch.no_grad():
+                for bin,val_loader in enumerate(val_loader_bins):
+                    val_loss = 0
+                    val_acc = 0
+                    val_iter_num = 0
+                    for j in range(0, len(val_loader.data), batch_size):
+                        X_val, Y_val, _ = val_loader.get_batch(j)
+                        X_val = X_val.to(device)
+                        Y_val = Y_val.to(device)
+                        logits, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
+                        val_loss += loss.item()
+                        val_acc += acc.item()
+                        val_iter_num += 1
+                    print(f"Validation bin{bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
+                        Avg Val Acc: {val_acc/val_iter_num:.4f}")
+            model.train()
+        
+        # early_stop_eps = 0.01
+        # if epoch_acc/epoch_iter_num >= 1.0 - early_stop_eps:
+        #     print(f"Early stopping at epoch {epoch} as accuracy reached {epoch_acc/epoch_iter_num:.4f}")
+        #     break
         epoch_iter_num = 0
         epoch_loss = 0
         epoch_acc = 0
+        
 
     if ddp:
         destroy_process_group()

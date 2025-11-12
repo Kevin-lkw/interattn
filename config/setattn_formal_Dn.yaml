@@ -11,9 +11,10 @@ wandb:
 
 data:
   # for dataloader
+  dataset: D_12
   mode: train
   lang: D_n
-  num_par: 2 # n in D_n,2,3,4,12
+  num_par: 12 # n in D_n,2,3,4,12
   lower_window: 2
   upper_window: 100
   training_size: 10000

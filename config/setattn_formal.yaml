@@ -5,6 +5,7 @@ defaults:
 out_dir: out-formal
 eval_interval: 250
 eval_iters: 200
+eval_epoch: 10
 log_interval: 50
 always_save_checkpoint: false
 
@@ -14,11 +15,11 @@ wandb:
   run_name: null
 
 data:
-  dataset: formal
   gradient_accumulation_steps: 1
   batch_size: 32
   block_size: 256
   # for dataloader
+  dataset: Parity
   mode: train
   p_val: 0.5
   q_val: 0.5
@@ -32,6 +33,7 @@ data:
   num_bins: 3
   debug: false
   loss_type: mse
+
 model:
   n_layer: 4
   n_head: 4

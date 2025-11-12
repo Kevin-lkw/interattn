@@ -10,28 +10,26 @@ wandb:
   run_name: null
 
 data:
-  dataset: formal
+  dataset: Dyck-1
   # for dataloader
   mode: train
   p_val: 0.5
-  q_val: 0.5
+  q_val: 0.25
   lang: Dyck
-  num_pair: null
+  num_par: 1 # 1 kind of brackets
   lower_window: 2
   upper_window: 50
+  lower_depth: 0
+  upper_depth: -1
+  bin1_lower_window: 52
+  bin1_upper_window: 100
+  bin1_lower_depth: 0
+  bin1_upper_depth: -1
   training_size: 10000
   test_size: 2000
   len_incr: 50
-  num_bins: 3
+  num_bins: 2
   debug: false
   loss_type: mse
-
-attn:
-  type: vanilla
-  level: 1
-  levelmax: 8
-  levelrand: true
-  k_mapping: False
-  v_mapping: False
-  smaller_sets: False
-  feature_map: 'identity'
+  vary_len: true
+  vary_depth: false

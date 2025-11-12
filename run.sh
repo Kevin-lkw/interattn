@@ -1,1 +1,1 @@
- CUDA_VISIBLE_DEVICES=7 python offlinetrain.py --config-name=setattn_formal_Dn out_dir=out-tmp 
+ CUDA_VISIBLE_DEVICES=7 python offlinetrain.py --config-name=setattn_formal_Dyck out_dir=out-tmp 

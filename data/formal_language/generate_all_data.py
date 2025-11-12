@@ -82,38 +82,38 @@ def main():
     
     # Configuration for all tasks
     tasks = [
-        # Context-Free Languages
-        # Counter Languages
-        ("Counter", "Counter-anbn", 50, 2, 100, 50, 3, 100, {"num_par": 2}),
-        ("Counter", "Counter-anbncn", 50, 3, 150, 50, 3, 150, {"num_par": 3}),
-        ("Counter", "Counter-anbncndn", 50, 4, 200, 50, 3, 200, {"num_par": 4}),
+        # # Context-Free Languages
+        # # Counter Languages
+        # ("Counter", "Counter-anbn", 50, 2, 100, 50, 3, 100, {"num_par": 2}),
+        # ("Counter", "Counter-anbncn", 50, 3, 150, 50, 3, 150, {"num_par": 3}),
+        # ("Counter", "Counter-anbncndn", 50, 4, 200, 50, 3, 200, {"num_par": 4}),
         
-        # Shuffle Languages
-        ("Shuffle", "Shuffle-2", 10000, 2, 50, 2000, 3, 50, {"num_par": 2, "p_val": 0.5, "q_val": 0.25}),
-        ("Shuffle", "Shuffle-4", 10000, 2, 100, 2000, 3, 50, {"num_par": 4, "p_val": 0.5, "q_val": 0.25}),
-        ("Shuffle", "Shuffle-6", 10000, 2, 100, 2000, 3, 50, {"num_par": 6, "p_val": 0.5, "q_val": 0.25}),
+        # # Shuffle Languages
+        # ("Shuffle", "Shuffle-2", 10000, 2, 50, 2000, 3, 50, {"num_par": 2, "p_val": 0.5, "q_val": 0.25}),
+        # ("Shuffle", "Shuffle-4", 10000, 2, 100, 2000, 3, 50, {"num_par": 4, "p_val": 0.5, "q_val": 0.25}),
+        # ("Shuffle", "Shuffle-6", 10000, 2, 100, 2000, 3, 50, {"num_par": 6, "p_val": 0.5, "q_val": 0.25}),
         
-        # Boolean Languages
-        ("Boolean", "Boolean-3", 10000, 2, 50, 2000, 3, 50, {"num_par": 3, "p_val": 0.5}),
-        ("Boolean", "Boolean-5", 10000, 2, 50, 2000, 3, 50, {"num_par": 5, "p_val": 0.5}),
+        # # Boolean Languages
+        # ("Boolean", "Boolean-3", 10000, 2, 50, 2000, 3, 50, {"num_par": 3, "p_val": 0.5}),
+        # ("Boolean", "Boolean-5", 10000, 2, 50, 2000, 3, 50, {"num_par": 5, "p_val": 0.5}),
         
-        # Dyck Languages
-        ("Dyck", "Dyck-1", 10000, 2, 50, 2000, 3, 50, {"num_par": 1, "p_val": 0.5, "q_val": 0.25}),
+        # # Dyck Languages
+        # ("Dyck", "Dyck-1", 10000, 2, 50, 2000, 3, 50, {"num_par": 1, "p_val": 0.5, "q_val": 0.25}),
         
-        # Regular Languages
-        # Tomita Grammars
-        ("Tomita", "Tomita-1", 50, 2, 50, 100, 2, 50, {"num_par": 1}),
-        ("Tomita", "Tomita-2", 25, 2, 50, 50, 2, 50, {"num_par": 2}),
-        ("Tomita", "Tomita-3", 10000, 2, 50, 2000, 2, 50, {"num_par": 3}),
-        ("Tomita", "Tomita-4", 10000, 2, 50, 2000, 2, 50, {"num_par": 4}),
-        ("Tomita", "Tomita-5", 10000, 2, 50, 2000, 2, 50, {"num_par": 5}),
-        ("Tomita", "Tomita-6", 10000, 2, 50, 2000, 2, 50, {"num_par": 6}),
-        ("Tomita", "Tomita-7", 10000, 2, 50, 2000, 2, 50, {"num_par": 7}),
+        # # Regular Languages
+        # # Tomita Grammars
+        # ("Tomita", "Tomita-1", 50, 2, 50, 100, 2, 50, {"num_par": 1}),
+        # ("Tomita", "Tomita-2", 25, 2, 50, 50, 2, 50, {"num_par": 2}),
+        # ("Tomita", "Tomita-3", 10000, 2, 50, 2000, 2, 50, {"num_par": 3}),
+        # ("Tomita", "Tomita-4", 10000, 2, 50, 2000, 2, 50, {"num_par": 4}),
+        # ("Tomita", "Tomita-5", 10000, 2, 50, 2000, 2, 50, {"num_par": 5}),
+        # ("Tomita", "Tomita-6", 10000, 2, 50, 2000, 2, 50, {"num_par": 6}),
+        # ("Tomita", "Tomita-7", 10000, 2, 50, 2000, 2, 50, {"num_par": 7}),
         
-        # Star-Free Languages  
-        ("CStarAnCStarBnCStar", "CStarAnCStarBnCStar", 10000, 5, 200, 1000, 2, 100, {"num_par": 5}),
-        ("CAB_n_ABD", "CAB_n_ABD", 10000, 1, 50, 2000, 2, 50, {}),
-        ("CStarAnCStar", "CStarAnCStar", 10000, 2, 50, 2000, 2, 50, {"num_par": 3}),
+        # # Star-Free Languages  
+        # ("CStarAnCStarBnCStar", "CStarAnCStarBnCStar", 10000, 5, 200, 1000, 2, 100, {"num_par": 5}),
+        # ("CAB_n_ABD", "CAB_n_ABD", 10000, 1, 50, 2000, 2, 50, {}),
+        # ("CStarAnCStar", "CStarAnCStar", 10000, 2, 50, 2000, 2, 50, {"num_par": 3}),
         ("D_n", "D2", 10000, 2, 100, 2000, 2, 100, {"num_par": 2}),
         ("D_n", "D3", 10000, 2, 100, 2000, 2, 100, {"num_par": 3}),
         ("D_n", "D4", 10000, 2, 100, 2000, 2, 100, {"num_par": 4}),
@@ -122,10 +122,10 @@ def main():
         # Parity
         ("Parity", "Parity", 10000, 2, 50, 2000, 2, 50, {}),
         
-        # Non-Star-Free Languages
-        ("AAStar", "AAStar", 250, 2, 500, 50, 2, 100, {"num_par": 2}),
-        ("AnStarA2", "AnStarA2", 125, 4, 500, 25, 2, 100, {"num_par": 4}),
-        ("ABABStar", "ABABStar", 125, 4, 500, 25, 2, 100, {"num_par": 4}),
+        # # Non-Star-Free Languages
+        # ("AAStar", "AAStar", 250, 2, 500, 50, 2, 100, {"num_par": 2}),
+        # ("AnStarA2", "AnStarA2", 125, 4, 500, 25, 2, 100, {"num_par": 4}),
+        # ("ABABStar", "ABABStar", 125, 4, 500, 25, 2, 100, {"num_par": 4}),
     ]
     
     for task in tasks:

@@ -24,8 +24,9 @@ class NonStarFreeLanguage(object):
 		while len(arr) < num:
 			string = self.generate_string(min_length, max_length)
 			if len(string) >= min_length and len(string) <= max_length:
-				arr.append(string)
-				print("Generated {}/{} samples".format(len(arr), num), end = '\r', flush = True)
+				if string not in arr:
+					arr.append(string)
+					print("Generated {}/{} samples".format(len(arr), num), end = '\r', flush = True)
 		print()
 		return arr
 

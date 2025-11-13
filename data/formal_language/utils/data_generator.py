@@ -46,7 +46,8 @@ class CounterLanguage():
     def sample_from_a_distrib (self, domain, sample_size, distrib_name):
         N = len(domain)
         if distrib_name == 'uniform':
-            return np.random.choice (a=domain, size=sample_size)
+            # not replace to avoid duplicates
+            return np.random.choice (a=domain, size=sample_size, replace=False)
         
         elif distrib_name == 'u-shaped':
             alpha = 0.25

@@ -10,16 +10,16 @@ wandb:
   run_name: null
 
 data:
-  dataset: AAStar
+  dataset: ABABStar
   block_size: 1024
   # for dataloader
   mode: train
-  lang: AAStar
+  lang: ABABStar
   num_par: 2 # number of 'a', 2 means 'aa'
-  lower_window: 2
+  lower_window: 4
   upper_window: 500
-  training_size: 250
-  test_size: 50
+  training_size: 125
+  test_size: 25
   len_incr: 100
   num_bins: 2
   debug: false

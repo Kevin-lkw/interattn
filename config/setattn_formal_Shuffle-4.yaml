@@ -10,20 +10,24 @@ wandb:
   run_name: null
 
 data:
-  dataset: Parity
+  dataset: Shuffle-4
   # for dataloader
   mode: train
   p_val: 0.5
-  q_val: 0.5
-  lang: Parity
-  num_par: null
+  q_val: 0.25
+  lang: Shuffle
+  num_par: 4
   lower_window: 2
-  upper_window: 50
+  upper_window: 100
+  lower_depth: 0
+  upper_depth: -1
+  bin1_lower_depth: 0
+  bin1_upper_depth: -1
   training_size: 10000
   test_size: 2000
   len_incr: 50
-  num_bins: 2
+  num_bins: 3
   debug: false
   loss_type: mse
-
+  vary_depth: false
 

@@ -232,7 +232,7 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
             upper_window = config.upper_window + config.len_incr
 
             for i in range(num_bins):
-                val_corpus_bin = NonStarFreeCorpus(config.num_par, lower_window, upper_window, config.test_size, config.debug, unique = True)
+                val_corpus_bin = NonStarFreeCorpus(config.lang,config.num_par, lower_window, upper_window, config.test_size, config.debug, unique = True)
                 val_corpus_bins.append(val_corpus_bin)
 
                 lower_window = upper_window

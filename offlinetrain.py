@@ -136,7 +136,7 @@ def main(cfg: DictConfig):
     meta_vocab_size = voc.nwords
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                    bias=bias, vocab_size=None, dropout=dropout, attn=cfg.attn)
+                    bias=bias, vocab_size=None, dropout=dropout, attn=cfg.attn, pos_enc_type='learned')
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch

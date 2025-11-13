@@ -6,7 +6,7 @@ out_dir: out-formal
 eval_interval: 250
 eval_iters: 200
 eval_epoch: 5
-log_interval: 50
+log_interval: 1000000
 always_save_checkpoint: false
 
 wandb:
@@ -42,7 +42,7 @@ model:
 
 optim:
   learning_rate: 1e-3
-  epochs: 100
+  epochs: 500
   lr_decay_iters: 5000
   min_lr: 1e-4
   beta2: 0.99
@@ -51,7 +51,7 @@ lr_decay:
   warmup_iters: 100
 
 attn:
-  type: linear_attention
+  type: vanilla
   level: 1
   levelmax: 8
   levelrand: true

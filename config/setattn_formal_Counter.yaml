@@ -10,18 +10,18 @@ wandb:
   run_name: null
 
 data:
-  dataset: AAStar
+  dataset: Counter-anbn
   block_size: 1024
   # for dataloader
   mode: train
-  lang: AAStar
-  num_par: 2 # number of 'a', 2 means 'aa'
-  lower_window: 2
-  upper_window: 500
-  training_size: 250
+  lang: Counter
+  num_par: 2 # number of character, 2 means 'anbn' 3 means 'anbncn'
+  lower_window: 1
+  upper_window: 50
+  training_size: 50
   test_size: 50
-  len_incr: 100
-  num_bins: 2
+  len_incr: 50
+  num_bins: 3
   debug: false
   loss_type: mse
 

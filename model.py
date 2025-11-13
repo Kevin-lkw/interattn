@@ -14,8 +14,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from setattn.setattn_legacy import SetAttention_Linear_Legacy
-from setattn.setattn_linear import SetAttention_Linear
+from attention_factory import create_attention
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -96,30 +96,19 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.post_LN = config.post_LN
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        if config.attn == 'vanilla':
+        if config.attn.type == 'vanilla':
             self.attn = CausalSelfAttention(config)
-        elif config.attn == 'setattn_linear_legacy':
-            self.attn = SetAttention_Linear_Legacy(config)
-        elif config.attn == 'setattn_linear':
-            self.attn = SetAttention_Linear(config)
-        else :
-            raise NotImplementedError
+        else:
+            self.attn = create_attention(config)
+
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        if self.post_LN:
-            x = self.ln_1(x)
-            x = x + self.attn(x)
-            x = self.ln_2(x)
-            x = x + self.mlp(x)
-        else :
-            x = x + self.attn(self.ln_1(x))
-            x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -130,14 +119,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    attn: str = 'vanilla'
-    level: int = None
-    levelrand: bool = None
-    k_mapping: bool = False
-    v_mapping: bool = False
-    smaller_sets: bool = False
-    post_LN: bool = False
-    feature_map: str = 'identity' 
+    attn: dict = None
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -201,7 +183,7 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)

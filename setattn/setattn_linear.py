@@ -99,12 +99,12 @@ class SetAttention_Linear_Slow(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.level = config.level
-        self.levelrand = config.levelrand
-        self.k_mapping = config.k_mapping
-        self.v_mapping = config.v_mapping
-        self.smaller_sets = config.smaller_sets
-        self.feature_map = config.feature_map
+        self.level = config.attn.level
+        self.levelrand = config.attn.levelrand
+        self.k_mapping = config.attn.k_mapping
+        self.v_mapping = config.attn.v_mapping
+        self.smaller_sets = config.attn.smaller_sets
+        self.feature_map = config.attn.feature_map
         if self.k_mapping:
             self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
         if self.v_mapping:
@@ -220,12 +220,12 @@ class SetAttention_Linear(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.level = config.level
-        self.levelrand = config.levelrand
-        self.k_mapping = config.k_mapping
-        self.v_mapping = config.v_mapping
-        self.smaller_sets = config.smaller_sets
-        self.feature_map = config.feature_map
+        self.level = config.attn.level
+        self.levelrand = config.attn.levelrand
+        self.k_mapping = config.attn.k_mapping
+        self.v_mapping = config.attn.v_mapping
+        self.smaller_sets = config.attn.smaller_sets
+        self.feature_map = config.attn.feature_map
         if self.k_mapping:
             self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
         if self.v_mapping:

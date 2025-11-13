@@ -5,7 +5,7 @@ defaults:
 out_dir: out-formal
 eval_interval: 250
 eval_iters: 200
-eval_epoch: 10
+eval_epoch: 5
 log_interval: 50
 always_save_checkpoint: false
 
@@ -35,11 +35,10 @@ data:
   loss_type: mse
 
 model:
-  n_layer: 4
+  n_layer: 2
   n_head: 4
   n_embd: 64
   dropout: 0.1
-  post_LN: False
 
 optim:
   learning_rate: 1e-3
@@ -52,11 +51,11 @@ lr_decay:
   warmup_iters: 100
 
 attn:
-  type: vanilla
+  type: linear_attention
   level: 1
   levelmax: 8
   levelrand: true
   k_mapping: False
   v_mapping: False
   smaller_sets: False
-  feature_map: 'identity'
+  feature_map: 'elementwise_product'

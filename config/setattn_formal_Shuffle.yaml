@@ -10,19 +10,17 @@ wandb:
   run_name: null
 
 data:
-  dataset: Dyck-1
+  dataset: Shuffle-2
   # for dataloader
   mode: train
   p_val: 0.5
   q_val: 0.25
-  lang: Dyck
-  num_par: 1 # 1 kind of brackets
+  lang: Shuffle
+  num_par: 2
   lower_window: 2
   upper_window: 50
   lower_depth: 0
   upper_depth: -1
-  bin1_lower_window: 52
-  bin1_upper_window: 100
   bin1_lower_depth: 0
   bin1_upper_depth: -1
   training_size: 10000
@@ -31,5 +29,5 @@ data:
   num_bins: 3
   debug: false
   loss_type: mse
-  vary_len: true
   vary_depth: false
+

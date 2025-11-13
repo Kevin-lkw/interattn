@@ -63,7 +63,6 @@ def main(cfg: DictConfig):
     n_embd = cfg.model.n_embd
     dropout = cfg.model.dropout
     bias = cfg.model.bias
-    post_LN = cfg.model.post_LN
 
     # 5) optim
     learning_rate = cfg.optim.learning_rate
@@ -86,16 +85,6 @@ def main(cfg: DictConfig):
     device = cfg.system.device
     dtype = cfg.system.dtype
     compile = cfg.system.compile
-
-    # 9) attn
-    attn = cfg.attn.type
-    level = cfg.attn.level
-    levelmax = cfg.attn.levelmax
-    levelrand = cfg.attn.levelrand
-    k_mapping = cfg.attn.k_mapping
-    v_mapping = cfg.attn.v_mapping
-    smaller_sets = cfg.attn.smaller_sets
-    feature_map = cfg.attn.feature_map
 
     # various inits, derived attributes, I/O setup
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -147,9 +136,7 @@ def main(cfg: DictConfig):
     meta_vocab_size = voc.nwords
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                    bias=bias, vocab_size=None, dropout=dropout, post_LN=post_LN,
-                    attn=attn, level = level, levelrand = levelrand,
-                    k_mapping = k_mapping, v_mapping = v_mapping, smaller_sets = smaller_sets, feature_map=feature_map)
+                    bias=bias, vocab_size=None, dropout=dropout, attn=cfg.attn)
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch

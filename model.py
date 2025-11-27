@@ -139,7 +139,7 @@ class CausalSelfAttention(nn.Module):
                 # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
                 config.n_embd // config.n_head, config.block_size * 2
             )
-    def forward(self, x):
+    def forward(self, x, visualize = False):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -190,19 +190,19 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_index=None):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         if config.attn.type == 'vanilla':
             self.attn = CausalSelfAttention(config)
         else:
-            self.attn = create_attention(config)
+            self.attn = create_attention(config, layer_index=layer_index)
 
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, visualize = False):
+        x = x + self.attn(self.ln_1(x), visualize=visualize)
         x = x + self.mlp(self.ln_2(x))
         return x
 @dataclass
@@ -230,7 +230,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, layer_index=i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         if config.n_outputs is not None:
@@ -270,7 +270,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, acc = False, loss_type = 'cross_entropy'):
+    def forward(self, idx, targets=None, acc = False, loss_type = 'cross_entropy', visualize = False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -284,7 +284,7 @@ class GPT(nn.Module):
         else:
             x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, visualize=visualize)
         x = self.transformer.ln_f(x)
 
         if targets is not None:

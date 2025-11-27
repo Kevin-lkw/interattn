@@ -8,7 +8,7 @@ from fla.layers.delta_net import DeltaNet
 from setattn.setattn_legacy import SetAttention_Linear_Legacy
 from setattn.setattn_linear import SetAttention_Linear
 
-def create_attention(config):
+def create_attention(config, layer_index=None):
     """
     Factory function to create attention mechanism based on config.
     
@@ -26,7 +26,7 @@ def create_attention(config):
         return SetAttention_Linear_Legacy(config)
     
     elif config.attn.type == 'setattn_linear':
-        return SetAttention_Linear(config)
+        return SetAttention_Linear(config,layer_index=layer_index)
     
     elif config.attn.type == 'linear_attention':
         return LinearAttention(hidden_size=config.n_embd,feature_map=config.attn.feature_map,

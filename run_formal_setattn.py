@@ -35,12 +35,14 @@ def run_single_experiment(task, attn_type, pos_enc, level, gpu):
         "python offlinetrain.py",
         f"--config-name={config_name}",
         "wandb.log=true",
-        f"wandb.project=setattn-formal-tmp",
-        f"wandb.run_name={attn_type}" + f"_{pos_enc}" + f"rand",
+        f"wandb.project=setattn-formal-Dn-tmp",
+        f"wandb.run_name=h2_{attn_type}" + f"_{pos_enc}" + f"_level{level}",
+        f"out_dir=out-{config_name}/h2_{attn_type}" + f"_level{level}",
         f"attn.type={attn_type}",
         f"attn.level={level}",
-        "attn.levelrand=true",
-        f"model.pos_enc_type={pos_enc}" 
+        "attn.levelrand=false",
+        f"model.pos_enc_type={pos_enc}" ,
+        f"model.n_head=2"
     ]
     
     
@@ -72,7 +74,7 @@ def run_experiment_wrapper(args):
 
 def main():
     # 配置可用的GPU列表
-    available_gpus = [5,6,7] * 2  # 根据实际情况修改
+    available_gpus = [3,3,3,3]   # 根据实际情况修改
     available_gpus = available_gpus 
     # 生成所有实验配置
     experiments = []
@@ -80,10 +82,10 @@ def main():
     for task in task_configs.keys():
         if task not in ["D_2"]:
             continue
-        # for level in range(0,6):
-        for pos_enc in ["nope","learned"]:
-            experiments.append((task, attn_type, pos_enc, 0))
-    
+        for level in [0,1,2,3,4,5]:
+            for pos_enc in ["nope"]:
+                experiments.append((task, attn_type, pos_enc, level))
+        
     # 为每个实验分配GPU（循环分配）
     gpu_cycle = cycle(available_gpus)
     experiments_with_gpu = [

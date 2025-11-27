@@ -121,7 +121,7 @@ def main(cfg: DictConfig):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    train_corpus,valid_corpus_bins = load_data(config=cfg.data,num_bins=cfg.data.num_bins)
+    train_corpus, valid_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
     voc = Voc()
     voc.create_vocab_dict(train_corpus)
     voc.noutputs = train_corpus.noutputs
@@ -285,41 +285,48 @@ def main(cfg: DictConfig):
                 print(f"iter {iter_num}: loss {lossf:.4f}, acc {accf:.3f}, dt {dt:.4f}")
                 if wandb_log:
                     wandb.log({'iter': iter_num, 'loss': lossf, 'acc': accf, 'lr': lr}, step=iter_num)
-                if lossf < best_val_loss or always_save_checkpoint:
-                    best_val_loss = lossf
-                    if iter_num > 0:
-                        checkpoint = {
-                            'model': raw_model.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                            'model_args': model_args,
-                            'iter_num': iter_num,
-                            'best_val_loss': best_val_loss,
-                            'config': cfg,
-                        }
-                        print(f"saving checkpoint to {out_dir}")
-                        torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
             if iter_num % eval_interval == 0:
                 # perform validation
                 model.eval()
-                with torch.no_grad():
-                    with ctx:
-                        for bin,val_loader in enumerate(val_loader_bins):
-                            val_loss = 0
-                            val_acc = 0
-                            val_iter_num = 0
-                            for j in range(0, len(val_loader.data), batch_size):
-                                X_val, Y_val, _ = val_loader.get_batch(j)
-                                X_val = X_val.to(device)
-                                Y_val = Y_val.to(device)
-                                _, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
-                                val_loss += loss.item()
-                                val_acc += acc.item()
-                                val_iter_num += 1
-                            print(f"Validation bin{bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
-                                Avg Val Acc: {val_acc/val_iter_num:.4f}")
-                            if wandb_log and master_process:
-                                wandb.log({f'val/loss_bin{bin}': val_loss/val_iter_num,
-                                        f'val/acc_bin{bin}': val_acc/val_iter_num}, step=iter_num)
+                sum_val_loss = 0
+                all_val_acc = []
+                with torch.no_grad(), ctx:
+                    for bin,val_loader in enumerate(val_loader_bins):
+                        val_loss = 0
+                        val_acc = 0
+                        val_iter_num = 0
+                        for j in range(0, len(val_loader.data), batch_size):
+                            X_val, Y_val, _ = val_loader.get_batch(j)
+                            X_val = X_val.to(device)
+                            Y_val = Y_val.to(device)
+                            _, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
+                            val_loss += loss.item()
+                            val_acc += acc.item()
+                            val_iter_num += 1
+                            sum_val_loss += loss.item()
+                        print(f"Validation bin{bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
+                            Avg Val Acc: {val_acc/val_iter_num:.4f}")
+                        all_val_acc.append(val_acc/val_iter_num)
+                        if wandb_log and master_process:
+                            wandb.log({f'val/loss_bin{bin}': val_loss/val_iter_num,
+                                    f'val/acc_bin{bin}': val_acc/val_iter_num}, step=iter_num)
+                    if sum_val_loss < best_val_loss or always_save_checkpoint:
+                        best_val_loss = sum_val_loss
+                        if iter_num > 0:
+                            checkpoint = {
+                                'model': raw_model.state_dict(),
+                                'optimizer': optimizer.state_dict(),
+                                'model_args': model_args,
+                                'iter_num': iter_num,
+                                'best_val_loss': best_val_loss,
+                                'val_acc': all_val_acc,
+                                'config': cfg,
+                            }
+                            print(f"saving checkpoint to {out_dir}")
+                            torch.save(checkpoint, os.path.join(out_dir, 'bestloss.pt'))
+                        if sum(all_val_acc)/len(all_val_acc) >= 0.999:
+                            print("Validation accuracy reached 99.9%, stopping training.")
+                            return
                 # if cfg.attn.type == 'setattn_linear' and iter_num % (eval_interval * 5) == 0 :
                 #     # add extra eval
                 #     raw_model = model.module if ddp else model  # unwrap DDP container if needed

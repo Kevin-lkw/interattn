@@ -12,6 +12,97 @@ from typing import Optional, Tuple
 from fla.layers.linear_attn import LinearAttention
 from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
 from setattn.setattn_legacy import get_sets
+import os
+
+def visualize_attention_matrix(
+    att_matrix: torch.Tensor,
+    batch_index: int = 0,
+    num_batches: int = 4,
+    save_path: Optional[str] = None,
+    layer_index = None,
+):
+    """
+    Visualize a 4D attention matrix (B, H, Q, K) for multiple batches and heads.
+
+    Args:
+        att_matrix: Attention weights or logits with shape (batch, heads, query, key).
+        batch_index: Starting batch index to visualize (up to ``num_batches`` batches).
+        num_batches: Maximum number of batches to show (defaults to 4 or whatever is available).
+        title: Custom title for the plot. Defaults to an auto generated one.
+        save_path: Optional filesystem path to save the figure.
+        show: Whether to immediately display the figure via matplotlib.
+
+    Returns:
+        (figure, axis) tuple from matplotlib for further customization.
+    """
+    if att_matrix.ndim != 4:
+        raise ValueError(f"Expected attention matrix with 4 dims (B, H, Q, K), got {att_matrix.shape}")
+    if not (0 <= batch_index < att_matrix.size(0)):
+        raise IndexError(f"batch_index {batch_index} out of range for batch size {att_matrix.size(0)}")
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError(
+            "visualize_attention_matrix requires matplotlib to be installed."
+        ) from exc
+
+    total_batches = att_matrix.size(0)
+    num_heads = att_matrix.size(1)
+    batches_to_show = min(num_batches, total_batches - batch_index)
+    if batches_to_show <= 0:
+        raise ValueError("No batches available to visualize from the provided batch_index.")
+
+    fig_width = 3 * num_heads
+    fig_height =  3 * batches_to_show
+    fig, axes = plt.subplots(batches_to_show, num_heads, figsize=(fig_width, fig_height))
+
+    if batches_to_show == 1 and num_heads == 1:
+        axes = [[axes]]
+    elif batches_to_show == 1:
+        axes = [axes]
+    elif num_heads == 1:
+        axes = [[ax] for ax in axes]
+
+    colorbar_ref = None
+    for row_idx, b_idx in enumerate(range(batch_index, batch_index + batches_to_show)):
+        for head_idx in range(num_heads):
+            att_slice = att_matrix[b_idx, head_idx]
+            att_np = att_slice.detach().float().cpu().numpy()
+            ax = axes[row_idx][head_idx]
+            im = ax.imshow(att_np, aspect="auto", interpolation="nearest", cmap="viridis")
+            if colorbar_ref is None:
+                colorbar_ref = im
+
+            if row_idx == batches_to_show - 1:
+                ax.set_xlabel("Key index")
+            else:
+                ax.set_xticklabels([])
+            if head_idx == 0:
+                ax.set_ylabel(f"Batch {b_idx}\nQuery index")
+            else:
+                ax.set_yticklabels([])
+            if row_idx == 0:
+                ax.set_title(f"Head {head_idx}")
+
+    if layer_index is not None:
+        title = f"Attention weights in layer{layer_index}"
+    else:
+        title = "Attention weights"
+    fig.suptitle(title)
+
+    all_axes = [axis for row in axes for axis in row]
+    # if colorbar_ref is not None:
+    #     fig.colorbar(colorbar_ref, ax=all_axes, fraction=0.02, pad=0.02)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+
+    if save_path is not None:
+        if not os.path.exists(os.path.dirname(save_path)):
+            os.makedirs(os.path.dirname(save_path))
+        fig.savefig(save_path, dpi=300)
+    import ipdb; ipdb.set_trace()
+    return fig, axes
+
 
 class CustomLinearAttention(LinearAttention):
     def __init__(self, **kwargs):
@@ -90,7 +181,7 @@ class CustomLinearAttention(LinearAttention):
         return o, final_state
 
 class SetAttention_Linear_Slow(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_index):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -116,6 +207,7 @@ class SetAttention_Linear_Slow(nn.Module):
             num_heads=self.n_head,
             feature_map=self.feature_map,
         )
+        self.layer_index = layer_index
 
     def forward(self, x):
         
@@ -211,7 +303,7 @@ correctness verified against above implementation, 20x faster than above
 TODO:can be further optimized by fusing two forward
 """ 
 class SetAttention_Linear(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_index):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -226,6 +318,7 @@ class SetAttention_Linear(nn.Module):
         self.v_mapping = config.attn.v_mapping
         self.smaller_sets = config.attn.smaller_sets
         self.feature_map = config.attn.feature_map
+        assert self.k_mapping == True and self.v_mapping == True, "k_mapping and v_mapping must be True"
         if self.k_mapping:
             self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
         if self.v_mapping:
@@ -237,8 +330,9 @@ class SetAttention_Linear(nn.Module):
             num_heads=self.n_head,
             feature_map=self.feature_map,
         )
+        self.layer_index = layer_index
 
-    def forward(self,x):
+    def forward(self, x, visualize = False):
         B, T, C = x.size()
         nh = self.n_head
         hs = C // nh
@@ -299,6 +393,9 @@ class SetAttention_Linear(nn.Module):
         if setlevel == 0 or self.smaller_sets:
             # no tail
             att = F.softmax(att_logits, dim=-1)  # (B,nh,T,nset)
+            if visualize:
+                print("visualizing attention matrix... T={}, nset={}, level={}".format(T, att_logits.shape[-1], setlevel))
+                visualize_attention_matrix(att, batch_index=0, save_path="./out-img/attn.png",layer_index=self.layer_index)
             att = F.dropout(att, p=self.dropout, training=self.training)
             V = V.transpose(1,2)  # (B,nh,nset,hs)
             out = att @ V  # (B,nh,T,hs)
@@ -340,6 +437,9 @@ class SetAttention_Linear(nn.Module):
         # concatenate
         att_logits = torch.cat([att_logits, attn_tail_logits.transpose(1, 2).unsqueeze(-1)], dim=-1)  # (B,nh,T,nset+1)
         att = F.softmax(att_logits, dim=-1)  # (B,nh,T,nset+1)
+        if visualize:
+            print("visualizing attention matrix... T={}, nset={}, level={}".format(T, att_logits.shape[-1]-1, setlevel))
+            visualize_attention_matrix(att, batch_index=0, save_path="./out-img/attn.png",layer_index=self.layer_index)
         att = self.attn_dropout(att)
         out = att[...,:-1] @ V.transpose(1,2)  # (B,nh,T,hs)
         out_tail = att[...,-1:] * V_tail.transpose(1,2)  # (B,nh,T,hs)

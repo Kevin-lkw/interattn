@@ -143,9 +143,7 @@ def main(cfg: DictConfig):
     meta_vocab_size = dataset.vocabulary_size
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                    bias=bias, vocab_size=None, dropout=dropout, post_LN=post_LN,
-                    attn=attn, level = level, levelrand = levelrand,
-                    k_mapping = k_mapping, v_mapping = v_mapping, smaller_sets = smaller_sets, feature_map=feature_map)
+                    bias=bias, vocab_size=None, dropout=dropout,attn=cfg.attn, pos_enc_type=cfg.model.pos_enc_type)
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch
@@ -278,9 +276,9 @@ def main(cfg: DictConfig):
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             # lossf = loss.item() * gradient_accumulation_steps
-            lossf = sum_loss / log_interval
+            lossf = sum_loss / log_interval / gradient_accumulation_steps
             sum_loss = 0
-            accf = sum_acc / log_interval
+            accf = sum_acc / log_interval / gradient_accumulation_steps
             sum_acc = 0
             dt = time.time() - t0
             t0 = time.time()

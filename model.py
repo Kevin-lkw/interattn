@@ -144,9 +144,9 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head) # (B, T, nh, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head) # (B, T, nh, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head) # (B, T, nh, hs)
 
         # Apply RoPE if specified
         if self.pos_enc_type == 'rope':
@@ -154,7 +154,7 @@ class CausalSelfAttention(nn.Module):
             q, k = apply_rotary_emb(q, k, self.freqs_cis[:T])
         q = q.transpose(1, 2)  # (B, nh, T, hs)
         k = k.transpose(1, 2)  # (B, nh, T, hs)
-            
+        v = v.transpose(1, 2)  # (B, nh, T, hs)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -293,9 +293,9 @@ class GPT(nn.Module):
             if loss_type == 'cross_entropy':
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             elif loss_type == 'mse':
+                logits = nn.Sigmoid()(logits)
                 # targets shape: [B, T, n_outputs]
                 # Create mask: valid positions where not all values are -1
-                # import ipdb; ipdb.set_trace()
                 mask = (targets != -1).any(dim=-1).float()  # [B, T]
                 mask = mask.unsqueeze(-1)  # [B, T, 1] for broadcasting
                 

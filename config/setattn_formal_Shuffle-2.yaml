@@ -9,6 +9,8 @@ wandb:
   project: setattn-formal-parity
   run_name: null
 
+model:
+  pos_enc_type: learned
 data:
   dataset: Shuffle-2
   # for dataloader

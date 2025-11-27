@@ -22,10 +22,11 @@ model:
   n_layer: 12
   n_head: 12
   n_embd: 768
-  dropout: 0.0
+  dropout: 0.1
   bias: false
   block_size: 1024
   post_LN: False
+  pos_enc_type: nope  # 'learned', 'rope', 'nope'
 
 optim:
   learning_rate: 6e-4
@@ -54,3 +55,6 @@ attn:
   set_policy: null
   set_aggr: null
   set_number: null
+  feature_map: null
+  k_mapping: True
+  v_mapping: True

@@ -63,6 +63,7 @@ def main(cfg: DictConfig):
     n_embd = cfg.model.n_embd
     dropout = cfg.model.dropout
     bias = cfg.model.bias
+    pos_enc_type = cfg.model.pos_enc_type
 
     # 5) optim
     learning_rate = cfg.optim.learning_rate
@@ -136,7 +137,7 @@ def main(cfg: DictConfig):
     meta_vocab_size = voc.nwords
     # model init
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                    bias=bias, vocab_size=None, dropout=dropout, attn=cfg.attn, pos_enc_type='learned')
+                        bias=bias, vocab_size=None, dropout=dropout, attn=cfg.attn, pos_enc_type=pos_enc_type)
                     # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch
@@ -297,39 +298,54 @@ def main(cfg: DictConfig):
                         }
                         print(f"saving checkpoint to {out_dir}")
                         torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            if iter_num % eval_interval == 0:
+                # perform validation
+                model.eval()
+                with torch.no_grad():
+                    with ctx:
+                        for bin,val_loader in enumerate(val_loader_bins):
+                            val_loss = 0
+                            val_acc = 0
+                            val_iter_num = 0
+                            for j in range(0, len(val_loader.data), batch_size):
+                                X_val, Y_val, _ = val_loader.get_batch(j)
+                                X_val = X_val.to(device)
+                                Y_val = Y_val.to(device)
+                                _, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
+                                val_loss += loss.item()
+                                val_acc += acc.item()
+                                val_iter_num += 1
+                            print(f"Validation bin{bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
+                                Avg Val Acc: {val_acc/val_iter_num:.4f}")
+                            if wandb_log and master_process:
+                                wandb.log({f'val/loss_bin{bin}': val_loss/val_iter_num,
+                                        f'val/acc_bin{bin}': val_acc/val_iter_num}, step=iter_num)
+                # if cfg.attn.type == 'setattn_linear' and iter_num % (eval_interval * 5) == 0 :
+                #     # add extra eval
+                #     raw_model = model.module if ddp else model  # unwrap DDP container if needed
+                    
+                #     raw_model.config.level_rand = False
+                #     for level in range(0, cfg.attn.levelmax+1):
+                #         for bin,val_loader in enumerate(val_loader_bins):
+                #             val_loss = 0
+                #             val_acc = 0
+                #             val_iter_num = 0
+                #             raw_model.config.level = level
+                #             for j in range(0, len(val_loader.data), batch_size):
+                #                 X_val, Y_val, _ = val_loader.get_batch(j)
+                #                 X_val = X_val.to(device)
+                #                 Y_val = Y_val.to(device)
+                #                 _, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
+                #                 val_loss += loss.item()
+                #                 val_acc += acc.item()
+                #                 val_iter_num += 1
+                #             print(f"Validation level={level} bin={bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
+                #                 Avg Val Acc: {val_acc/val_iter_num:.4f}")
+                #             if wandb_log and master_process:
+                #                 wandb.log({f'val_acc_level/bin{bin}/level{level}': val_acc/val_iter_num}, step=iter_num)
+                #     raw_model.config.level_rand = True
+                model.train()
             iter_num += 1
-        
-        print(f"Epoch {epoch} completed. Avg Loss: {epoch_loss/epoch_iter_num:.4f}, Avg Acc: {epoch_acc/epoch_iter_num:.4f}")
-        
-        if epoch % cfg.eval_epoch == 0:
-            # perform validation
-            model.eval()
-            with torch.no_grad():
-                for bin,val_loader in enumerate(val_loader_bins):
-                    val_loss = 0
-                    val_acc = 0
-                    val_iter_num = 0
-                    for j in range(0, len(val_loader.data), batch_size):
-                        X_val, Y_val, _ = val_loader.get_batch(j)
-                        X_val = X_val.to(device)
-                        Y_val = Y_val.to(device)
-                        logits, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
-                        val_loss += loss.item()
-                        val_acc += acc.item()
-                        val_iter_num += 1
-                    print(f"Validation bin{bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
-                        Avg Val Acc: {val_acc/val_iter_num:.4f}")
-            model.train()
-        
-        # early_stop_eps = 0.01
-        # if epoch_acc/epoch_iter_num >= 1.0 - early_stop_eps:
-        #     print(f"Early stopping at epoch {epoch} as accuracy reached {epoch_acc/epoch_iter_num:.4f}")
-        #     break
-        epoch_iter_num = 0
-        epoch_loss = 0
-        epoch_acc = 0
-        
-
     if ddp:
         destroy_process_group()
 

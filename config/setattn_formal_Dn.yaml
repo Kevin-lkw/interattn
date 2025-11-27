@@ -2,12 +2,12 @@
 defaults:
   - setattn_formal
 
-out_dir: out-formal-AAStar
+out_dir: out-formal-Dn
 
 wandb:
   log: false
-  project: setattn-formal-parity
-  run_name: null
+  project: setattn-formal-Dn
+  run_name: ${attn.type}_${model.pos_enc_type}
 
 data:
   # for dataloader

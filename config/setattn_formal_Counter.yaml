@@ -8,7 +8,10 @@ wandb:
   log: false
   project: setattn-formal-parity
   run_name: null
-
+model:
+  pos_enc_type: learned
+optim:
+  epochs: 2000
 data:
   dataset: Counter-anbn
   block_size: 1024

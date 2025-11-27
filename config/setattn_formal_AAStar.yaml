@@ -4,6 +4,8 @@ defaults:
 
 out_dir: out-formal-AAStar
 
+model:
+  pos_enc_type: 'nope'
 wandb:
   log: false
   project: setattn-formal-parity

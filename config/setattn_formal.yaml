@@ -3,16 +3,15 @@ defaults:
   - base
 
 out_dir: out-formal
-eval_interval: 250
+eval_interval: 200
 eval_iters: 200
-eval_epoch: 5
-log_interval: 1000000
+log_interval: 50
 always_save_checkpoint: false
 
 wandb:
   log: false
   project: setattn-formal
-  run_name: null
+  run_name: ${attn.type}
 
 data:
   gradient_accumulation_steps: 1
@@ -42,7 +41,7 @@ model:
 
 optim:
   learning_rate: 1e-3
-  epochs: 500
+  epochs: 100
   lr_decay_iters: 5000
   min_lr: 1e-4
   beta2: 0.99
@@ -53,9 +52,7 @@ lr_decay:
 attn:
   type: vanilla
   level: 1
-  levelmax: 8
+  levelmax: 5 # log2(50)
   levelrand: true
-  k_mapping: False
-  v_mapping: False
   smaller_sets: False
   feature_map: 'elementwise_product'

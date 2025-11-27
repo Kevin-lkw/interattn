@@ -11,7 +11,7 @@ always_save_checkpoint: false
 wandb:
   log: true
   project: fixattn
-  run_name: setKV-L1-large-20
+  run_name: ${attn.type}-L${attn.level}-${data.dataset}-${data.training_length}
 
 data:
   dataset: parity

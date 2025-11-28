@@ -14,7 +14,7 @@ def get_sets(T: int, levelrand: bool, level: int, smaller_sets: bool, device):
     if smaller_sets:
         for l in range(0, setlevel+1):
             step = 2**l
-            for i in range(0, T // step, 2):
+            for i in range(T // step):
                 sets.append([i*step, (i+1)*step-1])
     else:   
         for l in range(setlevel, levelmax+1):

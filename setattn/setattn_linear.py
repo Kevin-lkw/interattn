@@ -349,22 +349,36 @@ class SetAttention_Linear(nn.Module):
         lens = []
         if len(sets) > 0:
             # support larger sets first
-            assert self.smaller_sets==False, "smaller_sets=False is required for fast version"
-            for l in range(setlevel, levelmax+1):
-                curlen = 2**l
-                tail = T % curlen
-                num_sets = (T - tail) // curlen
-                lens.extend([curlen]*num_sets)
-                # tried cumsum,find slower.
-                k_ = k[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
-                v_ = v[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
-                K_mean.append(k_)
-                V_mean.append(v_)
-
-            idx = torch.cat([
-                torch.arange(0, T - (T % (2**l)))
-                for l in range(setlevel, levelmax+1)
-            ]).to(q.device)
+            if self.smaller_sets:     
+                for l in range(0, setlevel+1):
+                    curlen = 2**l
+                    tail = T % curlen
+                    num_sets = (T - tail) // curlen
+                    lens.extend([curlen]*num_sets)
+                    # tried cumsum,find slower.
+                    k_ = k[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                    v_ = v[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                    K_mean.append(k_)
+                    V_mean.append(v_)
+                idx = torch.cat([
+                    torch.arange(0, T - (T % (2**l)))
+                    for l in range(0, setlevel+1)
+                ]).to(q.device)
+            else :
+                for l in range(setlevel, levelmax+1):
+                    curlen = 2**l
+                    tail = T % curlen
+                    num_sets = (T - tail) // curlen
+                    lens.extend([curlen]*num_sets)
+                    # tried cumsum,find slower.
+                    k_ = k[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                    v_ = v[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                    K_mean.append(k_)
+                    V_mean.append(v_)
+                idx = torch.cat([
+                    torch.arange(0, T - (T % (2**l)))
+                    for l in range(setlevel, levelmax+1)
+                ]).to(q.device)
             q_all = q[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
             k_all = k[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
             v_all = v[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
@@ -380,7 +394,7 @@ class SetAttention_Linear(nn.Module):
 
             K = self.k_proj(set_features) if self.k_mapping else K_mean # (B, nset, nh, hs)
             V = self.v_proj(set_features) if self.v_mapping else V_mean # (B, nset, nh, hs)
-            # import ipdb; ipdb.set_trace()
+
             mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,T,nset)
             # compute logits: q: (B,T,nh,hs) K: (B,nset,nh,hs) -> (B,nh,T,nset)
             att_logits = torch.matmul(q.transpose(1,2), K.transpose(1,2).transpose(-2,-1)) / (hs ** 0.5)  # (B,nh,T,nset)

@@ -35,14 +35,14 @@ def run_single_experiment(task, attn_type, pos_enc, level, gpu):
         "python offlinetrain.py",
         f"--config-name={config_name}",
         "wandb.log=true",
-        f"wandb.project=setattn-formal-Dn-tmp",
-        f"wandb.run_name=h2_{attn_type}" + f"_{pos_enc}" + f"_level{level}",
-        f"out_dir=out-{config_name}/h2_{attn_type}" + f"_level{level}",
+        f"wandb.project=setattn-formal-{task}-new",
+        f"wandb.run_name=LG_{attn_type}" + f"_level{level}",
+        f"out_dir=out-{task}/LG_{attn_type}" + f"_level{level}",
         f"attn.type={attn_type}",
         f"attn.level={level}",
-        "attn.levelrand=false",
+        "attn.levelrand=False",
+        f"attn.smaller_sets=False",
         f"model.pos_enc_type={pos_enc}" ,
-        f"model.n_head=2"
     ]
     
     
@@ -74,7 +74,7 @@ def run_experiment_wrapper(args):
 
 def main():
     # 配置可用的GPU列表
-    available_gpus = [3,3,3,3]   # 根据实际情况修改
+    available_gpus = [3,3,3,4,4]   # 根据实际情况修改
     available_gpus = available_gpus 
     # 生成所有实验配置
     experiments = []

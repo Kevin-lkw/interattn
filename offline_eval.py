@@ -56,7 +56,7 @@ def test_model(out_dir):
     if log: 
         wandb.finish()
 def main():
-    out_dir='out-setattn_formal_Dn/h2_setattn_linear_level0'
+    out_dir='out-Shuffle-2/LG_setattn_linear_level1'
     test_model(out_dir)
 
 

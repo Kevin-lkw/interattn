@@ -149,7 +149,7 @@ class Voc:
         # seems ok
 		sents= corpus.source[-10:]
 		merged_sent = ''.join(sents)
-		all_letters = list(set(list(merged_sent)))
+		all_letters = sorted(set(list(merged_sent)))
 
 		for letter in all_letters:
 			self.add_word(letter)

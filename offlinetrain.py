@@ -114,6 +114,7 @@ def main(cfg: DictConfig):
         os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(0 + seed_offset)
     torch.cuda.manual_seed(0 + seed_offset)
+    np.random.seed(0 + seed_offset)
 
     device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
     # note: float16 data type will automatically use a GradScaler
@@ -307,9 +308,11 @@ def main(cfg: DictConfig):
                         print(f"Validation bin{bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
                             Avg Val Acc: {val_acc/val_iter_num:.4f}")
                         all_val_acc.append(val_acc/val_iter_num)
+
                         if wandb_log and master_process:
                             wandb.log({f'val/loss_bin{bin}': val_loss/val_iter_num,
                                     f'val/acc_bin{bin}': val_acc/val_iter_num}, step=iter_num)
+                            
                     if sum_val_loss < best_val_loss or always_save_checkpoint:
                         best_val_loss = sum_val_loss
                         if iter_num > 0:

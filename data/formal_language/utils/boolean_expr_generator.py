@@ -1,20 +1,22 @@
 import numpy as np
 import torch
 from collections import defaultdict
-#ops = ['~', '^', '+', '*', '<', '>']
+# ops = ['~', '^', '+', '*', '<', '>']
 ops = ['~', '+', '>']
 symb2nary = {
 				'0' : 0,
 				'1' : 0,
 				'~' : 1,
 				'+' : 2,
-				'>' : 3
+				'>' : 3,
+				'<' : 4,
+    			'*' : 5,	
 			}
 
 class NAryBooleanExpLang(object):
 
 	def __init__(self, n = 3, p = 0.5):
-		assert n <= 3
+		assert n <= 5
 		self.n = n
 		self.p = p
 		self.sigma = ['0', '1']

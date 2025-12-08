@@ -2,42 +2,53 @@ import os
 import torch
 import matplotlib.pyplot as plt
 
+def get_acc(dir):
+    if not os.path.exists(dir):
+        raise ValueError(f"Directory {dir} does not exist.")
+    ckpt_path = os.path.join(dir, 'bestloss.pt')
+    ckpt = torch.load(ckpt_path, weights_only=False)
+    return ckpt['val_acc'][0], ckpt['val_acc'][1]
+
 def main():
     LG_ind_acc, LG_ood_acc = [], []
     SM_ind_acc, SM_ood_acc = [], []
-    task = "Shuffle-2"
-    for level in range(0, 6):
+    task = "Boolean-5"
+    LG_levels = list(range(0, 8))
+    SM_levels = list(range(0, 6))
+    for level in LG_levels:
         # LG
-        out_dir_level = f"out-{task}/LG_setattn_linear_level{level}"
-        ckpt_path = os.path.join(out_dir_level, 'bestloss.pt')
-        ckpt = torch.load(ckpt_path, weights_only=False)
-        lg_ind, lg_ood = ckpt['val_acc'][0], ckpt['val_acc'][1]
+        lg_ind, lg_ood = get_acc(f"out-{task}/setattn_linear_level{level}_LG")
         LG_ind_acc.append(lg_ind)
         LG_ood_acc.append(lg_ood)
-
+    for level in SM_levels:
         # SM
-        out_dir_level = f"out-{task}/SM_setattn_linear_level{level}"
-        ckpt_path = os.path.join(out_dir_level, 'bestloss.pt')
-        ckpt = torch.load(ckpt_path, weights_only=False)
-        sm_ind, sm_ood = ckpt['val_acc'][0], ckpt['val_acc'][1]
+        sm_ind, sm_ood = get_acc(f"out-{task}/setattn_linear_level{level}_SM")
         SM_ind_acc.append(sm_ind)
         SM_ood_acc.append(sm_ood)
     # import ipdb; ipdb.set_trace()
     # plotting
-    levels = list(range(0, 6))
+    vanilla_ind, vanilla_ood = get_acc(f"out-{task}/vanilla_nope")
+    print(f"Vanilla: IND acc = {vanilla_ind}, OOD acc = {vanilla_ood}")
+    # linear_ind, linear_ood = get_acc(f"out-{task}/linear_attention_nope")
+
     plt.figure()
 
     # 颜色：C0 用于 IND，C1 用于 OOD
     # 线型：实线 = LG，虚线 = SM
-    plt.plot(levels, LG_ind_acc, label='LG IND', linestyle='-',  marker='o', color='C0')
-    plt.plot(levels, LG_ood_acc, label='LG OOD', linestyle='--',  marker='s', color='C0')    
-    plt.plot(levels, SM_ind_acc, label='SM IND', linestyle='-', marker='o', color='C1')
-    plt.plot(levels, SM_ood_acc, label='SM OOD', linestyle='--', marker='s', color='C1')
+    plt.plot(LG_levels, LG_ind_acc, label='LG IND', linestyle='-',  marker='o', color='C0')
+    plt.plot(LG_levels, LG_ood_acc, label='LG OOD', linestyle='--',  marker='s', color='C0')    
+    plt.plot(SM_levels, SM_ind_acc, label='SM IND', linestyle='-', marker='o', color='C1')
+    plt.plot(SM_levels, SM_ood_acc, label='SM OOD', linestyle='--', marker='s', color='C1')
     
+    plt.axhline(y=vanilla_ind, color='C2', linestyle='-', label='Vanilla IND')
+    plt.axhline(y=vanilla_ood, color='C2', linestyle='--', label='Vanilla OOD')
+    # if linear_ind < 0.99 or linear_ood <0.99: 
+    #     plt.axhline(y=linear_ind, color='C3', linestyle='-', label='Linear Attention IND')
+    #     plt.axhline(y=linear_ood, color='C3', linestyle='--', label='Linear Attention OOD')
     plt.xlabel('Level')
     plt.ylabel('Validation Accuracy')
     plt.title(f'{task}')
-    plt.xticks(levels)
+    plt.xticks(LG_levels)
     plt.ylim(0, 1)
     plt.grid(True)
     plt.legend()

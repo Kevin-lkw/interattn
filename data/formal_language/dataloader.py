@@ -179,7 +179,7 @@ class TomitaCorpus(object):
 
 class BooleanExprCorpus(object):
 	def __init__(self, p, n, lower_window, upper_window, size, debug = False):
-		assert n > 0 and n <= 3
+		assert n > 0 and n <= 5
 		self.Lang = NAryBooleanExpLang(n = n, p = p)
 		self.source, self.target = self.generate_data(size, lower_window, upper_window)
 		self.noutputs = 2

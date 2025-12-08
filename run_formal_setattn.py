@@ -18,10 +18,13 @@ task_configs = {
     "Dyck-1": ("setattn_formal_Dyck", {}),
     "Shuffle-2": ("setattn_formal_Shuffle-2", {}),
     "Shuffle-4": ("setattn_formal_Shuffle-4", {}),
+    "Boolean-3": ("setattn_formal_Boolean-3", {}),
+    "Boolean-3-lg": ("setattn_formal_Boolean-3-lg", {}),
+    "Boolean-5": ("setattn_formal_Boolean-5", {}),
     "Counter-anbn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbn", "data.num_par": 2, "optim.epochs": 5000}),
     "Counter-anbncn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbncn", "data.num_par": 3, "optim.epochs": 5000}),
 }
-def run_single_experiment(task, attn_type, pos_enc, level, gpu):
+def run_single_experiment(task, attn_type, pos_enc, level, smaller, gpu):
     
     if task not in task_configs:
         print(f"❌ Unknown task: {task}")
@@ -30,18 +33,23 @@ def run_single_experiment(task, attn_type, pos_enc, level, gpu):
     config_name, extra_params = task_configs[task]
     
     # 构建命令
+    name_str = f"{attn_type}"
+    if attn_type == "vanilla" or attn_type == "linear_attention":
+        name_str += f"_{pos_enc}"
+    elif attn_type == "setattn_linear":
+        name_str += f"_level{level}" + ("_SM" if smaller else "_LG")
     cmd = [
         f"CUDA_VISIBLE_DEVICES={gpu}",
         "python offlinetrain.py",
         f"--config-name={config_name}",
         "wandb.log=true",
-        f"wandb.project=setattn-formal-{task}-new",
-        f"wandb.run_name=LG_{attn_type}" + f"_level{level}",
-        f"out_dir=out-{task}/LG_{attn_type}" + f"_level{level}",
+        f"wandb.project=setattn-formal-{task}",
+        f"wandb.run_name={name_str}",
+        f"out_dir=out-{task}/{name_str}",
         f"attn.type={attn_type}",
         f"attn.level={level}",
         "attn.levelrand=False",
-        f"attn.smaller_sets=False",
+        f"attn.smaller_sets={str(smaller)}",
         f"model.pos_enc_type={pos_enc}" ,
     ]
     
@@ -68,29 +76,37 @@ def run_single_experiment(task, attn_type, pos_enc, level, gpu):
 
 def run_experiment_wrapper(args):
     """Wrapper function for parallel execution"""
-    task, attn_type, pos_enc, level, gpu = args
-    return run_single_experiment(task, attn_type, pos_enc, level, gpu)
+    task, attn_type, pos_enc, level, smaller, gpu = args
+    return run_single_experiment(task, attn_type, pos_enc, level, smaller, gpu)
 
-
+level_mapping = {
+    "vanilla":[0],
+    "linear_attention":[0],
+    "setattn_linear":[7,8],
+}
+smaller_mapping = {
+    "vanilla":[False],
+    "linear_attention":[False],
+    "setattn_linear":[True, False],
+}
 def main():
     # 配置可用的GPU列表
-    available_gpus = [3,3,3,4,4]   # 根据实际情况修改
+    available_gpus = [1,2,3,4,5,6]*7   # 根据实际情况修改
     available_gpus = available_gpus 
     # 生成所有实验配置
     experiments = []
-    attn_type = "setattn_linear"
-    for task in task_configs.keys():
-        if task not in ["D_2"]:
-            continue
-        for level in [0,1,2,3,4,5]:
-            for pos_enc in ["nope"]:
-                experiments.append((task, attn_type, pos_enc, level))
-        
+    for attn_type in ["vanilla"]:
+        for task in ["Boolean-3-lg"]:
+            for level in level_mapping[attn_type]:
+                for pos_enc in ["nope"]:
+                    for smaller in smaller_mapping[attn_type]:
+                        experiments.append((task, attn_type, pos_enc, level, smaller))
+            
     # 为每个实验分配GPU（循环分配）
     gpu_cycle = cycle(available_gpus)
     experiments_with_gpu = [
-        (task, attn_type, pos_enc, level, next(gpu_cycle))
-        for task, attn_type, pos_enc, level in experiments
+        (task, attn_type, pos_enc, level, smaller, next(gpu_cycle))
+        for task, attn_type, pos_enc, level, smaller in experiments
     ]
     
     print(f"\n{'='*80}")
@@ -110,8 +126,8 @@ def main():
     
     if failed_experiments:
         print(f"\n❌ {len(failed_experiments)} experiment(s) failed:")
-        for (task, attn_type, pos_enc, gpu), _ in failed_experiments:
-            print(f"  - {task} | {attn_type}" + (f" | PE={pos_enc}" if pos_enc else "") + f" (GPU {gpu})")
+        for (task, attn_type, pos_enc, level, smaller, gpu), _ in failed_experiments:
+            print(f"  - {task} | {attn_type} | level={level}" + (f" | PE={pos_enc}" if pos_enc else "") + f" | smaller={smaller} (GPU {gpu})")
         sys.exit(1)
     else:
         print(f"\n✅ All {len(experiments_with_gpu)} experiments completed successfully!")

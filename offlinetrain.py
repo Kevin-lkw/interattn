@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import copy
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ from omegaconf import DictConfig, OmegaConf
 from data.formal_language.generate_data import load_data
 from data.formal_language.dataloader import Sampler
 from data.formal_language.utils.helper import Voc
+
 
 @hydra.main(config_path="config", config_name="setattn_mqar", version_base=None)
 def main(cfg: DictConfig):
@@ -122,17 +124,17 @@ def main(cfg: DictConfig):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    train_corpus, valid_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
+    train_corpus, validation_corpus, test_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
     voc = Voc()
     voc.create_vocab_dict(train_corpus)
     voc.noutputs = train_corpus.noutputs
 
     train_loader = Sampler(train_corpus, voc, cfg.data.batch_size)
-    val_loader_bins = [Sampler(val_corpus_bin, voc, cfg.data.batch_size) for val_corpus_bin in valid_corpus_bins]
+    val_loader = Sampler(validation_corpus, voc, cfg.data.batch_size)
+    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size) for test_corpus_bin in test_corpus_bins]
     
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0
-    best_val_loss = 1e9
 
     # attempt to derive vocab_size from the dataset
     meta_vocab_size = voc.nwords
@@ -172,7 +174,6 @@ def main(cfg: DictConfig):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
         model.load_state_dict(state_dict)
         iter_num = checkpoint['iter_num']
-        best_val_loss = checkpoint['best_val_loss']
     elif init_from.startswith('gpt2'):
         print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
         # initialize from OpenAI GPT-2 weights
@@ -226,10 +227,11 @@ def main(cfg: DictConfig):
         wandb.init(project=wandb_project, name = wandb_run_name, config=OmegaConf.to_container(cfg, resolve=True))
     sum_loss = 0
     sum_acc = 0
+    top_k = 5
+    top_ckpts = []
+    break_flag = False
     for epoch in range(1,cfg.optim.epochs+1):
         print(f"Epoch {epoch}/{cfg.optim.epochs}")
-        epoch_loss = 0
-        epoch_acc = 0
         epoch_iter_num = 0 # number of iterations in the lifetime of this epoch
         for i in range(0, len(train_loader.data), batch_size):
             X, Y, _ = train_loader.get_batch(i)
@@ -252,11 +254,9 @@ def main(cfg: DictConfig):
                     # looking at the source of that context manager, it just toggles this variable
                     model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
                 with ctx:
-                    logits, loss, acc = model(X, Y, acc = True, loss_type = cfg.data.loss_type)
+                    _, loss, acc, _ = model(X, Y, acc = True, loss_type = cfg.data.loss_type)
                     sum_loss += loss.item()
                     sum_acc += acc.item()
-                    epoch_loss += loss.item()
-                    epoch_acc += acc.item()
                     epoch_iter_num += 1
                     loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
@@ -290,75 +290,83 @@ def main(cfg: DictConfig):
                 # perform validation
                 model.eval()
                 sum_val_loss = 0
-                all_val_acc = []
                 with torch.no_grad(), ctx:
-                    for bin,val_loader in enumerate(val_loader_bins):
-                        val_loss = 0
-                        val_acc = 0
-                        val_iter_num = 0
-                        for j in range(0, len(val_loader.data), batch_size):
-                            X_val, Y_val, _ = val_loader.get_batch(j)
-                            X_val = X_val.to(device)
-                            Y_val = Y_val.to(device)
-                            _, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
-                            val_loss += loss.item()
-                            val_acc += acc.item()
-                            val_iter_num += 1
-                            sum_val_loss += loss.item()
-                        print(f"Validation bin{bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
-                            Avg Val Acc: {val_acc/val_iter_num:.4f}")
-                        all_val_acc.append(val_acc/val_iter_num)
+                    val_loss = 0
+                    val_acc = 0
+                    val_iter_num = 0
+                    for j in range(0, len(val_loader.data), batch_size):
+                        X_val, Y_val, _ = val_loader.get_batch(j)
+                        X_val = X_val.to(device)
+                        Y_val = Y_val.to(device)
+                        _, loss, acc, _ = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
+                        val_loss += loss.item()
+                        val_acc += acc.item()
+                        val_iter_num += 1
+                        sum_val_loss += loss.item()
+                    val_acc = val_acc / val_iter_num
+                    print(f" Avg Val Loss: {val_loss/val_iter_num:.4f}, Avg Val Acc: {val_acc:.4f}")
 
-                        if wandb_log and master_process:
-                            wandb.log({f'val/loss_bin{bin}': val_loss/val_iter_num,
-                                    f'val/acc_bin{bin}': val_acc/val_iter_num}, step=iter_num)
-                            
-                    if sum_val_loss < best_val_loss or always_save_checkpoint:
-                        best_val_loss = sum_val_loss
-                        if iter_num > 0:
-                            checkpoint = {
-                                'model': raw_model.state_dict(),
-                                'optimizer': optimizer.state_dict(),
-                                'model_args': model_args,
-                                'iter_num': iter_num,
-                                'best_val_loss': best_val_loss,
-                                'val_acc': all_val_acc,
-                                'config': cfg,
-                            }
-                            print(f"saving checkpoint to {out_dir}")
-                            torch.save(checkpoint, os.path.join(out_dir, 'bestloss.pt'))
-                        if sum(all_val_acc)/len(all_val_acc) >= 0.999:
-                            print("Validation accuracy reached 99.9%, stopping training.")
-                            return
-                # if cfg.attn.type == 'setattn_linear' and iter_num % (eval_interval * 5) == 0 :
-                #     # add extra eval
-                #     raw_model = model.module if ddp else model  # unwrap DDP container if needed
+                    if wandb_log and master_process:
+                        wandb.log({f'val/loss': val_loss/val_iter_num, f'val/acc': val_acc},step=iter_num)
+                        
+                    checkpoint = {
+                        'model': copy.deepcopy(raw_model.state_dict()),
+                        'optimizer': copy.deepcopy(optimizer.state_dict()),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'val_acc': val_acc,
+                        'config': cfg,
+                    }
+                    top_ckpts.append((val_acc, checkpoint))
+                    top_ckpts = sorted(top_ckpts, key=lambda x: x[0], reverse=True)[:top_k] 
                     
-                #     raw_model.config.level_rand = False
-                #     for level in range(0, cfg.attn.levelmax+1):
-                #         for bin,val_loader in enumerate(val_loader_bins):
-                #             val_loss = 0
-                #             val_acc = 0
-                #             val_iter_num = 0
-                #             raw_model.config.level = level
-                #             for j in range(0, len(val_loader.data), batch_size):
-                #                 X_val, Y_val, _ = val_loader.get_batch(j)
-                #                 X_val = X_val.to(device)
-                #                 Y_val = Y_val.to(device)
-                #                 _, loss, acc = model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type)
-                #                 val_loss += loss.item()
-                #                 val_acc += acc.item()
-                #                 val_iter_num += 1
-                #             print(f"Validation level={level} bin={bin} completed. Avg Val Loss: {val_loss/val_iter_num:.4f}, \
-                #                 Avg Val Acc: {val_acc/val_iter_num:.4f}")
-                #             if wandb_log and master_process:
-                #                 wandb.log({f'val_acc_level/bin{bin}/level{level}': val_acc/val_iter_num}, step=iter_num)
-                #     raw_model.config.level_rand = True
+                    if len(top_ckpts) == top_k and top_ckpts[-1][0] >= 0.999:
+                        print("Top-k Validation accuracy reached 99.9%, stopping training.")
+                        break_flag = True
+                        break
                 model.train()
             iter_num += 1
+        if break_flag:
+            break
     if ddp:
         destroy_process_group()
+    print("Training complete. Saving final checkpoints...")
+    
+    summary_acc = []
+    for rank, (val_acc, checkpoint) in enumerate(top_ckpts):
+        model_state = checkpoint['model']
+        model.load_state_dict(model_state)
+        model.eval()
+        for bin_idx, test_loader in enumerate(test_loader_bins):
+            # perform testing
 
+            test_loss = 0
+            test_acc = 0
+            test_iter_num = 0
+            with torch.no_grad(), ctx:
+                for j in range(0, len(test_loader.data), batch_size):
+                    X_test, Y_test, _ = test_loader.get_batch(j)
+                    X_test = X_test.to(device)
+                    Y_test = Y_test.to(device)
+                    _, loss, acc, _ = model(X_test, Y_test, acc = True, loss_type = cfg.data.loss_type)
+                    test_loss += loss.item()
+                    test_acc += acc.item()
+                    test_iter_num += 1
+                test_acc = test_acc / test_iter_num
+                print(f"model{rank+1} Test Bin {bin_idx}: Avg Test Loss: {test_loss/test_iter_num:.4f}, Avg Test Acc: {test_acc:.4f}")
 
+                if wandb_log and master_process:
+                    wandb.summary[f'model{rank+1}_test_bin{bin_idx}/acc'] = test_acc
+            summary_acc.append((rank+1, bin_idx, test_acc))
+        ckpt_path = os.path.join(out_dir, f'ckpt_top{rank+1}.pt')
+        torch.save(checkpoint, ckpt_path)
+        print(f"Saved checkpoint to {ckpt_path} with val acc {val_acc:.4f}")
+    # calc avg acc
+    for bin_idx in range(len(test_loader_bins)):
+        accs = [acc for r, b, acc in summary_acc if b == bin_idx]
+        avg_acc = sum(accs) / len(accs)
+        print(f"Average Test Acc for Bin {bin_idx}: {avg_acc:.4f}")
+        if wandb_log and master_process:
+            wandb.summary[f'test_bin{bin_idx}/acc'] = avg_acc
 if __name__ == "__main__":
     main()

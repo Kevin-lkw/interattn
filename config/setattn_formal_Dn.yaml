@@ -18,6 +18,7 @@ data:
   lower_window: 2
   upper_window: 100
   training_size: 10000
+  validation_size: 2000
   test_size: 2000
   len_incr: 100
   num_bins: 2

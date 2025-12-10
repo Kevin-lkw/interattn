@@ -24,6 +24,7 @@ data:
   bin1_lower_depth: 0
   bin1_upper_depth: -1
   training_size: 10000
+  validation_size: 2000
   test_size: 2000
   len_incr: 50
   num_bins: 3

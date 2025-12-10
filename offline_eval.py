@@ -13,51 +13,61 @@ from data.formal_language.generate_data import load_data
 from data.formal_language.dataloader import Sampler
 from data.formal_language.utils.helper import Voc
 import wandb
-def test_model(out_dir):
+def load_model(out_dir):
     """
-    test model part
+    load model part
     """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    log = False
-    if log:
-        exp = out_dir.split('/')[0]
-        model = out_dir.split('/')[1]
-        wandb.init(project=f"test-{exp}",name=model)
-
-    print("Evaluating best model on test set...")
-    ckpt_path = os.path.join(out_dir, 'bestloss.pt')
+    ckpt = "ckpt_top1.pt"
+    ckpt_path = os.path.join(out_dir, ckpt)
     ckpt = torch.load(ckpt_path,weights_only=False)
     cfg = ckpt['config']
-    print("eval model with acc",ckpt['val_acc'])
-    best_model = ckpt['model']
-    best_model_args = ckpt['model_args']
-    
-    # dataloader
-    train_corpus, valid_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[cfg.system.dtype]
+    ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device,dtype=ptdtype)
+    train_corpus, validation_corpus, test_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
     voc = Voc()
     voc.create_vocab_dict(train_corpus)
     voc.noutputs = train_corpus.noutputs
 
-    train_loader = Sampler(train_corpus, voc, cfg.data.batch_size)
-    val_loader_bins = [Sampler(val_corpus_bin, voc, cfg.data.batch_size) for val_corpus_bin in valid_corpus_bins]
+    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size) for test_corpus_bin in test_corpus_bins]
     
-    
-    with torch.no_grad():
-        eval_model = GPT(GPTConfig(**best_model_args))
-        eval_model.load_state_dict(best_model)
-        eval_model.to(device)
-        eval_model.eval()
-        for bin,val_loader in enumerate(val_loader_bins):
-            for j in range(0, len(val_loader.data), cfg.data.batch_size):
-                X_val, Y_val, _ = val_loader.get_batch(j)
-                X_val = X_val.to(device)
-                Y_val = Y_val.to(device)
-                eval_model(X_val, Y_val, acc = True, loss_type = cfg.data.loss_type, visualize = True)
-    if log: 
-        wandb.finish()
+    summary_acc = []
+    for rank in range(1,6):
+        ckpt = "ckpt_top{}.pt".format(rank)
+        ckpt_path = os.path.join(out_dir, ckpt)
+        ckpt = torch.load(ckpt_path,weights_only=False)
+        cfg = ckpt['config']
+        print("eval model with iter",ckpt['iter_num'], "val acc",ckpt['val_acc'])
+        model = GPT(GPTConfig(**ckpt['model_args']))
+        model.load_state_dict(ckpt['model'])
+        model.to(device)
+        model.eval()
+        for bin_idx, test_loader in enumerate(test_loader_bins):
+            # perform testing
+
+            test_loss = 0
+            test_acc = 0
+            test_iter_num = 0
+            with torch.no_grad(), ctx:
+                for j in range(0, len(test_loader.data), cfg.data.batch_size):
+                    X_test, Y_test, _ = test_loader.get_batch(j)
+                    X_test = X_test.to(device)
+                    Y_test = Y_test.to(device)
+                    _, loss, acc, _ = model(X_test, Y_test, acc = True, loss_type = cfg.data.loss_type)
+                    test_loss += loss.item()
+                    test_acc += acc.item()
+                    test_iter_num += 1
+                test_acc = test_acc / test_iter_num
+                print(f"model{rank} Test Bin {bin_idx}: Avg Test Loss: {test_loss/test_iter_num:.4f}, Avg Test Acc: {test_acc:.4f}")
+            summary_acc.append((rank, bin_idx, test_acc))
+    for bin_idx in range(len(test_loader_bins)):
+        accs = [acc for (rank, b_idx, acc) in summary_acc if b_idx == bin_idx]
+        avg_acc = sum(accs) / len(accs)
+        print(f"Average Test Acc for Bin {bin_idx}: {avg_acc:.4f}")
 def main():
-    out_dir='out-Shuffle-2/LG_setattn_linear_level1'
-    test_model(out_dir)
+    out_dir='out-Boolean-3/vanilla_nope'
+    load_model(out_dir)
+    # test_model(out_dir)
 
 
 if __name__ == "__main__":

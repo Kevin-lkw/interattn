@@ -328,9 +328,11 @@ class GPT(nn.Module):
                             correct_per_sample = masked_correct.sum(dim=1)  # [B]
                             all_correct_per_sample = (correct_per_sample == valid_per_sample).float()  # [B]
                             acc = all_correct_per_sample.mean()
+                            
+                            per_token_acc = masked_correct.sum() / mask.sum()
                         else:
                             raise ValueError("MSE accuracy requires 3D targets [B, T, n_outputs]")
-                return logits, loss, acc
+                return logits, loss, acc, per_token_acc
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

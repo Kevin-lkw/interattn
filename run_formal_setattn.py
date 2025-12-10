@@ -91,12 +91,12 @@ smaller_mapping = {
 }
 def main():
     # 配置可用的GPU列表
-    available_gpus = [1,2,3,4,5,6]*7   # 根据实际情况修改
+    available_gpus = [4,5,6,7]*7   # 根据实际情况修改
     available_gpus = available_gpus 
     # 生成所有实验配置
     experiments = []
     for attn_type in ["vanilla"]:
-        for task in ["Boolean-3-lg"]:
+        for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]:
             for level in level_mapping[attn_type]:
                 for pos_enc in ["nope"]:
                     for smaller in smaller_mapping[attn_type]:

@@ -90,14 +90,8 @@ def main(cfg: DictConfig):
     compile = cfg.system.compile
 
     # 9) attn
-    attn = cfg.attn.type
     level = cfg.attn.level
     levelmax = cfg.attn.levelmax
-    levelrand = cfg.attn.levelrand
-    k_mapping = cfg.attn.k_mapping
-    v_mapping = cfg.attn.v_mapping
-    smaller_sets = cfg.attn.smaller_sets
-    feature_map = cfg.attn.feature_map
 
     # various inits, derived attributes, I/O setup
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?

@@ -54,5 +54,5 @@ attn:
   level: 1
   levelmax: 5 # log2(50)
   levelrand: true
-  smaller_sets: False
+  set_policy: "large"  # "small" or "large" or "fixed"
   feature_map: 'elementwise_product'

@@ -24,7 +24,7 @@ task_configs = {
     "Counter-anbn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbn", "data.num_par": 2, "optim.epochs": 5000}),
     "Counter-anbncn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbncn", "data.num_par": 3, "optim.epochs": 5000}),
 }
-def run_single_experiment(task, attn_type, pos_enc, level, smaller, gpu):
+def run_single_experiment(task, attn_type, pos_enc, level, set_policy, gpu):
     
     if task not in task_configs:
         print(f"❌ Unknown task: {task}")
@@ -37,7 +37,7 @@ def run_single_experiment(task, attn_type, pos_enc, level, smaller, gpu):
     if attn_type == "vanilla" or attn_type == "linear_attention":
         name_str += f"_{pos_enc}"
     elif attn_type == "setattn_linear":
-        name_str += f"_level{level}" + ("_SM" if smaller else "_LG")
+        name_str += f"_level{level}" + ("_SM" if set_policy == "small" else ("_LG" if set_policy == "large" else "_FX"))
     cmd = [
         f"CUDA_VISIBLE_DEVICES={gpu}",
         "python offlinetrain.py",
@@ -49,7 +49,7 @@ def run_single_experiment(task, attn_type, pos_enc, level, smaller, gpu):
         f"attn.type={attn_type}",
         f"attn.level={level}",
         "attn.levelrand=False",
-        f"attn.smaller_sets={str(smaller)}",
+        f"attn.set_policy={set_policy}",
         f"model.pos_enc_type={pos_enc}" ,
     ]
     
@@ -85,27 +85,27 @@ level_mapping = {
     "setattn_linear":[0,1,2,3,4,5,6,7,8],
 }
 smaller_mapping = {
-    "vanilla":[False],
-    "linear_attention":[False],
-    "setattn_linear":[True, False],
+    "vanilla":["small"],
+    "linear_attention":["small"],
+    "setattn_linear":["small", "large", "fixed"],
 }
 def main():
     # 配置可用的GPU列表
     available_gpus = [2,3,4,5,6,7]*6   # 根据实际情况修改
     # 生成所有实验配置
     experiments = []
-    for attn_type in ["linear_attention","setattn_linear"]:
+    for attn_type in ["setattn_linear"]:
         for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]:
             for level in level_mapping[attn_type]:
                 for pos_enc in ["nope"]:
-                    for smaller in smaller_mapping[attn_type]:
-                        experiments.append((task, attn_type, pos_enc, level, smaller))
+                    for set_policy in ["fixed"]:
+                        experiments.append((task, attn_type, pos_enc, level, set_policy))
             
     # 为每个实验分配GPU（循环分配）
     gpu_cycle = cycle(available_gpus)
     experiments_with_gpu = [
-        (task, attn_type, pos_enc, level, smaller, next(gpu_cycle))
-        for task, attn_type, pos_enc, level, smaller in experiments
+        (task, attn_type, pos_enc, level, set_policy, next(gpu_cycle))
+        for task, attn_type, pos_enc, level, set_policy in experiments
     ]
     
     print(f"\n{'='*80}")

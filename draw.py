@@ -16,7 +16,7 @@ def get_acc(dir):
 def main():
     LG_ind_acc, LG_ood_acc = [], []
     SM_ind_acc, SM_ood_acc = [], []
-    task = "D_2"
+    task = "Parity"
     LG_levels = list(range(0, 9))
     SM_levels = list(range(0, 9))
     for level in LG_levels:
@@ -33,7 +33,7 @@ def main():
     # plotting
     vanilla_ind, vanilla_ood = get_acc(f"out-{task}/vanilla_nope")
     print(f"Vanilla: IND acc = {vanilla_ind}, OOD acc = {vanilla_ood}")
-    # linear_ind, linear_ood = get_acc(f"out-{task}/linear_attention_nope")
+    linear_ind, linear_ood = get_acc(f"out-{task}/linear_attention_nope")
 
     plt.figure()
 
@@ -46,9 +46,9 @@ def main():
     
     plt.axhline(y=vanilla_ind, color='C2', linestyle='-', label='Vanilla IND')
     plt.axhline(y=vanilla_ood, color='C2', linestyle='--', label='Vanilla OOD')
-    # if linear_ind < 0.99 or linear_ood <0.99: 
-    #     plt.axhline(y=linear_ind, color='C3', linestyle='-', label='Linear Attention IND')
-    #     plt.axhline(y=linear_ood, color='C3', linestyle='--', label='Linear Attention OOD')
+    if linear_ind < 0.99 or linear_ood <0.99: 
+        plt.axhline(y=linear_ind, color='C3', linestyle='-', label='Linear Attention IND')
+        plt.axhline(y=linear_ood, color='C3', linestyle='--', label='Linear Attention OOD')
     plt.xlabel('Level')
     plt.ylabel('Validation Accuracy')
     plt.title(f'{task}')

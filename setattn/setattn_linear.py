@@ -13,10 +13,10 @@ from fla.layers.linear_attn import LinearAttention
 from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
 import os
 
-def get_sets(T: int, levelrand: bool, level: int, levelmax: int, smaller_sets: bool, device):
+def get_sets(T: int, levelrand: bool, level: int, levelmax: int, set_policy: str, device):
     sets = []
     setlevel = torch.randint(0,levelmax+1,()) if levelrand else level
-    if smaller_sets:
+    if set_policy == "small":
         """
         for smaller sets, we can directly set level to levelmax when setlevel > levelmax
         but this is not for larger sets, as when level > levelmax, there will be no sets and only tail. 
@@ -26,11 +26,16 @@ def get_sets(T: int, levelrand: bool, level: int, levelmax: int, smaller_sets: b
             step = 2**l
             for i in range(T // step):
                 sets.append([i*step, (i+1)*step-1])
-    else:   
+    elif set_policy == "large":   
         for l in range(setlevel, levelmax+1):
             step = 2**l
             for i in range(T // step):
                 sets.append([i*step, (i+1)*step-1])
+    else : # fixed
+        assert set_policy == "fixed", "set_policy must be one of ['small','large','fixed']"
+        step = 2**level
+        for i in range(T // step):
+            sets.append([i*step, (i+1)*step-1])
     # create causal mask
     t_idx = torch.arange(T, device=device)  # (T,)
     r_idx = torch.tensor([r for _,r in sets], device=device)  # (nset,)
@@ -339,7 +344,7 @@ class SetAttention_Linear(nn.Module):
         self.levelrand = config.attn.levelrand
         self.k_mapping = config.attn.k_mapping
         self.v_mapping = config.attn.v_mapping
-        self.smaller_sets = config.attn.smaller_sets
+        self.set_policy = config.attn.set_policy
         self.feature_map = config.attn.feature_map
         self.levelmax = config.attn.levelmax
         assert self.k_mapping == True and self.v_mapping == True, "k_mapping and v_mapping must be True"
@@ -365,7 +370,7 @@ class SetAttention_Linear(nn.Module):
         k_cumsum = torch.cat([torch.zeros(B, 1, nh, hs, device=k.device), k.cumsum(dim=1)], dim=1)
         v_cumsum = torch.cat([torch.zeros(B, 1, nh, hs, device=k.device), v.cumsum(dim=1)], dim=1)
 
-        sets, setlevel, levelmax, mask = get_sets(T, self.levelrand, self.level, self.levelmax, self.smaller_sets, x.device)
+        sets, setlevel, levelmax, mask = get_sets(T, self.levelrand, self.level, self.levelmax, self.set_policy, x.device)
         # import ipdb; ipdb.set_trace()
         nsets = len(sets)
         set_features = []
@@ -373,7 +378,7 @@ class SetAttention_Linear(nn.Module):
         V_mean = []
         lens = []
         if len(sets) > 0:
-            if self.smaller_sets:
+            if self.set_policy == "small":
                 
                 for l in range(0, setlevel+1):
                     curlen = 2**l
@@ -389,7 +394,8 @@ class SetAttention_Linear(nn.Module):
                     torch.arange(0, T - (T % (2**l)))
                     for l in range(0, setlevel+1)
                 ]).to(q.device)
-            else :
+                
+            elif self.set_policy == "large":
                 for l in range(setlevel, levelmax+1):
                     curlen = 2**l
                     tail = T % curlen
@@ -404,6 +410,18 @@ class SetAttention_Linear(nn.Module):
                     torch.arange(0, T - (T % (2**l)))
                     for l in range(setlevel, levelmax+1)
                 ]).to(q.device)
+                
+            else: # fixed
+                curlen = 2**setlevel
+                tail = T % curlen
+                num_sets = (T - tail) // curlen
+                lens.extend([curlen]*num_sets)
+                k_ = k[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                v_ = v[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                K_mean.append(k_)
+                V_mean.append(v_)
+                idx = torch.arange(0, T - (T % (2**setlevel))).to(q.device)
+                
             q_all = q[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
             k_all = k[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
             v_all = v[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
@@ -429,7 +447,7 @@ class SetAttention_Linear(nn.Module):
             att_logits = torch.zeros(B, nh, T, 0, device=x.device, dtype=x.dtype)  # (B,nh,T,0)   
             V = torch.zeros(B, 0, nh, hs, device=x.device, dtype=x.dtype)  # (B,0,nh,hs)
         #process tail
-        if setlevel == 0 or self.smaller_sets:
+        if setlevel == 0 or self.set_policy == "small":
             # no tail
             att = F.softmax(att_logits, dim=-1)  # (B,nh,T,nset)
             if visualize:

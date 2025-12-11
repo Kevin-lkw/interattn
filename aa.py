@@ -14,7 +14,7 @@ class DummyConfig:
     levelrand = False
     k_mapping = True
     v_mapping = False
-    smaller_sets = False
+    set_policy = "large"
     feature_map = "elu"
 
 # 初始化

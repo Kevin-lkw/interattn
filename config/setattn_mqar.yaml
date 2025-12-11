@@ -49,5 +49,5 @@ attn:
   level: 1
   levelmax: 8
   levelrand: true
-  smaller_sets: False
+  set_policy: "large"  # "small" or "large" or "fixed"
   feature_map: 'identity'

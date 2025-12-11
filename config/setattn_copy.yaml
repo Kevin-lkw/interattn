@@ -49,4 +49,4 @@ attn:
   levelrand: true
   k_mapping: False
   v_mapping: False
-  smaller_sets: False
+  sets_policy: "large"  # "small" or "large" or "fixed"

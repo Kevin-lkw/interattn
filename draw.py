@@ -1,20 +1,24 @@
 import os
 import torch
 import matplotlib.pyplot as plt
-
+import json
 def get_acc(dir):
-    if not os.path.exists(dir):
-        raise ValueError(f"Directory {dir} does not exist.")
-    ckpt_path = os.path.join(dir, 'bestloss.pt')
-    ckpt = torch.load(ckpt_path, weights_only=False)
-    return ckpt['val_acc'][0], ckpt['val_acc'][1]
+    # if not os.path.exists(dir):
+    #     raise ValueError(f"Directory {dir} does not exist.")
+    # ckpt_path = os.path.join(dir, 'bestloss.pt')
+    # ckpt = torch.load(ckpt_path, weights_only=False)
+    # return ckpt['val_acc'][0], ckpt['val_acc'][1]
+    path = os.path.join(dir, 'acc.json')
+    with open(path, 'r') as f:
+        data = json.load(f)
+        return data['avg_acc_per_bin'][0], data['avg_acc_per_bin'][1]
 
 def main():
     LG_ind_acc, LG_ood_acc = [], []
     SM_ind_acc, SM_ood_acc = [], []
-    task = "Boolean-5"
-    LG_levels = list(range(0, 8))
-    SM_levels = list(range(0, 6))
+    task = "D_2"
+    LG_levels = list(range(0, 9))
+    SM_levels = list(range(0, 9))
     for level in LG_levels:
         # LG
         lg_ind, lg_ood = get_acc(f"out-{task}/setattn_linear_level{level}_LG")

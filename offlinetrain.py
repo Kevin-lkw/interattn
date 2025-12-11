@@ -139,6 +139,9 @@ def main(cfg: DictConfig):
     # attempt to derive vocab_size from the dataset
     meta_vocab_size = voc.nwords
     # model init
+    # ensure level do not exceed log2 of upper_window
+    cfg.attn.levelmax = math.floor(math.log2(cfg.data.upper_window))
+    
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                         bias=bias, vocab_size=None, dropout=dropout, attn=cfg.attn, pos_enc_type=pos_enc_type)
                     # start with model_args from command line

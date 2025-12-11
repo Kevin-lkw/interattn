@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-def get_sets(T: int, levelrand: bool, level: int, smaller_sets: bool, device):
+def get_sets(T: int, levelrand: bool, level: int, levelmax: int, smaller_sets: bool, device):
     sets = []
-    levelmax = math.floor(math.log2(T))
+    # levelmax = math.floor(math.log2(T))
     setlevel = torch.randint(0,levelmax+1,()) if levelrand else level
     if smaller_sets:
         for l in range(0, setlevel+1):

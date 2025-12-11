@@ -28,7 +28,7 @@ data:
   validation_size: 2000
   test_size: 2000
   len_incr: 50
-  num_bins: 3
+  num_bins: 2
   debug: false
   loss_type: mse
   vary_depth: false

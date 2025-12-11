@@ -11,8 +11,31 @@ from typing import Optional, Tuple
 
 from fla.layers.linear_attn import LinearAttention
 from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
-from setattn.setattn_legacy import get_sets
 import os
+
+def get_sets(T: int, levelrand: bool, level: int, levelmax: int, smaller_sets: bool, device):
+    sets = []
+    setlevel = torch.randint(0,levelmax+1,()) if levelrand else level
+    if smaller_sets:
+        """
+        for smaller sets, we can directly set level to levelmax when setlevel > levelmax
+        but this is not for larger sets, as when level > levelmax, there will be no sets and only tail. 
+        """
+        setlevel = min(setlevel, levelmax)
+        for l in range(0, setlevel+1):
+            step = 2**l
+            for i in range(T // step):
+                sets.append([i*step, (i+1)*step-1])
+    else:   
+        for l in range(setlevel, levelmax+1):
+            step = 2**l
+            for i in range(T // step):
+                sets.append([i*step, (i+1)*step-1])
+    # create causal mask
+    t_idx = torch.arange(T, device=device)  # (T,)
+    r_idx = torch.tensor([r for _,r in sets], device=device)  # (nset,)
+    mask = t_idx.unsqueeze(-1) >= r_idx.unsqueeze(0)  # (T,nset)
+    return sets, setlevel, levelmax, mask
 
 def visualize_attention_matrix(
     att_matrix: torch.Tensor,
@@ -318,6 +341,7 @@ class SetAttention_Linear(nn.Module):
         self.v_mapping = config.attn.v_mapping
         self.smaller_sets = config.attn.smaller_sets
         self.feature_map = config.attn.feature_map
+        self.levelmax = config.attn.levelmax
         assert self.k_mapping == True and self.v_mapping == True, "k_mapping and v_mapping must be True"
         if self.k_mapping:
             self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
@@ -341,15 +365,16 @@ class SetAttention_Linear(nn.Module):
         k_cumsum = torch.cat([torch.zeros(B, 1, nh, hs, device=k.device), k.cumsum(dim=1)], dim=1)
         v_cumsum = torch.cat([torch.zeros(B, 1, nh, hs, device=k.device), v.cumsum(dim=1)], dim=1)
 
-        sets, setlevel, levelmax, mask = get_sets(T, self.levelrand, self.level, self.smaller_sets, x.device)
+        sets, setlevel, levelmax, mask = get_sets(T, self.levelrand, self.level, self.levelmax, self.smaller_sets, x.device)
+        # import ipdb; ipdb.set_trace()
         nsets = len(sets)
         set_features = []
         K_mean = []
         V_mean = []
         lens = []
         if len(sets) > 0:
-            # support larger sets first
-            if self.smaller_sets:     
+            if self.smaller_sets:
+                
                 for l in range(0, setlevel+1):
                     curlen = 2**l
                     tail = T % curlen
@@ -417,13 +442,27 @@ class SetAttention_Linear(nn.Module):
             out = self.resid_dropout(self.c_proj(out))
             return out
 
-        # process tail
-        Lmin = 2**setlevel
+        # process tail, Larger sets only.
+        """
+        levelmax refers to the max level during training. During inference, 
+        if setlevel > levelmax, there will be no sets, only tail.
+        As there are no sets, tail includes all tokens. So Lmin = T+1
+        """
+        # import ipdb; ipdb.set_trace()
+        if setlevel <= levelmax:
+            Lmin = 2**setlevel 
+        else :
+            assert nsets == 0, "if setlevel > levelmax, there should be no sets"
+            Lmin = T + 1
         tail_features = []
         K_mean = []
         V_mean = []
         t_range = torch.arange(T, device=x.device)  # (T,)
         tail_lens = t_range % (Lmin) + 1
+        """
+        This is a N^2 implementation, can be further optimized.
+        [TODO]
+        """
         idx = torch.cat([
             torch.arange(t - (t % Lmin), t + 1)
             for t in range(T)

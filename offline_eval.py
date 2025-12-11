@@ -13,6 +13,9 @@ from data.formal_language.generate_data import load_data
 from data.formal_language.dataloader import Sampler
 from data.formal_language.utils.helper import Voc
 import wandb
+import json
+import math
+
 def load_model(out_dir):
     """
     load model part
@@ -37,8 +40,12 @@ def load_model(out_dir):
         ckpt_path = os.path.join(out_dir, ckpt)
         ckpt = torch.load(ckpt_path,weights_only=False)
         cfg = ckpt['config']
+        cfg.attn.levelmax = math.floor(math.log2(cfg.data.upper_window))
         print("eval model with iter",ckpt['iter_num'], "val acc",ckpt['val_acc'])
-        model = GPT(GPTConfig(**ckpt['model_args']))
+        model_args = ckpt['model_args']
+        # import ipdb; ipdb.set_trace()
+        model_args['attn'] = cfg.attn
+        model = GPT(GPTConfig(**model_args))
         model.load_state_dict(ckpt['model'])
         model.to(device)
         model.eval()
@@ -60,14 +67,31 @@ def load_model(out_dir):
                 test_acc = test_acc / test_iter_num
                 print(f"model{rank} Test Bin {bin_idx}: Avg Test Loss: {test_loss/test_iter_num:.4f}, Avg Test Acc: {test_acc:.4f}")
             summary_acc.append((rank, bin_idx, test_acc))
+    avg_acc_list = []
     for bin_idx in range(len(test_loader_bins)):
         accs = [acc for (rank, b_idx, acc) in summary_acc if b_idx == bin_idx]
         avg_acc = sum(accs) / len(accs)
+        avg_acc_list.append(avg_acc)
         print(f"Average Test Acc for Bin {bin_idx}: {avg_acc:.4f}")
+    with open(os.path.join(out_dir, "acc.json"), "w") as f:
+        sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
+        result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list}
+        json.dump(result, f, indent=4)
 def main():
-    out_dir='out-Boolean-3/vanilla_nope'
-    load_model(out_dir)
-    # test_model(out_dir)
+    task = ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]
+    for t in task:
+        for level in range(0,9):
+            for type in ["LG","SM"]:
+                name_str = f"setattn_linear_level{level}_{type}"
+                out_dir=f"out-{t}/{name_str}"
+                load_model(out_dir)
+        name_str = "vanilla_nope"
+        out_dir=f"out-{t}/{name_str}"
+        load_model(out_dir)
+        name_str = "linear_attention_nope"
+        out_dir=f"out-{t}/{name_str}"
+        load_model(out_dir)
+
 
 
 if __name__ == "__main__":

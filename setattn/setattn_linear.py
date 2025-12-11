@@ -33,9 +33,10 @@ def get_sets(T: int, levelrand: bool, level: int, levelmax: int, set_policy: str
                 sets.append([i*step, (i+1)*step-1])
     else : # fixed
         assert set_policy == "fixed", "set_policy must be one of ['small','large','fixed']"
-        step = 2**level
-        for i in range(T // step):
-            sets.append([i*step, (i+1)*step-1])
+        if setlevel <= levelmax:
+            step = 2**setlevel
+            for i in range(T // step):
+                sets.append([i*step, (i+1)*step-1])
     # create causal mask
     t_idx = torch.arange(T, device=device)  # (T,)
     r_idx = torch.tensor([r for _,r in sets], device=device)  # (nset,)
@@ -222,7 +223,7 @@ class SetAttention_Linear_Slow(nn.Module):
         self.levelrand = config.attn.levelrand
         self.k_mapping = config.attn.k_mapping
         self.v_mapping = config.attn.v_mapping
-        self.smaller_sets = config.attn.smaller_sets
+        self.set_policy = config.attn.set_policy
         self.feature_map = config.attn.feature_map
         if self.k_mapping:
             self.k_proj = nn.Linear((config.n_embd // config.n_head)**2, config.n_embd // config.n_head)
@@ -243,7 +244,7 @@ class SetAttention_Linear_Slow(nn.Module):
         nh = self.n_head
         hs = C // nh
         q, k, v = self.linear_attn.preprocess(x)  # q,k,v: (B, T, nh, hs)
-        sets, setlevel, levelmax, mask = get_sets(T, self.levelrand, self.level, self.smaller_sets, x.device)
+        sets, setlevel, levelmax, mask = get_sets(T, self.levelrand, self.level, self.set_policy, x.device)
         nsets = len(sets)
         set_features = []
         K_mean = []
@@ -411,17 +412,18 @@ class SetAttention_Linear(nn.Module):
                     for l in range(setlevel, levelmax+1)
                 ]).to(q.device)
                 
-            else: # fixed
-                curlen = 2**setlevel
-                tail = T % curlen
-                num_sets = (T - tail) // curlen
-                lens.extend([curlen]*num_sets)
-                k_ = k[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
-                v_ = v[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
-                K_mean.append(k_)
-                V_mean.append(v_)
-                idx = torch.arange(0, T - (T % (2**setlevel))).to(q.device)
-                
+            else : # set_policy == fixed
+                if setlevel <= levelmax:
+                    curlen = 2**setlevel
+                    tail = T % curlen
+                    num_sets = (T - tail) // curlen
+                    lens.extend([curlen]*num_sets)
+                    k_ = k[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                    v_ = v[:, :T-tail, :, :].reshape(B,-1,curlen,nh,hs).mean(dim=2)  # (B, num_sets, nh, hs)
+                    K_mean.append(k_)
+                    V_mean.append(v_)
+                    idx = torch.arange(0, T - (T % (2**setlevel))).to(q.device)
+                    
             q_all = q[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
             k_all = k[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)
             v_all = v[:,idx, :, :].reshape(1,-1,nh,hs) # (1, :, nh, hs)

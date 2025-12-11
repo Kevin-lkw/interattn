@@ -82,20 +82,24 @@ def run_experiment_wrapper(args):
 level_mapping = {
     "vanilla":[0],
     "linear_attention":[0],
-    "setattn_linear":[0,1,2,3,4,5,6,7,8],
+    "mamba":[0],
+    "delta_net":[0],
+    "setattn_linear":[6,7],
 }
 smaller_mapping = {
     "vanilla":["small"],
     "linear_attention":["small"],
+    "mamba":["small"],
+    "delta_net":["small"],
     "setattn_linear":["small", "large", "fixed"],
 }
 def main():
     # 配置可用的GPU列表
-    available_gpus = [2,3,4,5,6,7]*6   # 根据实际情况修改
+    available_gpus = [6,7]*3   # 根据实际情况修改
     # 生成所有实验配置
     experiments = []
-    for attn_type in ["setattn_linear"]:
-        for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]:
+    for attn_type in ["delta_net"]:
+        for task in ["D_2","D_3"]:
             for level in level_mapping[attn_type]:
                 for pos_enc in ["nope"]:
                     for set_policy in ["fixed"]:

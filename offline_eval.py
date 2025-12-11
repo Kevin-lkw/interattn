@@ -20,6 +20,7 @@ def load_model(out_dir):
     """
     load model part
     """
+    os.environ["CUDA_VISIBLE_DEVICES"] = "7"
     ckpt = "ckpt_top1.pt"
     ckpt_path = os.path.join(out_dir, ckpt)
     ckpt = torch.load(ckpt_path,weights_only=False)
@@ -68,27 +69,37 @@ def load_model(out_dir):
                 print(f"model{rank} Test Bin {bin_idx}: Avg Test Loss: {test_loss/test_iter_num:.4f}, Avg Test Acc: {test_acc:.4f}")
             summary_acc.append((rank, bin_idx, test_acc))
     avg_acc_list = []
+    std_acc_list = []
     for bin_idx in range(len(test_loader_bins)):
         accs = [acc for (rank, b_idx, acc) in summary_acc if b_idx == bin_idx]
         avg_acc = sum(accs) / len(accs)
+        variance = sum((x - avg_acc) ** 2 for x in accs) / len(accs) if accs else 0.0
+        std_acc = math.sqrt(variance)
         avg_acc_list.append(avg_acc)
+        std_acc_list.append(std_acc)
         print(f"Average Test Acc for Bin {bin_idx}: {avg_acc:.4f}")
     with open(os.path.join(out_dir, "acc.json"), "w") as f:
         sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
-        result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list}
+        result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list, "std_acc_per_bin": std_acc_list}
         json.dump(result, f, indent=4)
 def main():
     task = ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]
     for t in task:
-        for level in range(0,9):
-            for type in ["LG","SM"]:
-                name_str = f"setattn_linear_level{level}_{type}"
-                out_dir=f"out-{t}/{name_str}"
-                load_model(out_dir)
-        name_str = "vanilla_nope"
-        out_dir=f"out-{t}/{name_str}"
-        load_model(out_dir)
-        name_str = "linear_attention_nope"
+        # for level in range(0,9):
+        #     for type in ["FX"]:
+        #         name_str = f"setattn_linear_level{level}_{type}"
+        #         out_dir=f"out-{t}/{name_str}"
+        #         load_model(out_dir)
+        # name_str = "vanilla_nope"
+        # out_dir=f"out-{t}/{name_str}"
+        # load_model(out_dir)
+        # name_str = "linear_attention_nope"
+        # out_dir=f"out-{t}/{name_str}"
+        # load_model(out_dir)
+        # name_str = "mamba"
+        # out_dir=f"out-{t}/{name_str}"
+        # load_model(out_dir)
+        name_str = "delta_net"
         out_dir=f"out-{t}/{name_str}"
         load_model(out_dir)
 

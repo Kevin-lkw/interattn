@@ -26,7 +26,9 @@ model:
   bias: false
   block_size: 1024
   post_LN: False
-  pos_enc_type: nope  # 'learned', 'rope', 'nope'
+  pos_enc_type: nope  # 'learned', 'rope', 'alibi', 't5', 'nope'
+  relative_attention_num_buckets: 32
+  relative_attention_max_distance: 128
 
 optim:
   learning_rate: 6e-4

@@ -93,15 +93,22 @@ smaller_mapping = {
     "delta_net":["small"],
     "setattn_linear":["small", "large", "fixed"],
 }
+pe_mapping = {
+    "vanilla":["sinusoidal", "learned", "rope", "alibi"],
+    "linear_attention":["nope", "rope"],
+    "mamba":["nope"],
+    "delta_net":["nope"],
+    "setattn_linear":["nope"],
+}
 def main():
     # 配置可用的GPU列表
-    available_gpus = [6,7]*3   # 根据实际情况修改
+    available_gpus = [4,5,6,7]*3   # 根据实际情况修改
     # 生成所有实验配置
     experiments = []
-    for attn_type in ["delta_net"]:
-        for task in ["D_2","D_3"]:
+    for attn_type in ["vanilla"]:
+        for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]:
             for level in level_mapping[attn_type]:
-                for pos_enc in ["nope"]:
+                for pos_enc in pe_mapping[attn_type]:
                     for set_policy in ["fixed"]:
                         experiments.append((task, attn_type, pos_enc, level, set_policy))
             

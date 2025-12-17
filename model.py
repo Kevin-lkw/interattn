@@ -16,6 +16,17 @@ import torch.nn as nn
 from torch.nn import functional as F
 from attention_factory import create_attention
 from typing import Tuple
+### Sinusoidal implementation
+def sinusoidal(pos, d_model: int):
+    if pos.dim() == 1:
+        pos = pos.unsqueeze(1)  # 改成 (t, 1)
+    div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32, device=pos.device) *
+                         -(math.log(10000.0) / d_model))
+
+    pe = torch.zeros(pos.size(0), d_model, dtype=torch.float32, device=pos.device)
+    pe[:, 0::2] = torch.sin(pos * div_term)  # 偶数维度用 sin
+    pe[:, 1::2] = torch.cos(pos * div_term)  # 奇数维度用 cos
+    return pe
 ### RoPE implementation from llama2(https://github.com/meta-llama/llama/blob/main/llama/model.py)
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -37,7 +48,6 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
         AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
     """
     ndim = x.ndim
-    # import ipdb; ipdb.set_trace()
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
@@ -88,16 +98,62 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
     """
+    
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
+
+
+def get_alibi_slopes(n_heads: int) -> torch.Tensor:
+    """Create ALiBi slopes for each attention head."""
+
+    def get_slopes_power_of_2(power: int):
+        start = 2 ** (-(2 ** -(math.log2(power) - 3)))
+        ratio = start
+        return [start * (ratio ** i) for i in range(power)]
+
+    if math.log2(n_heads).is_integer():
+        slopes = get_slopes_power_of_2(n_heads)
+    else:
+        closest_power_of_2 = 2 ** math.floor(math.log2(n_heads))
+        slopes = get_slopes_power_of_2(closest_power_of_2)
+        slopes += get_slopes_power_of_2(2 * closest_power_of_2)[: n_heads - closest_power_of_2]
+    return torch.tensor(slopes, dtype=torch.float32)
+
+
+def relative_position_bucket(relative_position: torch.Tensor, bidirectional: bool = False,
+                             num_buckets: int = 32, max_distance: int = 128) -> torch.Tensor:
+    """Bucket relative positions as described in T5."""
+
+    relative_position = relative_position
+    if bidirectional:
+        num_buckets //= 2
+        positive = (relative_position > 0).to(torch.long) * num_buckets
+        relative_position = relative_position.abs()
+    else:
+        # We only look backward for causal attention
+        positive = torch.zeros_like(relative_position, dtype=torch.long)
+        relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+    max_exact = max(1, num_buckets // 2)
+    is_small = relative_position < max_exact
+    log_ratio = math.log(max(max_distance / max_exact, 1.0))
+    if log_ratio == 0:
+        log_ratio = 1.0
+    relative_position_clamped = torch.max(
+        relative_position.float(),
+        torch.ones_like(relative_position, dtype=torch.float32)
+    )
+    large_pos = max_exact + (
+        torch.log(relative_position_clamped / max_exact)
+        / log_ratio
+        * (num_buckets - max_exact)
+    ).to(torch.long)
+    large_pos = torch.min(large_pos, torch.full_like(large_pos, num_buckets - 1))
+    buckets = torch.where(is_small, relative_position, large_pos)
+    return buckets + positive
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -139,6 +195,12 @@ class CausalSelfAttention(nn.Module):
                 # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
                 config.n_embd // config.n_head, config.block_size * 2
             )
+        elif self.pos_enc_type == 'alibi':
+            self.register_buffer("alibi_slopes", get_alibi_slopes(self.n_head))
+        elif self.pos_enc_type == 't5':
+            self.relative_attention_num_buckets = getattr(config, "relative_attention_num_buckets", 32)
+            self.relative_attention_max_distance = getattr(config, "relative_attention_max_distance", 128)
+            self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_head)
     def forward(self, x, visualize = False):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -148,20 +210,44 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head) # (B, T, nh, hs)
         v = v.view(B, T, self.n_head, C // self.n_head) # (B, T, nh, hs)
 
+        pos_bias = None
         # Apply RoPE if specified
         if self.pos_enc_type == 'rope':
             self.freqs_cis = self.freqs_cis.to(x.device)
             q, k = apply_rotary_emb(q, k, self.freqs_cis[:T])
+        elif self.pos_enc_type == 'alibi':
+            pos = torch.arange(T, device=x.device)
+            rel_pos = pos.unsqueeze(0) - pos.unsqueeze(1)
+            slopes = self.alibi_slopes.to(device=x.device, dtype=q.dtype)
+            pos_bias = slopes.view(1, self.n_head, 1, 1) * rel_pos.to(q.dtype).view(1, 1, T, T)
+        elif self.pos_enc_type == 't5':
+            pos = torch.arange(T, device=x.device)
+            rel_pos = pos.unsqueeze(0) - pos.unsqueeze(1)
+            rp_bucket = relative_position_bucket(
+                rel_pos,
+                bidirectional=False,
+                num_buckets=self.relative_attention_num_buckets,
+                max_distance=self.relative_attention_max_distance,
+            )
+            values = self.relative_attention_bias(rp_bucket)
+            pos_bias = values.permute(2, 0, 1).unsqueeze(0).to(dtype=q.dtype)
         q = q.transpose(1, 2)  # (B, nh, T, hs)
         k = k.transpose(1, 2)  # (B, nh, T, hs)
         v = v.transpose(1, 2)  # (B, nh, T, hs)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=pos_bias,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True
+            )
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if pos_bias is not None:
+                att = att + pos_bias
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -216,7 +302,9 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     attn: dict = None
-    pos_enc_type: str = 'rope'  # 'learned', 'rope', 'nope'
+    pos_enc_type: str = 'rope'  # 'learned', 'rope', 'alibi', 't5', 'nope'
+    relative_attention_num_buckets: int = 32
+    relative_attention_max_distance: int = 128
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -278,11 +366,15 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         if self.config.pos_enc_type == 'learned':
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+        elif self.config.pos_enc_type == 'sinusoidal':
+            pos_emb = sinusoidal(pos,self.config.n_embd)
             x = self.transformer.drop(tok_emb + pos_emb)
         else:
             x = self.transformer.drop(tok_emb)
+        
         for block in self.transformer.h:
             x = block(x, visualize=visualize)
         x = self.transformer.ln_f(x)

@@ -125,13 +125,12 @@ def main(cfg: DictConfig):
 
     # poor man's data loader
     train_corpus, validation_corpus, test_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
-    voc = Voc()
+    voc = Voc(cfg.data.bos)
     voc.create_vocab_dict(train_corpus)
     voc.noutputs = train_corpus.noutputs
-
-    train_loader = Sampler(train_corpus, voc, cfg.data.batch_size)
-    val_loader = Sampler(validation_corpus, voc, cfg.data.batch_size)
-    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size) for test_corpus_bin in test_corpus_bins]
+    train_loader = Sampler(train_corpus, voc, cfg.data.batch_size,cfg.data.bos)
+    val_loader = Sampler(validation_corpus, voc, cfg.data.batch_size,cfg.data.bos)
+    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size,cfg.data.bos) for test_corpus_bin in test_corpus_bins]
     
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0

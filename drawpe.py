@@ -21,28 +21,35 @@ def draw(task):
         cfg = f.read()
     levelmax = math.floor(math.log2(int(cfg.split('upper_window: ')[1].split('\n')[0])))
     ind_acc, ood_acc, ind_std, ood_std = [], [], [], []
-    pt_ind_acc, pt_ood_acc, pt_ind_std, pt_ood_std = [], [], [], []
+    d8_ind_acc, d8_ood_acc, d8_ind_std, d8_ood_std = [], [], [], []
     pes = ["nope","sinusoidal", "learned", "rope", "alibi", "t5"]
     for pe in pes:
-        ind, ood, ind_s, ood_s = get_acc(f"out-{task}/vanilla_{pe}")
-        pt_ind, pt_ood, pt_ind_s, pt_ood_s = get_pt_acc(f"out-{task}/vanilla_{pe}")
+        ind, ood, ind_s, ood_s = get_acc(f"out-{task}/vanilla_{pe}_d4")
+        # pt_ind, pt_ood, pt_ind_s, pt_ood_s = get_pt_acc(f"out-{task}/vanilla_{pe}")
+        # d4_ind, d4_ood, d4_ind_s, d4_ood_s = get_acc(f"out-{task}/vanilla_{pe}_d4")
+        d8_ind, d8_ood, d8_ind_s, d8_ood_s = get_acc(f"out-{task}/vanilla_{pe}_d16")
         ind_acc.append(ind)
         ood_acc.append(ood)
         ind_std.append(ind_s)
         ood_std.append(ood_s)
-        pt_ind_acc.append(pt_ind)
-        pt_ood_acc.append(pt_ood)
-        pt_ind_std.append(pt_ind_s)
-        pt_ood_std.append(ood_s)
+        d8_ind_acc.append(d8_ind)
+        d8_ood_acc.append(d8_ood)
+        d8_ind_std.append(d8_ind_s)
+        d8_ood_std.append(d8_ood_s)
+        
     # plotting
     plt.figure()
     x = range(len(pes))
     width = 0.2  # 柱子的宽度
-    plt.bar([i - width*0.5 for i in x], ind_acc, width,
+    plt.bar([i - width*1.5 for i in x], ind_acc, width,
             yerr=ind_std, capsize=3, label='IND')
 
-    plt.bar([i + width*0.5 for i in x], ood_acc, width,
+    plt.bar([i - width*0.5 for i in x], ood_acc, width,
             yerr=ood_std, capsize=3, label='OOD')
+    plt.bar([i + width*0.5 for i in x], d8_ind_acc, width,
+            yerr=d8_ind_std, capsize=3, label='D8-IND')
+    plt.bar([i + width*1.5 for i in x], d8_ood_acc, width,
+            yerr=d8_ood_std, capsize=3, label='D8-OOD')
     # plt.bar([i + width*0.5 for i in x], pt_ind_acc, width,
     #         yerr=pt_ind_std, capsize=3, label='PT-IND')
     # plt.bar([i + width*1.5 for i in x], pt_ood_acc, width,
@@ -65,11 +72,11 @@ def draw(task):
     # borderaxespad=0.
     )
     # plt.tight_layout(rect=[0, 0, 0.99, 0.99])  
-    os.makedirs(f'out-img', exist_ok=True)
-    plt.savefig(f'out-img/{task}-acc_pe_avg5.png', dpi=300)
+    os.makedirs(f'out-img/d416', exist_ok=True)
+    plt.savefig(f'out-img/d416/{task}-acc.png', dpi=300)
     plt.close()
 
 if __name__ == "__main__":
-    for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]:
+    for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]:
         draw(task)
         print(f"Plot for task {task}")

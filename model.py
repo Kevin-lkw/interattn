@@ -428,6 +428,17 @@ class GPT(nn.Module):
                             valid_per_sample = mask.sum(dim=1)  # [B]
                             correct_per_sample = masked_correct.sum(dim=1)  # [B]
                             all_correct_per_sample = (correct_per_sample == valid_per_sample).float()  # [B]
+                            # print("correct samples")
+                            # for i in range(all_correct_per_sample.size(0)):
+                            #     if all_correct_per_sample[i]:
+                            #         print(idx[i])
+                            # print("Incorrect samples")
+                            # for i in range(all_correct_per_sample.size(0)):
+                            #     if not all_correct_per_sample[i]:
+                            #         print(idx[i])
+                            # print("----")
+                            # print("acc=", all_correct_per_sample.mean())
+                            # import ipdb; ipdb.set_trace()
                             acc = all_correct_per_sample.mean()
                             
                             per_token_acc = masked_correct.sum() / mask.sum()

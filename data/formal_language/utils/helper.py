@@ -115,12 +115,13 @@ def load_checkpoint(model, mode, ckpt_path, logger, device, bins = -1):
 
 
 class Voc:
-	def __init__(self):
+	def __init__(self,bos):
 
 		self.w2id= {'T': 0}
 		self.id2w = {0:'T'}
 		self.w2c = {'T':0}
 		self.nwords = 1
+		self.bos = bos
 
 	def add_word(self, word):
 		if word not in self.w2id:
@@ -154,7 +155,8 @@ class Voc:
 		for letter in all_letters:
 			self.add_word(letter)
 
-
+		if self.bos:
+			self.add_word('BOS')
 		# self.most_frequent(args.vocab_size)
 		assert len(self.w2id) == self.nwords
 		assert len(self.id2w) == self.nwords

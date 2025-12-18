@@ -32,12 +32,13 @@ def load_model(args):
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[cfg.system.dtype]
     ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device,dtype=ptdtype)
     train_corpus, validation_corpus, test_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
+    
     bos = getattr(cfg.data, 'bos', False)
     voc = Voc(bos)
     voc.create_vocab_dict(train_corpus)
     voc.noutputs = train_corpus.noutputs
 
-    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size) for test_corpus_bin in test_corpus_bins]
+    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size, bos=bos) for test_corpus_bin in test_corpus_bins]
     
     summary_acc = []
     for rank in range(1,6):
@@ -86,16 +87,6 @@ def load_model(args):
         avg_acc_list.append(avg_acc)
         std_acc_list.append(std_acc)
         print(f"Average Test Acc for Bin {bin_idx}: {avg_acc:.4f}")
-    if pt == False:
-        with open(os.path.join(out_dir, "acc.json"), "w") as f:
-            sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
-            result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list, "std_acc_per_bin": std_acc_list}
-            json.dump(result, f, indent=4)
-    else :
-        with open(os.path.join(out_dir, "per_token_acc.json"), "w") as f:
-            sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
-            result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list, "std_acc_per_bin": std_acc_list}
-            json.dump(result, f, indent=4)
 def main():
     pt = False
     task = ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]
@@ -103,32 +94,13 @@ def main():
     gpu_id = [0,1,2,3,4,5,6,7] * 4
     gpu_cycle = cycle(gpu_id)
     task_list = []
-    for t in task:
-        # for level in range(0,9):
-        #     for type in ["FX"]:
-        #         name_str = f"setattn_linear_level{level}_{type}"
-        #         out_dir=f"out-{t}/{name_str}"
-        #         load_model(out_dir)
-        # name_str = "vanilla_nope"
-        # out_dir=f"out-{t}/{name_str}"
-        # load_model(out_dir)
-        # name_str = "linear_attention_nope"
-        # out_dir=f"out-{t}/{name_str}"
-        # load_model(out_dir)
-        # name_str = "mamba"
-        # out_dir=f"out-{t}/{name_str}"
-        # load_model(out_dir)
-        # name_str = "delta_net"
-        # out_dir=f"out-{t}/{name_str}"
-        # load_model(out_dir)
-        for pe in pes:
-            for depth in [16]:
-                name_str = f"vanilla_{pe}_d{depth}"
-                out_dir=f"out-{t}/{name_str}"
-                task_list.append((out_dir, next(gpu_cycle)))
+    for t in ["D_2"]:
+        pe = "nope"
+        depth = 8
+        name_str = f"vanilla_{pe}_d{depth}"
+        out_dir=f"out-{t}/{name_str}"
+        load_model((out_dir, next(gpu_cycle), pt))
 
-    with Pool(processes=len(gpu_id)) as pool:
-        results = pool.map(load_model, [ (out_dir, gpu, False) for (out_dir, gpu) in task_list ])
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     main()

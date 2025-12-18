@@ -139,8 +139,12 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
             corpus = CRLCorpus(config.crl_n, config.lower_window, config.upper_window, config.training_size + config.test_size, debug = config.debug)
             train_corpus = copy.deepcopy(corpus)
             train_corpus.source, train_corpus.target = corpus.source[:config.training_size], corpus.target[:config.training_size]
+            
+            validation_corpus = copy.deepcopy(corpus)
+            validation_corpus.source, validation_corpus.target = corpus.source[config.training_size:config.training_size + config.validation_size], corpus.target[config.training_size:config.training_size + config.validation_size]
+            
             val_corpus = copy.deepcopy(corpus)
-            val_corpus.source, val_corpus.target = corpus.source[config.training_size:], corpus.target[config.training_size:]
+            val_corpus.source, val_corpus.target = corpus.source[config.training_size + config.validation_size:], corpus.target[config.training_size + config.validation_size:]
             val_corpus_bins = [val_corpus]
             lower_window = config.upper_window + 1
             upper_window = config.upper_window + config.len_incr
@@ -152,13 +156,18 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
                 upper_window = upper_window + config.len_incr
 
         elif config.lang == 'Tomita':
+            assert config.leak == False
             if not config.leak:
                 print("Generating Training and Validation Bin0 Data")
-                corpus = TomitaCorpus(config.num_par, config.lower_window, config.upper_window, config.training_size + config.test_size, unique = True, debug = config.debug)
+                corpus = TomitaCorpus(config.num_par, config.lower_window, config.upper_window, config.training_size + config.validation_size + config.test_size, unique = True, debug = config.debug)
                 train_corpus = copy.deepcopy(corpus)
                 train_corpus.source, train_corpus.target = corpus.source[:config.training_size], corpus.target[:config.training_size]
+                
+                validation_corpus = copy.deepcopy(corpus)
+                validation_corpus.source, validation_corpus.target = corpus.source[config.training_size:config.training_size + config.validation_size], corpus.target[config.training_size:config.training_size + config.validation_size]
+                
                 val_corpus = copy.deepcopy(corpus)
-                val_corpus.source, val_corpus.target = corpus.source[config.training_size:], corpus.target[config.training_size:]
+                val_corpus.source, val_corpus.target = corpus.source[config.training_size + config.validation_size:], corpus.target[config.training_size + config.validation_size:]
                 val_corpus_bins = [val_corpus]
                 lower_window = config.upper_window + 1
                 upper_window = config.upper_window + config.len_incr

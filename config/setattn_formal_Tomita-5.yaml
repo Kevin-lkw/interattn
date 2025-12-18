@@ -1,0 +1,27 @@
+# conf/setattn.yaml
+defaults:
+  - setattn_formal
+
+out_dir: out-formal-Tomita-3
+
+wandb:
+  log: false
+  project: setattn-formal-Tomita-3
+  run_name: ${attn.type}_${model.pos_enc_type}
+
+data:
+  # for dataloader
+  dataset: Tomita-5
+  mode: train
+  lang: Tomita
+  num_par: 5 
+  lower_window: 2
+  upper_window: 50
+  training_size: 10000
+  validation_size: 2000
+  test_size: 2000
+  len_incr: 50
+  num_bins: 2
+  debug: false
+  loss_type: mse
+  leak: false

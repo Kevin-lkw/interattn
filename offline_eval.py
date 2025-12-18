@@ -16,7 +16,7 @@ import wandb
 import json
 import math
 
-def load_model(out_dir):
+def load_model(out_dir,pt = False):
     """
     load model part
     """
@@ -55,19 +55,23 @@ def load_model(out_dir):
 
             test_loss = 0
             test_acc = 0
+            pt_acc = 0
             test_iter_num = 0
             with torch.no_grad(), ctx:
                 for j in range(0, len(test_loader.data), cfg.data.batch_size):
                     X_test, Y_test, _ = test_loader.get_batch(j)
                     X_test = X_test.to(device)
                     Y_test = Y_test.to(device)
-                    _, loss, acc, _ = model(X_test, Y_test, acc = True, loss_type = cfg.data.loss_type)
+                    _, loss, acc, acc2 = model(X_test, Y_test, acc = True, loss_type = cfg.data.loss_type)
                     test_loss += loss.item()
                     test_acc += acc.item()
+                    pt_acc += acc2.item()
                     test_iter_num += 1
                 test_acc = test_acc / test_iter_num
+                pt_acc = pt_acc / test_iter_num
                 print(f"model{rank} Test Bin {bin_idx}: Avg Test Loss: {test_loss/test_iter_num:.4f}, Avg Test Acc: {test_acc:.4f}")
-            summary_acc.append((rank, bin_idx, test_acc))
+                print(f"model{rank} Test Bin {bin_idx}: Avg Per Token Acc: {pt_acc:.4f}")
+            summary_acc.append((rank, bin_idx, test_acc if pt == False else pt_acc))
     avg_acc_list = []
     std_acc_list = []
     for bin_idx in range(len(test_loader_bins)):
@@ -78,11 +82,18 @@ def load_model(out_dir):
         avg_acc_list.append(avg_acc)
         std_acc_list.append(std_acc)
         print(f"Average Test Acc for Bin {bin_idx}: {avg_acc:.4f}")
-    with open(os.path.join(out_dir, "acc.json"), "w") as f:
-        sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
-        result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list, "std_acc_per_bin": std_acc_list}
-        json.dump(result, f, indent=4)
+    if pt == False:
+        with open(os.path.join(out_dir, "acc.json"), "w") as f:
+            sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
+            result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list, "std_acc_per_bin": std_acc_list}
+            json.dump(result, f, indent=4)
+    else :
+        with open(os.path.join(out_dir, "per_token_acc.json"), "w") as f:
+            sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
+            result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list, "std_acc_per_bin": std_acc_list}
+            json.dump(result, f, indent=4)
 def main():
+    pt = True
     task = ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]
     for t in task:
         # for level in range(0,9):
@@ -99,10 +110,13 @@ def main():
         # name_str = "mamba"
         # out_dir=f"out-{t}/{name_str}"
         # load_model(out_dir)
-        name_str = "delta_net"
-        out_dir=f"out-{t}/{name_str}"
-        load_model(out_dir)
-
+        # name_str = "delta_net"
+        # out_dir=f"out-{t}/{name_str}"
+        # load_model(out_dir)
+        for pe in ["nope"]:
+            name_str = f"vanilla_{pe}"
+            out_dir=f"out-{t}/{name_str}"
+            load_model(out_dir,pt)
 
 
 if __name__ == "__main__":

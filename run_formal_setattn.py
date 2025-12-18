@@ -23,6 +23,11 @@ task_configs = {
     "Boolean-5": ("setattn_formal_Boolean-5", {}),
     "Counter-anbn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbn", "data.num_par": 2, "optim.epochs": 5000}),
     "Counter-anbncn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbncn", "data.num_par": 3, "optim.epochs": 5000}),
+    "Tomita-3": ("setattn_formal_Tomita-3", {}),
+    "Tomita-4": ("setattn_formal_Tomita-4", {}),
+    "Tomita-5": ("setattn_formal_Tomita-5", {}),
+    "Tomita-6": ("setattn_formal_Tomita-6", {}),
+    "Tomita-7": ("setattn_formal_Tomita-7", {}),
 }
 def run_single_experiment(task, attn_type, pos_enc, level, set_policy, gpu):
     
@@ -42,7 +47,7 @@ def run_single_experiment(task, attn_type, pos_enc, level, set_policy, gpu):
         f"CUDA_VISIBLE_DEVICES={gpu}",
         "python offlinetrain.py",
         f"--config-name={config_name}",
-        "wandb.log=true",
+        "wandb.log=false",
         f"wandb.project=setattn-formal-{task}",
         f"wandb.run_name={name_str}",
         f"out_dir=out-{task}/{name_str}",
@@ -106,9 +111,9 @@ def main():
     # 生成所有实验配置
     experiments = []
     for attn_type in ["vanilla"]:
-        for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]:
+        for task in ["Tomita-5","Tomita-6","Tomita-7"]:
             for level in level_mapping[attn_type]:
-                for pos_enc in pe_mapping[attn_type]:
+                for pos_enc in ["nope"]:
                     for set_policy in ["fixed"]:
                         experiments.append((task, attn_type, pos_enc, level, set_policy))
             

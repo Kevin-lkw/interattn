@@ -35,7 +35,7 @@ from omegaconf import DictConfig, OmegaConf
 from data.formal_language.generate_data import load_data
 from data.formal_language.dataloader import Sampler
 from data.formal_language.utils.helper import Voc
-
+import json
 
 @hydra.main(config_path="config", config_name="setattn_mqar", version_base=None)
 def main(cfg: DictConfig):
@@ -364,11 +364,21 @@ def main(cfg: DictConfig):
         torch.save(checkpoint, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path} with val acc {val_acc:.4f}")
     # calc avg acc
+    avg_acc_list = []
+    std_acc_list = []
     for bin_idx in range(len(test_loader_bins)):
         accs = [acc for r, b, acc in summary_acc if b == bin_idx]
         avg_acc = sum(accs) / len(accs)
+        avg_acc_list.append(avg_acc)
+        variance = sum((x - avg_acc) ** 2 for x in accs) / len(accs) if accs else 0.0
+        std_acc = math.sqrt(variance) 
+        std_acc_list.append(std_acc)
         print(f"Average Test Acc for Bin {bin_idx}: {avg_acc:.4f}")
         if wandb_log and master_process:
             wandb.summary[f'test_bin{bin_idx}/acc'] = avg_acc
+    with open(os.path.join(out_dir, "acc.json"), "w") as f:
+        sum_acc = {"model{}_bin{}".format(rank, bin_idx): acc for (rank, bin_idx, acc) in summary_acc}
+        result = {"summary_acc": sum_acc, "avg_acc_per_bin": avg_acc_list, "std_acc_per_bin": std_acc_list}
+        json.dump(result, f, indent=4)
 if __name__ == "__main__":
     main()

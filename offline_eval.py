@@ -24,11 +24,12 @@ def load_model(args):
     """
     out_dir, gpu, pt = args
     torch.cuda.set_device(gpu)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    device = 'cuda'
     ckpt = "ckpt_top1.pt"
     ckpt_path = os.path.join(out_dir, ckpt)
     ckpt = torch.load(ckpt_path,weights_only=False)
     cfg = ckpt['config']
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[cfg.system.dtype]
     ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device,dtype=ptdtype)
     train_corpus, validation_corpus, test_corpus_bins = load_data(config=cfg.data, num_bins=cfg.data.num_bins)
@@ -37,7 +38,7 @@ def load_model(args):
     voc.create_vocab_dict(train_corpus)
     voc.noutputs = train_corpus.noutputs
 
-    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size) for test_corpus_bin in test_corpus_bins]
+    test_loader_bins = [Sampler(test_corpus_bin, voc, cfg.data.batch_size, bos=bos) for test_corpus_bin in test_corpus_bins]
     
     summary_acc = []
     for rank in range(1,6):
@@ -98,12 +99,12 @@ def load_model(args):
             json.dump(result, f, indent=4)
 def main():
     pt = False
-    task = ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]
+    task = ["D_2","D_3","D_12","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]
     pes = ["nope", "sinusoidal", "learned", "rope", "alibi", "t5"]
-    gpu_id = [0,1,2,3,4,5,6,7] * 4
+    gpu_id = [0,1] * 5
     gpu_cycle = cycle(gpu_id)
     task_list = []
-    for t in task:
+    for t in ["D_1"]:
         # for level in range(0,9):
         #     for type in ["FX"]:
         #         name_str = f"setattn_linear_level{level}_{type}"
@@ -122,7 +123,7 @@ def main():
         # out_dir=f"out-{t}/{name_str}"
         # load_model(out_dir)
         for pe in pes:
-            for depth in [16]:
+            for depth in [8]:
                 name_str = f"vanilla_{pe}_d{depth}"
                 out_dir=f"out-{t}/{name_str}"
                 task_list.append((out_dir, next(gpu_cycle)))

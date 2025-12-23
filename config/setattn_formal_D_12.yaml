@@ -1,0 +1,27 @@
+# conf/setattn.yaml
+defaults:
+  - setattn_formal
+
+out_dir: out-formal-Dn
+
+wandb:
+  log: false
+  project: setattn-formal-Dn
+  run_name: ${attn.type}_${model.pos_enc_type}
+
+data:
+  # for dataloader
+  dataset: D_12
+  mode: train
+  lang: D_n
+  num_par: 12 # n in D_n,2,3,4,12
+  lower_window: 2
+  upper_window: 100
+  training_size: 10000
+  validation_size: 2000
+  test_size: 2000
+  len_incr: 100
+  num_bins: 2
+  debug: false
+  loss_type: mse
+

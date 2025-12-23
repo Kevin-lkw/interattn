@@ -168,7 +168,7 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_index):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -181,6 +181,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.shortcut_mask = True
+        self.layer = layer_index
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -239,21 +241,23 @@ class CausalSelfAttention(nn.Module):
             # efficient attention using Flash Attention CUDA kernels
             
             if pos_bias is not None:
-                causal_mask = torch.triu(torch.ones((T, T), device=x.device), diagonal=1).bool()
-                pos_bias = pos_bias.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+                causal_mask = self.getmask(T, x.device)
+                pos_bias = pos_bias.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
                 y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=pos_bias,
                     dropout_p=self.dropout if self.training else 0,
                 )
             else :
+                # import ipdb; ipdb.set_trace()
                 y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
+                    attn_mask=self.getmask(T, x.device),
                     dropout_p=self.dropout if self.training else 0,
-                    is_causal=True,
                 )
         else:
             # manual implementation of attention
+            assert False, "non-flash attention not implemented with shortcut mask yet"
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             if pos_bias is not None:
                 att = att + pos_bias
@@ -266,6 +270,30 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+    def getmask(self, T, device):
+        """
+        returns a mask with shape (T, T)
+        =True means that position i should attend to position j
+        """
+        if not self.shortcut_mask:
+            # standard causal mask
+            mask = torch.tril(torch.ones((T, T), device=device)).to(torch.bool)
+            return mask
+        
+        # shortcut mask
+        n = self.layer
+        B = 2 ** (n + 1)
+        size = ((T + B - 1) // B) * B
+        mat = torch.eye(size, device=device, dtype=torch.bool)
+
+        for start in range(0, size, B):
+
+            mid_col = start + (2 ** n) - 1
+            rows = torch.arange(start + (2 ** n), start + B, device=device)
+            mat[rows, mid_col] = True
+        mat = mat[:T, :T]
+        
+        return mat
 
 class MLP(nn.Module):
 
@@ -289,7 +317,7 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         if config.attn.type == 'vanilla':
-            self.attn = CausalSelfAttention(config)
+            self.attn = CausalSelfAttention(config, layer_index=layer_index)
         else:
             self.attn = create_attention(config, layer_index=layer_index)
 

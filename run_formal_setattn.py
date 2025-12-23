@@ -9,9 +9,10 @@ import sys
 from multiprocessing import Pool
 from itertools import cycle
 task_configs = {
+    "D_1": ("setattn_formal_D_1", {"data.dataset": "D_1", "data.num_par": 1, "optim.epochs": 1000}),
     "D_2": ("setattn_formal_Dn", {"data.dataset": "D_2", "data.num_par": 2}),
     "D_3": ("setattn_formal_Dn", {"data.dataset": "D_3", "data.num_par": 3}),
-    # "D_12": ("setattn_formal_Dn", {"data.dataset": "D_12", "data.num_par": 12}),
+    "D_12": ("setattn_formal_Dn", {"data.dataset": "D_12", "data.num_par": 12}),
     "Parity": ("setattn_formal_Parity", {}),
     # "AAStar": ("setattn_formal_AAStar", {}),
     # "ABABStar": ("setattn_formal_ABABStar", {}),
@@ -40,9 +41,9 @@ def run_single_experiment(task, attn_type, pos_enc, level, set_policy, depth, gp
     # 构建命令
     name_str = f"{attn_type}"
     if attn_type == "vanilla" or attn_type == "linear_attention":
-        name_str += f"_{pos_enc}_d{depth}_BOS"
+        name_str += f"/{pos_enc}/shortcut_BOS"
     elif attn_type == "setattn_linear":
-        name_str += f"_level{level}" + ("_SM" if set_policy == "small" else ("_LG" if set_policy == "large" else "_FX"))
+        name_str += f"/level{level}" + "/" + ("SM" if set_policy == "small" else ("LG" if set_policy == "large" else "FX"))
     cmd = [
         f"CUDA_VISIBLE_DEVICES={gpu}",
         "python offlinetrain.py",
@@ -116,11 +117,11 @@ depth_mapping = {
 }
 def main():
     # 配置可用的GPU列表
-    available_gpus = [0,1,2,3,4,5,6,7]*5   # 根据实际情况修改
+    available_gpus = [0,1]*6   # 根据实际情况修改
     # 生成所有实验配置
     experiments = []
     for attn_type in ["vanilla"]:
-        for task in task_configs.keys():
+        for task in ["Parity"]:
             for level in level_mapping[attn_type]:
                 for pos_enc in pe_mapping[attn_type]:
                     for depth in depth_mapping[attn_type]:

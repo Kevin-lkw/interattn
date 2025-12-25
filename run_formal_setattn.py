@@ -14,8 +14,8 @@ task_configs = {
     "D_3": ("setattn_formal_Dn", {"data.dataset": "D_3", "data.num_par": 3}),
     "D_12": ("setattn_formal_Dn", {"data.dataset": "D_12", "data.num_par": 12}),
     "Parity": ("setattn_formal_Parity", {}),
-    # "AAStar": ("setattn_formal_AAStar", {}),
-    # "ABABStar": ("setattn_formal_ABABStar", {}),
+    "AAStar": ("setattn_formal_AAStar", {}),
+    "ABABStar": ("setattn_formal_ABABStar", {}),
     # "Dyck-1": ("setattn_formal_Dyck", {}),
     "Shuffle-2": ("setattn_formal_Shuffle-2", {}),
     "Shuffle-4": ("setattn_formal_Shuffle-4", {}),
@@ -24,6 +24,8 @@ task_configs = {
     "Boolean-5": ("setattn_formal_Boolean-5", {}),
     # "Counter-anbn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbn", "data.num_par": 2, "optim.epochs": 5000}),
     # "Counter-anbncn": ("setattn_formal_Counter", {"data.dataset": "Counter-anbncn", "data.num_par": 3, "optim.epochs": 5000}),
+    "Counter-2": ("setattn_formal_Counter-2", {}),
+    "Counter-3": ("setattn_formal_Counter-3", {}),
     "Tomita-3": ("setattn_formal_Tomita-3", {}),
     "Tomita-4": ("setattn_formal_Tomita-4", {}),
     "Tomita-5": ("setattn_formal_Tomita-5", {}),
@@ -41,7 +43,7 @@ def run_single_experiment(task, attn_type, pos_enc, level, set_policy, depth, gp
     # 构建命令
     name_str = f"{attn_type}"
     if attn_type == "vanilla" or attn_type == "linear_attention":
-        name_str += f"/{pos_enc}/shortcut_BOS"
+        name_str += f"/{pos_enc}/d{depth}_BOS"
     elif attn_type == "setattn_linear":
         name_str += f"/level{level}" + "/" + ("SM" if set_policy == "small" else ("LG" if set_policy == "large" else "FX"))
     cmd = [
@@ -109,7 +111,7 @@ pe_mapping = {
     "setattn_linear":["nope"],
 }
 depth_mapping = {
-    "vanilla":[8],
+    "vanilla":[16],
     "linear_attention":[2],
     "mamba":[2],
     "delta_net":[2],
@@ -117,11 +119,11 @@ depth_mapping = {
 }
 def main():
     # 配置可用的GPU列表
-    available_gpus = [0,1]*6   # 根据实际情况修改
+    available_gpus = [6,7]*7   # 根据实际情况修改
     # 生成所有实验配置
     experiments = []
     for attn_type in ["vanilla"]:
-        for task in ["Parity"]:
+        for task in ["Counter-3","Counter-2","AAStar","ABABStar"]:
             for level in level_mapping[attn_type]:
                 for pos_enc in pe_mapping[attn_type]:
                     for depth in depth_mapping[attn_type]:

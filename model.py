@@ -15,7 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from attention_factory import create_attention
-from typing import Tuple
+from typing import Tuple, Optional
+import os
 ### Sinusoidal implementation
 def sinusoidal(pos, d_model: int):
     if pos.dim() == 1:
@@ -181,7 +182,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.shortcut_mask = True
+        self.shortcut_mask = False
         self.layer = layer_index
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -249,7 +250,6 @@ class CausalSelfAttention(nn.Module):
                     dropout_p=self.dropout if self.training else 0,
                 )
             else :
-                # import ipdb; ipdb.set_trace()
                 y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=self.getmask(T, x.device),
@@ -460,10 +460,13 @@ class GPT(nn.Module):
                             # for i in range(all_correct_per_sample.size(0)):
                             #     if all_correct_per_sample[i]:
                             #         print(idx[i])
+                            #         import ipdb; ipdb.set_trace()
                             # print("Incorrect samples")
                             # for i in range(all_correct_per_sample.size(0)):
                             #     if not all_correct_per_sample[i]:
                             #         print(idx[i])
+                            #         print("is_correct=", is_correct[i])
+                            #         import ipdb; ipdb.set_trace()
                             # print("----")
                             # print("acc=", all_correct_per_sample.mean())
                             # import ipdb; ipdb.set_trace()

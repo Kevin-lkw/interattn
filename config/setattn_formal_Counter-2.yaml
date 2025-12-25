@@ -4,27 +4,27 @@ defaults:
 
 out_dir: out-formal-AAStar
 
-model:
-  pos_enc_type: 'nope'
 wandb:
   log: false
   project: setattn-formal-parity
   run_name: null
+model:
+  pos_enc_type: learned
 optim:
   epochs: 2000
 data:
-  dataset: AAStar
+  dataset: Counter-2
   block_size: 1024
   # for dataloader
   mode: train
-  lang: AAStar
-  num_par: 2 # number of 'a', 2 means 'aa'
-  lower_window: 2
-  upper_window: 500
-  training_size: 150
+  lang: Counter
+  num_par: 2 # number of character, 2 means 'anbn' 3 means 'anbncn'
+  lower_window: 1
+  upper_window: 150 # here 150 means n = 150, total length = anbn = 300
+  training_size: 50
   validation_size: 50
   test_size: 50
-  len_incr: 100
+  len_incr: 50
   num_bins: 2
   debug: false
   loss_type: mse

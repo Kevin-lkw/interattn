@@ -12,12 +12,24 @@ from omegaconf import DictConfig
 from data.formal_language.generate_data import load_data
 from data.formal_language.dataloader import Sampler
 from data.formal_language.utils.helper import Voc
-import wandb
 import json
 import math
 import multiprocessing as mp
 from multiprocessing import Pool
 from itertools import cycle
+def modify(x,y,bos):
+    print("modify input")
+    start = 0
+    if bos == True:
+        x[0][0] = 3
+        y[0][0] = torch.tensor([-1,-1],dtype=y.dtype,device=y.device)
+        start = 1
+    x[0][start] = 1
+    y[0][start] = torch.tensor([1,1],dtype=y.dtype,device=y.device)
+    for i in range(start+1,x.size(1)):
+        x[0][i] = 3 - x[0][i-1]
+        y[0][i] = torch.tensor([1,1],dtype=y.dtype,device=y.device) if x[0][i]==1 else torch.tensor([1,0],dtype=y.dtype,device=y.device)
+    # print("sample:", x[0]) 
 def load_model(args):
     """
     load model part
@@ -65,8 +77,12 @@ def load_model(args):
             with torch.no_grad(), ctx:
                 for j in range(0, len(test_loader.data), cfg.data.batch_size):
                     X_test, Y_test, _ = test_loader.get_batch(j)
+                    X_test = X_test.clone()
+                    Y_test = Y_test.clone()
+                    # modify(X_test,Y_test,bos)
                     X_test = X_test.to(device)
                     Y_test = Y_test.to(device)
+                    # import ipdb; ipdb.set_trace()
                     _, loss, acc, acc2 = model(X_test, Y_test, acc = True, loss_type = cfg.data.loss_type)
                     test_loss += loss.item()
                     test_acc += acc.item()
@@ -101,10 +117,10 @@ def main():
     pt = False
     task = ["D_2","D_3","D_12","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]
     pes = ["nope", "sinusoidal", "learned", "rope", "alibi", "t5"]
-    gpu_id = [0,1] * 5
+    gpu_id = [0]
     gpu_cycle = cycle(gpu_id)
     task_list = []
-    for t in ["D_1"]:
+    for t in ["Parity"]:
         # for level in range(0,9):
         #     for type in ["FX"]:
         #         name_str = f"setattn_linear_level{level}_{type}"
@@ -122,14 +138,15 @@ def main():
         # name_str = "delta_net"
         # out_dir=f"out-{t}/{name_str}"
         # load_model(out_dir)
-        for pe in pes:
+        for pe in ["rope"]:
             for depth in [8]:
-                name_str = f"vanilla_{pe}_d{depth}"
+                name_str = f"vanilla/{pe}/d{depth}"
                 out_dir=f"out-{t}/{name_str}"
-                task_list.append((out_dir, next(gpu_cycle)))
+                # task_list.append((out_dir, next(gpu_cycle)))
+                load_model((out_dir, 0, pt))
 
-    with Pool(processes=len(gpu_id)) as pool:
-        results = pool.map(load_model, [ (out_dir, gpu, False) for (out_dir, gpu) in task_list ])
+    # with Pool(processes=len(gpu_id)) as pool:
+    #     results = pool.map(load_model, [ (out_dir, gpu, False) for (out_dir, gpu) in task_list ])
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     main()

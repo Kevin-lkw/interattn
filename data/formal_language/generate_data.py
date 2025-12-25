@@ -73,8 +73,14 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
                     upper_depth = upper_depth + config.depth_incr
             
         elif config.lang == 'Counter':
-            train_corpus 	= CounterCorpus( config.num_par, config.lower_window, config.upper_window, config.training_size, config.debug)
-            val_corpus_bins = [CounterCorpus( config.num_par, config.lower_window, config.upper_window, config.test_size, config.debug, unique = True)]
+            corpus 	= CounterCorpus( config.num_par, config.lower_window, config.upper_window, config.training_size + config.validation_size + config.test_size, config.debug)
+            train_corpus = copy.deepcopy(corpus)
+            train_corpus.source, train_corpus.target = corpus.source[:config.training_size], corpus.target[:config.training_size]
+            validation_corpus = copy.deepcopy(corpus)
+            validation_corpus.source, validation_corpus.target = corpus.source[config.training_size:config.training_size + config.validation_size], corpus.target[config.training_size:config.training_size + config.validation_size]
+            val_corpus = copy.deepcopy(corpus)
+            val_corpus.source, val_corpus.target = corpus.source[config.training_size + config.validation_size:], corpus.target[config.training_size + config.validation_size:]
+            val_corpus_bins = [val_corpus]
 
             lower_window = config.upper_window + 1
             upper_window = config.upper_window + config.len_incr
@@ -254,8 +260,14 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
                 upper_window = upper_window + config.len_incr
 
         elif config.lang == 'ABABStar':
-            train_corpus 	= NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.training_size, config.debug)
-            val_corpus_bins = [NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.test_size, config.debug, unique = True)]
+            corpus 	= NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.training_size + config.validation_size + config.test_size, config.debug)
+            train_corpus = copy.deepcopy(corpus)
+            train_corpus.source, train_corpus.target = corpus.source[:config.training_size], corpus.target[:config.training_size]
+            validation_corpus = copy.deepcopy(corpus)
+            validation_corpus.source, validation_corpus.target = corpus.source[config.training_size:config.training_size + config.validation_size], corpus.target[config.training_size:config.training_size + config.validation_size]
+            val_corpus = copy.deepcopy(corpus)
+            val_corpus.source, val_corpus.target = corpus.source[config.training_size + config.validation_size:], corpus.target[config.training_size + config.validation_size:]
+            val_corpus_bins = [val_corpus]
 
             lower_window = config.upper_window + 1
             upper_window = config.upper_window + config.len_incr
@@ -268,8 +280,14 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
                 upper_window += config.len_incr
 
         elif config.lang == 'AAStar':
-            train_corpus 	= NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.training_size, config.debug)
-            val_corpus_bins = [NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.test_size, config.debug, unique = True)]
+            corpus 	= NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.training_size + config.validation_size + config.test_size, config.debug)
+            train_corpus = copy.deepcopy(corpus)
+            train_corpus.source, train_corpus.target = corpus.source[:config.training_size], corpus.target[:config.training_size]
+            validation_corpus = copy.deepcopy(corpus)
+            validation_corpus.source, validation_corpus.target = corpus.source[config.training_size:config.training_size + config.validation_size], corpus.target[config.training_size:config.training_size + config.validation_size]
+            val_corpus = copy.deepcopy(corpus)
+            val_corpus.source, val_corpus.target = corpus.source[config.training_size + config.validation_size:], corpus.target[config.training_size + config.validation_size:]                                                                                                                                             
+            val_corpus_bins = [val_corpus]
 
             lower_window = config.upper_window + 1
             upper_window = config.upper_window + config.len_incr
@@ -282,8 +300,14 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
                 upper_window += config.len_incr
 
         elif config.lang == 'AnStarA2':
-            train_corpus 	= NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.training_size, config.debug)
-            val_corpus_bins = [NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.test_size, config.debug, unique = True)]
+            corpus 	= NonStarFreeCorpus(config.lang, config.num_par, config.lower_window, config.upper_window, config.training_size + config.validation_size + config.test_size, config.debug)
+            train_corpus = copy.deepcopy(corpus)
+            train_corpus.source, train_corpus.target = corpus.source[:config.training_size], corpus.target[:config.training_size]
+            validation_corpus = copy.deepcopy(corpus)
+            validation_corpus.source, validation_corpus.target = corpus.source[config.training_size:config.training_size + config.validation_size], corpus.target[config.training_size:config.training_size + config.validation_size]
+            val_corpus = copy.deepcopy(corpus)
+            val_corpus.source, val_corpus.target = corpus.source[config.training_size + config.validation_size:], corpus.target[config.training_size + config.validation_size:]
+            val_corpus_bins = [val_corpus]
 
             lower_window = config.upper_window + 1
             upper_window = config.upper_window + config.len_incr

@@ -17,6 +17,29 @@ from torch.nn import functional as F
 from attention_factory import create_attention
 from typing import Tuple, Optional
 import os
+def maxlen(tensor):
+    # calc the max length of Dyck-2 sequence
+    max_depth = 0
+    current_depth = 0
+    s1 = 0 
+    s2 = 0
+    len = 0
+    last = 0
+    for i in range(tensor.size(0)):
+        if tensor[i] == 1:
+            s1 = s1 + 1
+            max_depth = max(max_depth, s1+s2)
+        elif tensor[i] == 3:
+            s2 = s2 + 1
+            max_depth = max(max_depth, s1+s2)
+        elif tensor[i] == 2:
+            s1 = s1 - 1
+        elif tensor[i] == 4:
+            s2 = s2 - 1
+        if s1 == 0 and s2 == 0:
+            len = max (len, i - last + 1)
+            last = i + 1
+    return len, max_depth
 ### Sinusoidal implementation
 def sinusoidal(pos, d_model: int):
     if pos.dim() == 1:
@@ -182,7 +205,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.shortcut_mask = False
+        self.shortcut_mask = True
         self.layer = layer_index
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -250,11 +273,19 @@ class CausalSelfAttention(nn.Module):
                     dropout_p=self.dropout if self.training else 0,
                 )
             else :
-                y = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=self.getmask(T, x.device),
-                    dropout_p=self.dropout if self.training else 0,
-                )
+                if self.shortcut_mask:
+                    causal_mask = self.getmask(T, x.device)
+                    y = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=causal_mask,
+                        dropout_p=self.dropout if self.training else 0,
+                    )
+                else:
+                    y = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v,
+                        dropout_p=self.dropout if self.training else 0,
+                        is_causal=True
+                    )
         else:
             # manual implementation of attention
             assert False, "non-flash attention not implemented with shortcut mask yet"
@@ -291,9 +322,14 @@ class CausalSelfAttention(nn.Module):
             mid_col = start + (2 ** n) - 1
             rows = torch.arange(start + (2 ** n), start + B, device=device)
             mat[rows, mid_col] = True
-        mat = mat[:T, :T]
+        # adding BOS token
+        final_mask = torch.zeros((size + 1, size + 1), device=device, dtype=torch.bool)
+        final_mask[1:,1:] = mat
+        final_mask[:,0] = True  # every position can attend to BOS
+        final_mask = final_mask[:T, :T]
+        # mat = mat[:T, :T]
         
-        return mat
+        return final_mask
 
 class MLP(nn.Module):
 
@@ -459,13 +495,20 @@ class GPT(nn.Module):
                             # print("correct samples")
                             # for i in range(all_correct_per_sample.size(0)):
                             #     if all_correct_per_sample[i]:
+                            #         len,depth = maxlen(idx[i])
+                            #         # maxd = max(maxd,depth)
                             #         print(idx[i])
-                            #         import ipdb; ipdb.set_trace()
+                            # # print("Max depth of correct samples:", maxd)
                             # print("Incorrect samples")
                             # for i in range(all_correct_per_sample.size(0)):
                             #     if not all_correct_per_sample[i]:
+                            #         # len,depth = maxlen(idx[i])
                             #         print(idx[i])
                             #         print("is_correct=", is_correct[i])
+                            #         for j in range(1,idx[i].size(0)):
+                            #             if mask[i, j] and is_correct[i, j] == 0:
+                            #                 print(f"Wrong {j}, Target: {targets[i, j]}, Predicted: {logits[i, j]}")
+                            #                 break
                             #         import ipdb; ipdb.set_trace()
                             # print("----")
                             # print("acc=", all_correct_per_sample.mean())

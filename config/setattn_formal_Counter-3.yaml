@@ -11,7 +11,7 @@ wandb:
 model:
   pos_enc_type: learned
 optim:
-  epochs: 2000
+  epochs: 10000
 data:
   dataset: Counter-3
   block_size: 1024

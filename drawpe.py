@@ -26,7 +26,7 @@ def draw(task):
         ind, ood, ind_s, ood_s = get_acc(f"out-{task}/vanilla/{pe}/d8_BOS")
         # pt_ind, pt_ood, pt_ind_s, pt_ood_s = get_pt_acc(f"out-{task}/vanilla_{pe}")
         # d4_ind, d4_ood, d4_ind_s, d4_ood_s = get_acc(f"out-{task}/vanilla_{pe}_d4")
-        d8_ind, d8_ood, d8_ind_s, d8_ood_s = get_acc(f"out-{task}/vanilla/{pe}/shortcut_BOS")
+        d8_ind, d8_ood, d8_ind_s, d8_ood_s = get_acc(f"out-{task}/vanilla/{pe}/d8_shortcut_BOS")
         ind_acc.append(ind)
         ood_acc.append(ood)
         ind_std.append(ind_s)
@@ -46,9 +46,9 @@ def draw(task):
     plt.bar([i + width*0.5 for i in x], ood_acc, width,
             yerr=ood_std, capsize=3, label='OOD',color='C1')
     plt.bar([i - width*0.5 for i in x], d8_ind_acc, width,
-            yerr=d8_ind_std, capsize=3, label='mask-IND',color='C0', alpha=0.65)
+            yerr=d8_ind_std, capsize=3, label='shortcut-IND',color='C0', alpha=0.65)
     plt.bar([i + width*1.5 for i in x], d8_ood_acc, width,
-            yerr=d8_ood_std, capsize=3, label='mask-OOD',color='C1', alpha=0.65)
+            yerr=d8_ood_std, capsize=3, label='shortcut-OOD',color='C1', alpha=0.65)
     # plt.bar([i + width*0.5 for i in x], pt_ind_acc, width,
     #         yerr=pt_ind_std, capsize=3, label='PT-IND')
     # plt.bar([i + width*1.5 for i in x], pt_ood_acc, width,
@@ -71,8 +71,8 @@ def draw(task):
     # borderaxespad=0.
     )
     # plt.tight_layout(rect=[0, 0, 0.99, 0.99])  
-    os.makedirs(f'out-img/shortcut', exist_ok=True)
-    plt.savefig(f'out-img/shortcut/{task}-acc.png', dpi=300)
+    os.makedirs(f'out-img/shortcut_bos', exist_ok=True)
+    plt.savefig(f'out-img/shortcut_bos/{task}-acc.png', dpi=300)
     plt.close()
 
 if __name__ == "__main__":

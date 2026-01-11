@@ -52,8 +52,15 @@ def load_data(config, num_bins = 2, load_from_disk = True, save_to_disk = True):
 
         '''Load Datasets'''
         if config.lang == 'Dyck':
-            train_corpus 	    = DyckCorpus(config.p_val, config.q_val, config.num_par, config.lower_window, config.upper_window, config.training_size, config.lower_depth, config.upper_depth, config.debug)
-            val_corpus_bins     = [DyckCorpus(config.p_val, config.q_val, config.num_par, config.lower_window, config.upper_window, config.test_size, config.lower_depth, config.upper_depth, config.debug)]
+            corpus = DyckCorpus(config.p_val, config.q_val, config.num_par, config.lower_window, config.upper_window, config.training_size + config.validation_size+config.test_size, config.lower_depth, config.upper_depth, config.debug)
+            train_corpus = copy.deepcopy(corpus)
+            train_corpus.source, train_corpus.target = corpus.source[:config.training_size], corpus.target[:config.training_size]
+            validation_corpus = copy.deepcopy(corpus)
+            validation_corpus.source, validation_corpus.target = corpus.source[config.training_size:config.training_size + config.validation_size], corpus.target[config.training_size:config.training_size + config.validation_size]
+            val_corpus = copy.deepcopy(corpus)
+            val_corpus.source, val_corpus.target = corpus.source[config.training_size + config.validation_size:], corpus.target[config.training_size + config.validation_size:]
+            
+            val_corpus_bins     = [val_corpus]
             val_corpus_bin = []
             lower_window = config.bin1_lower_window
             upper_window = config.bin1_upper_window

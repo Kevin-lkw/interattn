@@ -9,7 +9,7 @@ wandb:
   project: setattn-formal-parity
   run_name: null
 optim:
-  epochs: 2000
+  epochs: 10000
 data:
   dataset: ABABStar
   block_size: 1024

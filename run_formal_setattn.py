@@ -16,7 +16,8 @@ task_configs = {
     "Parity": ("setattn_formal_Parity", {}),
     "AAStar": ("setattn_formal_AAStar", {}),
     "ABABStar": ("setattn_formal_ABABStar", {}),
-    # "Dyck-1": ("setattn_formal_Dyck", {}),
+    "Dyck-1": ("setattn_formal_Dyck-1", {}),
+    "Dyck-2": ("setattn_formal_Dyck-2", {}),
     "Shuffle-2": ("setattn_formal_Shuffle-2", {}),
     "Shuffle-4": ("setattn_formal_Shuffle-4", {}),
     "Boolean-3": ("setattn_formal_Boolean-3", {}),
@@ -43,14 +44,14 @@ def run_single_experiment(task, attn_type, pos_enc, level, set_policy, depth, gp
     # 构建命令
     name_str = f"{attn_type}"
     if attn_type == "vanilla" or attn_type == "linear_attention":
-        name_str += f"/{pos_enc}/d{depth}_BOS"
+        name_str += f"/{pos_enc}/d{depth}_shortcut_BOS_200epoch"
     elif attn_type == "setattn_linear":
         name_str += f"/level{level}" + "/" + ("SM" if set_policy == "small" else ("LG" if set_policy == "large" else "FX"))
     cmd = [
         f"CUDA_VISIBLE_DEVICES={gpu}",
         "python offlinetrain.py",
         f"--config-name={config_name}",
-        "wandb.log=true",
+        "wandb.log=false",
         f"wandb.project=setattn-formal-{task}",
         f"wandb.run_name={name_str}",
         f"out_dir=out-{task}/{name_str}",
@@ -61,6 +62,7 @@ def run_single_experiment(task, attn_type, pos_enc, level, set_policy, depth, gp
         f"model.pos_enc_type={pos_enc}" ,
         f"model.n_layer={depth}",
         f"data.bos=True",
+        f"optim.epochs=200"
     ]
     
     
@@ -119,13 +121,13 @@ depth_mapping = {
 }
 def main():
     # 配置可用的GPU列表
-    available_gpus = [6,7]*7   # 根据实际情况修改
+    available_gpus = [1]   # 根据实际情况修改
     # 生成所有实验配置
     experiments = []
     for attn_type in ["vanilla"]:
-        for task in ["Counter-3","Counter-2","AAStar","ABABStar"]:
+        for task in ["Parity"]:
             for level in level_mapping[attn_type]:
-                for pos_enc in pe_mapping[attn_type]:
+                for pos_enc in ["nope"]:
                     for depth in depth_mapping[attn_type]:
                         for set_policy in ["fixed"]:
                             experiments.append((task, attn_type, pos_enc, level, set_policy, depth))
@@ -154,8 +156,8 @@ def main():
     
     if failed_experiments:
         print(f"\n❌ {len(failed_experiments)} experiment(s) failed:")
-        for (task, attn_type, pos_enc, level, smaller, gpu), _ in failed_experiments:
-            print(f"  - {task} | {attn_type} | level={level}" + (f" | PE={pos_enc}" if pos_enc else "") + f" | smaller={smaller} (GPU {gpu})")
+        for (task, attn_type, pos_enc, level, smaller, depth, gpu), _ in failed_experiments:
+            print(f"  - {task} | {attn_type} | level={level}" + (f" | PE={pos_enc}" if pos_enc else "") + f" | smaller={smaller} depth={depth} (GPU {gpu})")
         sys.exit(1)
     else:
         print(f"\n✅ All {len(experiments_with_gpu)} experiments completed successfully!")

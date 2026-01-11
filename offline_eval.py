@@ -117,7 +117,7 @@ def main():
     pt = False
     task = ["D_2","D_3","D_12","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]
     pes = ["nope", "sinusoidal", "learned", "rope", "alibi", "t5"]
-    gpu_id = [0]
+    gpu_id = [1]
     gpu_cycle = cycle(gpu_id)
     task_list = []
     for t in ["Parity"]:
@@ -138,9 +138,9 @@ def main():
         # name_str = "delta_net"
         # out_dir=f"out-{t}/{name_str}"
         # load_model(out_dir)
-        for pe in ["rope"]:
+        for pe in ["nope"]:
             for depth in [8]:
-                name_str = f"vanilla/{pe}/d{depth}"
+                name_str = f"vanilla/{pe}/d{depth}_shortcut_BOS"
                 out_dir=f"out-{t}/{name_str}"
                 # task_list.append((out_dir, next(gpu_cycle)))
                 load_model((out_dir, 0, pt))

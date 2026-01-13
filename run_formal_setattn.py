@@ -9,13 +9,13 @@ import sys
 from multiprocessing import Pool
 from itertools import cycle
 task_configs = {
-    "D_1": ("setattn_formal_D_1", {"data.dataset": "D_1", "data.num_par": 1, "optim.epochs": 1000}),
+    # "D_1": ("setattn_formal_D_1", {"data.dataset": "D_1", "data.num_par": 1, "optim.epochs": 1000}),
     "D_2": ("setattn_formal_Dn", {"data.dataset": "D_2", "data.num_par": 2}),
     "D_3": ("setattn_formal_Dn", {"data.dataset": "D_3", "data.num_par": 3}),
     "D_12": ("setattn_formal_Dn", {"data.dataset": "D_12", "data.num_par": 12}),
     "Parity": ("setattn_formal_Parity", {}),
-    "AAStar": ("setattn_formal_AAStar", {}),
-    "ABABStar": ("setattn_formal_ABABStar", {}),
+    # "AAStar": ("setattn_formal_AAStar", {}),
+    # "ABABStar": ("setattn_formal_ABABStar", {}),
     "Dyck-1": ("setattn_formal_Dyck-1", {}),
     "Dyck-2": ("setattn_formal_Dyck-2", {}),
     "Shuffle-2": ("setattn_formal_Shuffle-2", {}),
@@ -43,15 +43,15 @@ def run_single_experiment(task, attn_type, pos_enc, level, set_policy, depth, gp
     
     # 构建命令
     name_str = f"{attn_type}"
-    if attn_type == "vanilla" or attn_type == "linear_attention":
-        name_str += f"/{pos_enc}/d{depth}_shortcut_BOS_200epoch"
-    elif attn_type == "setattn_linear":
+    all_append = f"/{pos_enc}/d{depth}_BOS"
+    if attn_type == "setattn_linear":
         name_str += f"/level{level}" + "/" + ("SM" if set_policy == "small" else ("LG" if set_policy == "large" else "FX"))
+    name_str += all_append
     cmd = [
         f"CUDA_VISIBLE_DEVICES={gpu}",
         "python offlinetrain.py",
         f"--config-name={config_name}",
-        "wandb.log=false",
+        "wandb.log=true",
         f"wandb.project=setattn-formal-{task}",
         f"wandb.run_name={name_str}",
         f"out_dir=out-{task}/{name_str}",
@@ -62,7 +62,6 @@ def run_single_experiment(task, attn_type, pos_enc, level, set_policy, depth, gp
         f"model.pos_enc_type={pos_enc}" ,
         f"model.n_layer={depth}",
         f"data.bos=True",
-        f"optim.epochs=200"
     ]
     
     
@@ -96,7 +95,7 @@ level_mapping = {
     "linear_attention":[0],
     "mamba":[0],
     "delta_net":[0],
-    "setattn_linear":[6,7],
+    "setattn_linear":[0,1,2,3,4,5,6],
 }
 smaller_mapping = {
     "vanilla":["small"],
@@ -107,29 +106,29 @@ smaller_mapping = {
 }
 pe_mapping = {
     "vanilla":["sinusoidal", "learned", "rope", "alibi","nope", "t5"],
-    "linear_attention":["nope", "rope"],
+    "linear_attention":["nope"],
     "mamba":["nope"],
     "delta_net":["nope"],
     "setattn_linear":["nope"],
 }
 depth_mapping = {
-    "vanilla":[16],
-    "linear_attention":[2],
-    "mamba":[2],
-    "delta_net":[2],
-    "setattn_linear":[2],
+    "vanilla":[8],
+    "linear_attention":[8],
+    "mamba":[8],
+    "delta_net":[8],
+    "setattn_linear":[8],
 }
 def main():
     # 配置可用的GPU列表
-    available_gpus = [1]   # 根据实际情况修改
+    available_gpus = [0,1,2,3,4,5,6,7]*7   # 根据实际情况修改
     # 生成所有实验配置
     experiments = []
-    for attn_type in ["vanilla"]:
-        for task in ["Parity"]:
+    for attn_type in ["setattn_linear"]:
+        for task in task_configs.keys():
             for level in level_mapping[attn_type]:
-                for pos_enc in ["nope"]:
+                for pos_enc in pe_mapping[attn_type]:
                     for depth in depth_mapping[attn_type]:
-                        for set_policy in ["fixed"]:
+                        for set_policy in smaller_mapping[attn_type]:
                             experiments.append((task, attn_type, pos_enc, level, set_policy, depth))
             
     # 为每个实验分配GPU（循环分配）

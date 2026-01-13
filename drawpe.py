@@ -77,6 +77,6 @@ def draw(task):
 
 if __name__ == "__main__":
     # for task in ["D_2","D_3","D_12","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]:
-    for task in ["Parity"]:
+    for task in ["Tomita-5","Tomita-6"]:
         draw(task)
         print(f"Plot for task {task}")

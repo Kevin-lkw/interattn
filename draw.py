@@ -1,5 +1,4 @@
 import os
-import torch
 import matplotlib.pyplot as plt
 import json
 import math
@@ -22,36 +21,37 @@ def draw(task):
     LG_ind_acc, LG_ood_acc, LG_ind_std, LG_ood_std = [], [], [], []
     SM_ind_acc, SM_ood_acc, SM_ind_std, SM_ood_std = [], [], [], []
     FX_ind_acc, FX_ood_acc, FX_ind_std, FX_ood_std = [], [], [], []
-    LG_levels = list(range(0, levelmax+2))
-    SM_levels = list(range(0, levelmax+2))
-    FX_levels = list(range(0, levelmax+2))
+    LG_levels = list(range(0, levelmax+1))
+    SM_levels = list(range(0, levelmax+1))
+    FX_levels = list(range(0, levelmax+1))
+    sufix = "d8_BOS"
     for level in LG_levels:
         # LG
-        lg_ind, lg_ood, lg_ind_std, lg_ood_std = get_acc(f"out-{task}/setattn_linear_level{level}_LG")
+        lg_ind, lg_ood, lg_ind_std, lg_ood_std = get_acc(f"out-{task}/setattn_linear/level{level}/LG/nope/{sufix}")
         LG_ind_acc.append(lg_ind)
         LG_ood_acc.append(lg_ood)
         LG_ind_std.append(lg_ind_std)
         LG_ood_std.append(lg_ood_std)
     for level in SM_levels:
         # SM
-        sm_ind, sm_ood, sm_ind_std, sm_ood_std = get_acc(f"out-{task}/setattn_linear_level{level}_SM")
+        sm_ind, sm_ood, sm_ind_std, sm_ood_std = get_acc(f"out-{task}/setattn_linear/level{level}/SM/nope/{sufix}")
         SM_ind_acc.append(sm_ind)
         SM_ood_acc.append(sm_ood)
         SM_ind_std.append(sm_ind_std)
         SM_ood_std.append(sm_ood_std)
     for level in FX_levels:
         # FX
-        fx_ind, fx_ood, fx_ind_std, fx_ood_std = get_acc(f"out-{task}/setattn_linear_level{level}_FX")
+        fx_ind, fx_ood, fx_ind_std, fx_ood_std = get_acc(f"out-{task}/setattn_linear/level{level}/FX/nope/{sufix}")
         FX_ind_acc.append(fx_ind)
         FX_ood_acc.append(fx_ood) 
         FX_ind_std.append(fx_ind_std)
         FX_ood_std.append(fx_ood_std)
     # import ipdb; ipdb.set_trace()
     # plotting
-    vanilla_ind, vanilla_ood, vanilla_ind_std, vanilla_ood_std = get_acc(f"out-{task}/vanilla_nope")
-    linear_ind, linear_ood, linear_ind_std, linear_ood_std = get_acc(f"out-{task}/linear_attention_nope")
-    mamba_ind, mamba_ood, mamba_ind_std, mamba_ood_std = get_acc(f"out-{task}/mamba")
-    delta_ind, delta_ood, delta_ind_std, delta_ood_std = get_acc(f"out-{task}/delta_net")
+    vanilla_ind, vanilla_ood, vanilla_ind_std, vanilla_ood_std = get_acc(f"out-{task}/vanilla/nope/{sufix}")
+    linear_ind, linear_ood, linear_ind_std, linear_ood_std = get_acc(f"out-{task}/linear_attention/nope/{sufix}")
+    mamba_ind, mamba_ood, mamba_ind_std, mamba_ood_std = get_acc(f"out-{task}/mamba/nope/{sufix}")
+    delta_ind, delta_ood, delta_ind_std, delta_ood_std = get_acc(f"out-{task}/delta_net/nope/{sufix}")
     plt.figure()
 
     # 颜色：C0 用于 IND，C1 用于 OOD
@@ -176,11 +176,11 @@ def draw(task):
     # borderaxespad=0.
     )
     # plt.tight_layout(rect=[0, 0, 0.99, 0.99])  
-    os.makedirs(f'out-{task}', exist_ok=True)
-    plt.savefig(f'out-{task}/model_accuracy.png', dpi=300)
+    os.makedirs(f'out-img/setattn', exist_ok=True)
+    plt.savefig(f'out-img/setattn/{task}.png', dpi=300)
     plt.close()
 
 if __name__ == "__main__":
-    for task in ["D_2","D_3","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5"]:
+    for task in ["D_2","D_3","Dyck-1","Dyck-2","Parity","Shuffle-2","Shuffle-4","Boolean-3","Boolean-5","Tomita-3","Tomita-4","Tomita-5","Tomita-6","Tomita-7"]:
         draw(task)
         print(f"Plot for task {task}")

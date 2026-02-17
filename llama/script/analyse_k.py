@@ -5,14 +5,15 @@ import numpy as np
 import seaborn as sns 
 import os
 import math
-model = "llama-7b-hf"
+model = "llama-2-7b-hf"
 dataset_name="wikitext"
 start = 0
-kv = torch.load(f"{model}_{dataset_name}_st{start}.pt", weights_only=False)
+kv = torch.load(f"../{model}_{dataset_name}_st{start}.pt", weights_only=False)
 
 model_config = kv["model_config"]
 kv_info = kv["before_rope"]
 rope_qkv = kv["after_rope"]
+inputs = kv["input"]
 
 def get_attention_map_after_rope(layer_idx, head_idx=0, causal=True, dtype=torch.float32):
     """
@@ -136,7 +137,7 @@ def plot_similarity_grid(layers, num_heads_to_plot=8, query_type='q', key_type='
                 ax.set_ylabel(f"Layer {layer_idx}", fontsize=15, fontweight='bold')
 
 
-    plt.suptitle(f"KV Similarity (After RoPE) - Context Length: {data.shape[0]}", fontsize=20)
+    plt.suptitle(f"KV Similarity (After RoPE)", fontsize=20)
     out_path = f"./img/kv_sim_grid_comparison_{key_type}.png"
     os.makedirs("./img/", exist_ok=True)
     plt.savefig(out_path, dpi=150) # 4096 尺度下 150 dpi 足够看清结构
@@ -157,7 +158,7 @@ def plot_length_distribution(layer_index, head_index, key_type='k'):
     file_name = out_dir + f"{key_type}_length_distribution.png"
     plt.savefig(file_name)
 
-def plot_attention_grid(layers, num_heads_to_plot, causal=True, save_path="./img/attn_grid.png", dpi=150, zoom=None):
+def plot_attention_grid(layers, num_heads_to_plot, causal=True, save_path="../img/attn_grid.png", dpi=150, zoom=None):
 
     num_layers = len(layers)
 
@@ -205,10 +206,9 @@ def plot_attention_grid(layers, num_heads_to_plot, causal=True, save_path="./img
                 ax.set_title(f"Head {head_idx}", fontsize=14)
             if j == 0:
                 ax.set_ylabel(f"Layer {layer_idx}", fontsize=14, fontweight="bold")
-
-    # 全局一个 colorbar（推荐）
-    cbar = fig.colorbar(last_im, ax=axes.ravel().tolist(), shrink=0.6)
-    cbar.set_label("Attention Weight")
+    if last_im is not None:
+        cbar = fig.colorbar(last_im, ax=axes.ravel().tolist(), shrink=0.6)
+        cbar.set_label("Attention Weight")
 
     title = f"Attention Map Grid (After RoPE) - causal={causal}"
     if zoom is not None:
@@ -223,4 +223,4 @@ def plot_attention_grid(layers, num_heads_to_plot, causal=True, save_path="./img
 # plot_similarity_lower_triangle(layer_idx=24, head_idx=5, after_rope=True, key_type='v')
 # plot_similarity_grid(layers=[8,12,24], num_heads_to_plot=4, key_type = 'k')    
 # plot_length_distribution(layer_index=24, head_index=5, key_type='q')
-plot_attention_grid(layers=[4,8,12,24,30], num_heads_to_plot=6, causal=True, save_path="./img/attn_grid.png", dpi=150,zoom=(0,128))
+# plot_attention_grid(layers=[30,31], num_heads_to_plot=6, causal=True, save_path="../img/attn_grid.png", dpi=150,zoom=(0,128))

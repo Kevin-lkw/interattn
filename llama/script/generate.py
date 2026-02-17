@@ -16,22 +16,18 @@ texts = '\n'.join([t for t in dataset['text'] if t.strip()])
 # texts = '\n'.join([t for t in dataset['text'] if t.strip()])
 
 # import ipdb; ipdb.set_trace()
-llama_model = "llama-7b-hf"
-# load model
-local_dir = f"/nfs-shared-2/models/llama/{llama_model}" 
-
+llama_model = "meta-llama/Llama-2-7b-hf"
+model_name = "llama-2-7b-hf"
 tokenizer = AutoTokenizer.from_pretrained(
-    local_dir,
-    local_files_only=True,
-    use_fast=False,          
+    llama_model,
+    use_fast=False,        
 )
 
 model = AutoModelForCausalLM.from_pretrained(
-    local_dir,
-    local_files_only=True,
+    llama_model,
     torch_dtype="auto",  
     device_map="auto",
-    attn_implementation="eager", 
+    attn_implementation="eager",
 )
 # model is LlamaForCausalLM
 
@@ -100,7 +96,7 @@ Wo = model.model.layers[-1].self_attn.o_proj.weight.detach().cpu()
 Wlm = model.lm_head.weight.detach().cpu()
     
 save = {
-    "model_dir": local_dir, 
+    "model_dir": llama_model, 
     "model_config": model.config,
     "input": inputs,
     "before_rope": kv_info,
@@ -108,5 +104,5 @@ save = {
     "Wo": Wo,
     "Wlm": Wlm,
 }
-torch.save(save, f"{llama_model}_{dataset_name}_st{start_index}.pt")
-print(f"Saved kv and rope info to {llama_model}_{dataset_name}_st{start_index}.pt")
+torch.save(save, f"../{model_name}_{dataset_name}_st{start_index}.pt")
+print(f"Saved kv and rope info to ../{model_name}_{dataset_name}_st{start_index}.pt")

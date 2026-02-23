@@ -1,19 +1,9 @@
-import token
-from turtle import left
-from sympy import per
-from tokenizers import InputSequence
 import torch
-import torch.nn.functional as F
-import numpy as np
-
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import normalize
-
 from matplotlib import pyplot as plt
+from torch.nn import functional as F
 import os
 from transformers import AutoTokenizer
+import math
 
 llama_model = "meta-llama/Llama-2-7b-hf"
 model = "llama-2-7b-hf"
@@ -25,136 +15,206 @@ tokenizer = AutoTokenizer.from_pretrained(
 dataset_name="wikitext"
 start = 0
 kv = torch.load(f"../{model}_{dataset_name}_st{start}.pt", weights_only=False)
-
-
-
 model_config = kv["model_config"]
 kv_info = kv["before_rope"]
 rope_qkv = kv["after_rope"]
-Wo = kv["Wo"] # Shape (hidden_size, hidden_size)
+Wnorm = kv["Wnorm"] # Shape (hidden_size,)
 Wlm = kv["Wlm"] # Shape (vocab_size, hidden_size)
 inputs = kv["input"]
-
+outputs = kv["output"]
+attn = kv["last_layer_attention"]
+last_layer_param  = kv["last_layer"]
+last_layer_input = kv["last_layer_input"]
+gt_label = kv["gt_label"]
+# print("model_config", model_config)
 L = model_config.num_hidden_layers
 
-from analyse_k import get_attention_map_after_rope
-attention_score = {}
-per_token_attention = torch.zeros(inputs['input_ids'].shape[1])  # [seq_len]
-for head_idx in range(model_config.num_attention_heads):
-    attention_score[head_idx] = get_attention_map_after_rope(layer_idx=L-1, head_idx=head_idx, causal=True)
-    per_token_attention = per_token_attention + attention_score[head_idx].sum(dim=0)  # 每个 token 的总 attention 权重
 
 
-V:torch.Tensor = rope_qkv[L-1]["v"]  # last layer's value, shape (B,nh,seq_len,hd)
-V = V.transpose(1, 2).contiguous()  # (B,seq_len,nh,hd)
-B, seq_len, nh, hd = V.shape
-V = V.view(B, seq_len, nh * hd)  # (B,seq_len,nh*hd)
+from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaDecoderLayer
 
-Z_hidden = V @ Wo.T  # (B,seq_len,hidden_size)
-Z_final = Z_hidden @ Wlm.T  # (B,seq_len, vocab_size)
-Z_hidden_np = Z_hidden[0].cpu().numpy()  # (seq_len, hidden_size)
-Z_hidden_np = Z_hidden_np.astype(np.float32)
+device = "cuda"
+# constant part
+modelNorm = LlamaRMSNorm(model_config.hidden_size, eps=model_config.rms_norm_eps).half().to(device)
+modelNorm.load_state_dict({"weight": Wnorm.to(device)}, strict=True)
+modelNorm.requires_grad_(False)
+modelNorm.eval()
 
-# print("Output shape:", Z_final.shape)
+layer = LlamaDecoderLayer(model_config, layer_idx=L-1).half().to(device)
+layer.load_state_dict(last_layer_param, strict=True)
+layer.eval()
+def plain_forward(alpha, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm):
+        V_new = alpha.to(V_head.dtype) @ V_head # [n_pos, hd]
+        output = original.clone()
+        output[head_idx] = V_new
+        hidden = output.permute(1,0,2).reshape(len(pos_list), -1) # [n_pos, hidden_size]
+        hidden = hidden @ Wo.T # [n_pos, hidden_size]
+        hidden = hidden + residual_attn_in # add residual
+        
+        hidden = modelNorm(hidden)
+        hidden = hidden @ Wlm.T # [n_pos, vocab_size]
+        return hidden 
 
-# # SVD for Z_hidden
+def mlp_forward(alpha, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm):
+    V_new = alpha.to(V_head.dtype) @ V_head # [n_pos, hd]
+    output = original.clone()
+    output[head_idx] = V_new
+    hidden = output.permute(1,0,2).reshape(len(pos_list), -1) # [n_pos, hidden_size]
+    hidden = hidden @ Wo.T # [n_pos, hidden_size]
+    hidden = hidden + residual_attn_in # add residual
+    residual = hidden
+    hidden = layer.post_attention_layernorm(hidden)
+    
+    # MLP
+    hidden = layer.mlp(hidden)
+    hidden = hidden + residual
+    
+    
+    hidden_states_normed = modelNorm(hidden)
+    logits = hidden_states_normed @ Wlm.T
+    return logits
 
-# Z_centered = Z_hidden_np - Z_hidden_np.mean(axis=0)  # Centering
-# # import ipdb; ipdb.set_trace() 
-# U, S, VT = np.linalg.svd(Z_centered, full_matrices=False)
-
-# # Plot singular values
-# plt.figure(figsize=(8, 6))
-# plt.plot(S, marker='o')
-# plt.yscale('log')
-# plt.title("Singular Values of Z_hidden")
-# plt.xlabel("Index")
-# plt.ylabel("Singular Value(log scale)")
-# plt.grid()
-# path = "../img/v_analysis"
-# os.makedirs(path, exist_ok=True)
-# plt.savefig(f"{path}/Z_hidden_singular_values_{model}_{dataset_name}_st{start}.png")
-
-# # Effective rank
-# energy = np.cumsum(S**2) / np.sum(S**2)
-# effective_rank = np.searchsorted(energy, 0.9) + 1
-# print(f"Effective rank of Z_hidden: {effective_rank}")
-
-
-# # PCA for Z_hidden
-# pca = PCA(n_components=2)
-# Z_pca = pca.fit_transform(Z_hidden_np)  # (seq_len, 2)
-
-# plt.figure(figsize=(8, 6))
-# plt.scatter(Z_pca[:, 0], Z_pca[:, 1], s=5)
-# plt.title("PCA of Z_hidden")
-# plt.xlabel("Principal Component 1")
-# plt.ylabel("Principal Component 2")
-# plt.grid()
-# path = "../img/v_analysis"
-# os.makedirs(path, exist_ok=True)
-# plt.savefig(f"{path}/Z_hidden_PCA_{model}_{dataset_name}_st{start}.png")
-
-
-
-"""
-We want to analyze the convex hull of the value vectors Z.
-where Z = V @ Wo.T.
-"""
-
-# # support vectors 
-# num_dirctions = 2048
-# n,d = Z_hidden_np.shape
-# cnt = np.zeros(n)
-# for i in range(num_dirctions):
-#     r = np.random.randn(d)
-#     r = r / np.linalg.norm(r)
-#     projections = Z_hidden_np @ r  # (n,)
-#     argmax = np.argmax(projections)
-#     cnt[argmax] += 1
-
-# # print the number of positive counts
-# num_support_vectors = np.sum(cnt > 0)
-# print(f"Number of support vectors in Z_hidden: {num_support_vectors} out of {n}")
-# print("top 10 support vectors indices and counts:")
-# top_10_indices = np.argsort(cnt)[-10:][::-1]
-# for idx in top_10_indices:
-#     print(f"Index: {idx}, Count: {cnt[idx]}")
-
-# # plot the relation between counts and per token attention
-# plt.figure(figsize=(8, 6))
-# plt.scatter(cnt, per_token_attention.cpu().numpy(), alpha=0.6)
-# plt.xscale("log")
-# plt.yscale("log")
-# plt.xlabel("Support Vector Counts ")
-# plt.ylabel("Per Token Attention")
-# plt.title("Support Vector Counts vs Per Token Attention")
-# plt.grid()
-# plt.savefig(f"../img/v_analysis/support_vector_counts_vs_attention_{model}_{dataset_name}_st{start}.png")
-
-
-"""
-finding the optimal alpha star for a given token
-"""
-def solve_alpha_star_logits(Z_logit: torch.Tensor, y_id: int, steps=500, lr=0.05):
+    
+def optimize_alpha_star(head_idx, pos_list ,training_steps=100, lr=0.5, device="cuda"):
     """
-    Z_logit: (n, V) float32
-    y_id: int
-    returns alpha_star (n,)
+    head: int, the head to optimize
+    pos_list: list of int, the positions to optimize
     """
-    device = Z_logit.device
-    n, V = Z_logit.shape
-    w = torch.zeros(n, device=device, requires_grad=True)
-    opt = torch.optim.Adam([w], lr=lr)
-
-    for _ in range(steps):
-        alpha = F.softmax(w, dim=0)              # (n,)
-        s = alpha @ Z_logit                      # (V,)
-        loss = -s[y_id] + torch.logsumexp(s, dim=0)
-
+    # a[n_pos,seq]
+    n_pos = len(pos_list)
+    # a_param = torch.zeros(n_pos, 4096, device=device, requires_grad=True)
+    a_param = torch.randn(n_pos, 4096, device=device, requires_grad=True)
+    
+    mask = torch.zeros(n_pos, 4096, device=device)
+    for i, pos in enumerate(pos_list):
+        mask[i, pos+1:] = float("-inf")
+    
+    gt_y = gt_label[0, pos_list].to(device)
+    
+    opt = torch.optim.Adam([a_param], lr=lr)
+    
+    # compute the constant part
+    residual_attn_in = last_layer_input['hidden_states'][0,pos_list].to(device) # [n_pos, hidden_size]
+    original = attn['output'][0,pos_list].permute(1,0,2).to(device) # [nh, n_pos, hd]
+    V_head = rope_qkv[L-1]['v'].to(device)[0][head_idx]  # [B, nh, seq, hd]
+    Wo = last_layer_param['self_attn.o_proj.weight'].to(device)
+    Wlm = kv["Wlm"].to(device)
+    
+    # def head_ablate_loss(head):
+    #     output = original.clone()
+    #     output[head].zero_()   # 或者 output[head] = 0
+    #     hidden = output.permute(1,0,2).reshape(n_pos, -1)
+    #     hidden = hidden @ Wo.T
+    #     hidden = hidden + residual_attn_in
+    #     residual = hidden
+    #     hidden = layer.post_attention_layernorm(hidden)
+    #     hidden = layer.mlp(hidden) + residual
+    #     logits = modelNorm(hidden) @ Wlm.T
+    #     return F.cross_entropy(logits.float(), gt_y).item()
+    # return head_ablate_loss(head)
+    
+    for step in range(training_steps):
+        alpha = F.softmax(a_param + mask, dim=-1)    
+        
+        logits = mlp_forward(alpha, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm)
+        loss = F.cross_entropy(logits.float(), gt_y, reduction='mean')
+        
+        if step % 10 == 0:
+            print("step", step, "loss:", loss.item())
         opt.zero_grad()
         loss.backward()
         opt.step()
+    return F.softmax(a_param + mask, dim=-1).detach().cpu()
 
-    return F.softmax(w, dim=0).detach()
+head_idx = 25
+pos_list = list([4091])
+a_star = optimize_alpha_star(head_idx=head_idx, pos_list=pos_list, training_steps=200, lr=0.5, device=device)
+a_star_2 = optimize_alpha_star(head_idx=head_idx, pos_list=pos_list, training_steps=200, lr=0.5, device=device)
 
+# sparisity and entrophy
+a_star = a_star.cpu()
+entrophy = -(a_star * a_star.clamp_min(1e-8).log()).sum(dim=-1)
+print("entrophy", entrophy.mean().item())
+
+topk = 3
+topk_mass = a_star.topk(topk, dim=-1).values.sum(dim=-1)
+print("top{}_mass".format(topk), topk_mass.mean().item())
+
+# KL divergence with original alpha
+vanilla_alpha = attn['weights'][0][25, pos_list].cpu().float()
+def KL_divergence(p, q):
+    eps = 1e-12
+    p = p.clamp_min(eps)
+    q = q.clamp_min(eps)
+    kl_pq = (p * (p.log() - q.log())).sum(dim=-1)
+    kl_qp = (q * (q.log() - p.log())).sum(dim=-1)
+    return kl_pq, kl_qp
+kl_pq, kl_qp = KL_divergence(a_star, vanilla_alpha)
+print("KL(a_star || vanilla_alpha)", kl_pq.mean().item())
+print("KL(vanilla_alpha || a_star)", kl_qp.mean().item())
+
+kl_pq, kl_qp = KL_divergence(a_star, a_star_2)
+print("KL(a_star || a_star_2)", kl_pq.mean().item())
+print("KL(a_star_2 || a_star)", kl_qp.mean().item())
+
+
+# avg topk overlap
+
+def topk_overlap(p, q, topk=10):
+    p_topk_indices = torch.topk(p, k=topk, dim=-1).indices  # [n_pos, topk]
+    q_topk_indices = torch.topk(q, k=topk, dim=-1).indices  # [n_pos, topk]
+
+    overlap_counts = []
+
+    for i in range(p_topk_indices.shape[0]):
+        overlap = set(p_topk_indices[i].tolist()) & set(q_topk_indices[i].tolist())
+        overlap_counts.append(len(overlap))
+    # print("overlap_counts", overlap_counts)
+    return sum(overlap_counts)/len(overlap_counts)/topk
+
+topk=3
+print("Average top-{} overlap: {}".format(topk, topk_overlap(a_star, vanilla_alpha, topk=topk)))
+print("Average top-{} overlap: {}".format(topk, topk_overlap(a_star, a_star_2, topk=topk)))
+
+
+
+# cosine in V space
+head = head_idx
+V = rope_qkv[L-1]['v'].float()  # [B, nh, seq, hd]
+V_head = V[0][head]
+V_1 = a_star @ V_head
+V_2 = a_star_2 @ V_head
+V_3 = vanilla_alpha @ V_head
+cos = F.cosine_similarity(V_1, V_2, dim=-1)          # [n_pos]
+rel = (V_1 - V_2).norm(dim=-1) / (V_1.norm(dim=-1) + 1e-12)
+print("mix cosine mean/med:", cos.mean().item(), cos.median().item())
+print("mix relerr mean/med:", rel.mean().item(), rel.median().item())
+cos_vanilla = F.cosine_similarity(V_1, V_3, dim=-1)
+rel_vanilla = (V_1 - V_3).norm(dim=-1) / (V_1.norm(dim=-1) + 1e-12)
+print("vanilla cosine mean/med:", cos_vanilla.mean().item(), cos_vanilla.median().item())
+print("vanilla relerr mean/med:", rel_vanilla.mean().item(), rel_vanilla.median().item())
+
+
+# logits
+vanilla = outputs["logits"]
+vanilla_logits = vanilla[0][pos_list]
+loss_baseline = F.cross_entropy(vanilla_logits.float(), gt_label[0, pos_list].to(vanilla_logits.device), reduction='none')
+print("baseline loss", loss_baseline.mean().item())
+
+device='cuda'
+a_star = a_star.to(device)
+residual_attn_in = last_layer_input['hidden_states'][0,pos_list].to(device) # [n_pos, hidden_size]
+original = attn['output'][0,pos_list].permute(1,0,2).to(device) # [nh, n_pos, hd]
+V_head = rope_qkv[L-1]['v'].to(device)[0][head_idx]  # [B, nh, seq, hd]
+Wo = last_layer_param['self_attn.o_proj.weight'].to(device)
+Wlm = kv["Wlm"].to(device)
+
+logits = mlp_forward(a_star, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm)
+loss_mix = F.cross_entropy(logits.float(), gt_label[0, pos_list].to(logits.device), reduction='none')
+print("mix loss", loss_mix)
+
+logits_2 = mlp_forward(a_star_2.to(device), head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm)
+loss_mix_2 = F.cross_entropy(logits_2.float(), gt_label[0, pos_list].to(logits_2.device), reduction='none')
+print("mix_2 loss", loss_mix_2)
+
+print("delta",(loss_mix_2 - loss_mix).abs())

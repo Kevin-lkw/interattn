@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers.models.llama import modeling_llama
+from transformers.models.llama import modeling_llama, LlamaForCausalLM
 from datasets import load_dataset
 
 # load dataset
@@ -29,20 +29,22 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     attn_implementation="eager",
 )
-# model is LlamaForCausalLM
+model:LlamaForCausalLM
 
 model.eval()
 
 # tokenize input
 prompt = texts
-inputs = tokenizer(
+inputs_origin = tokenizer(
     prompt,
-    max_length = start_index + 4096,
+    max_length = start_index + 8192,
     truncation=True,
     return_tensors="pt"
 ).to(model.device)
+context_len = 4096
+inputs = {k: v[:, start_index:start_index+context_len] for k, v in inputs_origin.items()}
+gt_label = inputs_origin["input_ids"][:, start_index+1:start_index+context_len+1]
 
-inputs = {k: v[:, start_index:start_index+4096] for k, v in inputs.items()}
 kv_info = {}
 
 def get_kv_hook(name):
@@ -55,8 +57,19 @@ for name, module in model.named_modules():
     if "k_proj" in name or "v_proj" in name:
         module.register_forward_hook(get_kv_hook(name))
 
-rope_qkv = {}
+# hook input for each layer
+layer_input = {}
+def layer_input_hook(layer_idx):
+    def hook(module, inp, out):
+        layer_input[layer_idx] = inp[0].detach().cpu()
+    return hook
 
+# h = model.model.layers[-1].register_forward_hook(last_layer_input_hook)
+for i, layer in enumerate(model.model.layers):
+    layer.register_forward_hook(layer_input_hook(i))
+
+rope_qkv = {}
+attn = {}
 _orig_eager = modeling_llama.eager_attention_forward
 
 def eager_wrapper(
@@ -75,7 +88,7 @@ def eager_wrapper(
         "k": key.detach().cpu(),
         "v": value.detach().cpu(),
     }
-    return _orig_eager(
+    attn_output, attn_weights =  _orig_eager(
         module,
         query,
         key,
@@ -85,24 +98,36 @@ def eager_wrapper(
         dropout=dropout,
         **kwargs,
     )
+    attn[layer] = {
+        "weights": attn_weights.detach().cpu(),
+        "output": attn_output.detach().cpu(),
+    }
+    return attn_output, attn_weights
 
 modeling_llama.eager_attention_forward = eager_wrapper
 
 
 # 重新运行推理
 with torch.no_grad():
-    outputs = model(**inputs, use_cache=True)
-Wo = model.model.layers[-1].self_attn.o_proj.weight.detach().cpu()
+    outputs = model(**inputs,labels = inputs['input_ids'], use_cache=True)
+    # import ipdb; ipdb.set_trace()
+Wnorm = model.model.norm.weight.detach().cpu()
 Wlm = model.lm_head.weight.detach().cpu()
-    
+last_layer = model.model.layers[-1]
+
 save = {
     "model_dir": llama_model, 
     "model_config": model.config,
     "input": inputs,
+    "output": outputs,
     "before_rope": kv_info,
     "after_rope": rope_qkv,
-    "Wo": Wo,
+    "last_layer_attention": attn[model.config.num_hidden_layers - 1],
+    "last_layer": {k: v.detach().cpu() for k, v in last_layer.named_parameters()},
+    "layer_input": layer_input,
+    "Wnorm": Wnorm,
     "Wlm": Wlm,
+    "gt_label": gt_label,
 }
 torch.save(save, f"../{model_name}_{dataset_name}_st{start_index}.pt")
-print(f"Saved kv and rope info to ../{model_name}_{dataset_name}_st{start_index}.pt")
+print(f"Saved to ../{model_name}_{dataset_name}_st{start_index}.pt")

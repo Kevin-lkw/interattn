@@ -9,10 +9,12 @@ from sklearn.preprocessing import normalize
 
 from matplotlib import pyplot as plt
 import os
-model = "llama-7b-hf"
+llama_model = "meta-llama/Llama-2-7b-hf"
+model = "llama-2-7b-hf"
+
 dataset_name="wikitext"
 start = 0
-kv = torch.load(f"{model}_{dataset_name}_st{start}.pt", weights_only=False)
+kv = torch.load(f"../{model}_{dataset_name}_st{start}.pt", weights_only=False)
 
 model_config = kv["model_config"]
 kv_info = kv["before_rope"]
@@ -77,11 +79,13 @@ def _cluster_attention_concentration(Q_np, K_np, labels, query_idx, topm_list=(1
     intra_ent = []  
     topm_mass = {m: [] for m in topm_list}
     intra_topk_mass = {m: [] for m in topm_list}
-    for t in query_idx:
+    count2 = 0
+    for index,t in enumerate(query_idx):
         # logits over all keys: [seq]
-        logits = K_np @ Q_np[t]  # dot product
+        logits = Q_np[t] @ K_np.T / np.sqrt(Q_np.shape[-1])  # [seq]
+        logits[t+1:] = -1e9  
+        # import ipdb; ipdb.set_trace()
         a = _softmax_np(logits[None, :], axis=1).reshape(-1)
-
         # aggregate to clusters
         ac = np.zeros(C, dtype=np.float64)
         for c in range(C):
@@ -92,7 +96,8 @@ def _cluster_attention_concentration(Q_np, K_np, labels, query_idx, topm_list=(1
         # entropy
         p = ac / (np.sum(ac) + 1e-12)
         ent.append(float(-np.sum(p * np.log(p + 1e-12))))
-        # import ipdb; ipdb.set_trace()
+        if index < 3:
+            print(f"Query {t}: cluster distribution {p}, entropy={ent[-1]:.4f}")
         # top-m mass
         srt = np.sort(ac)[::-1]
         for m in topm_list:
@@ -102,6 +107,10 @@ def _cluster_attention_concentration(Q_np, K_np, labels, query_idx, topm_list=(1
         c_star = int(np.argmax(ac))
         idx = members[c_star]
         mass = float(ac[c_star]) + 1e-12
+        if c_star == 2 :
+            count2 += 1
+        else:
+            print(f"Query {t}: cluster {c_star} mass={mass:.4f}, size={len(idx)}")
 
         # conditional within cluster
         within = a[idx] / mass  # sums to 1 over idx
@@ -109,8 +118,7 @@ def _cluster_attention_concentration(Q_np, K_np, labels, query_idx, topm_list=(1
         srt = np.sort(within)[::-1]
         for m in topm_list:
             intra_topk_mass[m].append(float(np.sum(srt[:m])))
-
-
+    print("count2:", count2)
     return {
         "entropy": np.array(ent, dtype=np.float64),
         "topm_mass": {m: np.array(v, dtype=np.float64) for m, v in topm_mass.items()},
@@ -137,76 +145,83 @@ def clustering(layer_idx, head_idx=0, after_rope=True, key_type='k', n_clusters=
         key = F.normalize(specific_head_key.float(), dim=-1).cpu().numpy()
     else:
         key = specific_head_key.float().cpu().numpy()
+    print("key shape", key.shape)
     labels = KMeans(n_clusters=n_clusters, random_state=0).fit_predict(key)
     print("Cluster sizes:")
     print(np.bincount(labels))
-
-    # ===== Dim reduction for visualization =====
-    if use_tsne:
-        emb = TSNE(
-            n_components=2,
-            perplexity=30,
-            init="pca",
-            learning_rate="auto"
-        ).fit_transform(key)
-    else:
-        emb = PCA(n_components=2).fit_transform(key)
-    out_dir=f"img/layer{layer_idx}/head{head_idx}/clusters{n_clusters}/"
+    out_dir=f"../img/layer{layer_idx}/head{head_idx}/clusters{n_clusters}/"
     os.makedirs(out_dir, exist_ok=True)
-    # ===== Plot 1: embedding colored by cluster =====
-    plt.figure(figsize=(6,5))
-    plt.scatter(emb[:,0], emb[:,1], c=labels, s=5, cmap="tab20")
-    plt.title("Cluster embedding")
-    plt.colorbar()
-   
-    plt.savefig(f"{out_dir}embedding.png")
+    # # ===== Dim reduction for visualization =====
+    # if use_tsne:
+    #     emb = TSNE(
+    #         n_components=2,
+    #         perplexity=30,
+    #         init="pca",
+    #         learning_rate="auto"
+    #     ).fit_transform(key)
+    # else:
+    #     emb = PCA(n_components=2).fit_transform(key)
 
-    # ===== Plot 2: cluster vs token position =====
-    plt.figure(figsize=(10,3))
-    plt.scatter(np.arange(len(labels)), labels, s=3)
-    plt.title("Cluster ID vs Token Position")
-    plt.xlabel("Token index")
-    plt.ylabel("Cluster")
-    plt.savefig(f"{out_dir}cluster_vs_tokenpos.png")
+    # # ===== Plot 1: embedding colored by cluster =====
+    # plt.figure(figsize=(6,5))
+    # plt.scatter(emb[:,0], emb[:,1], c=labels, s=5, cmap="tab20")
+    # plt.title("Cluster embedding")
+    # plt.colorbar()
+    # for c in range(n_clusters):
+    #     idx = np.where(labels == c)[0]
+    #     if len(idx) > 0:
+    #         plt.text(emb[idx,0].mean(), emb[idx,1].mean(), str(c), fontsize=12, weight='bold')
+    # plt.savefig(f"{out_dir}embedding.png")
+    # # ===== Plot 2: cluster vs token position =====
+    # plt.figure(figsize=(10,3))
+    # plt.scatter(np.arange(len(labels)), labels, s=3)
+    # plt.title("Cluster ID vs Token Position")
+    # plt.xlabel("Token index")
+    # plt.ylabel("Cluster")
+    # for c in range(n_clusters):
+    #     idx = np.where(labels == c)[0]
+    #     if len(idx) > 0:
+    #         plt.text(idx.mean(), c, str(c), fontsize=12, weight='bold')
+    # plt.savefig(f"{out_dir}cluster_vs_tokenpos.png")
     
-    # ===== Low-rank stats per cluster =====
-    sizes, erank, r90 = _cluster_low_rank_stats(key_np, labels, energy_thr=0.90)
+    # # ===== Low-rank stats per cluster =====
+    # sizes, erank, r90 = _cluster_low_rank_stats(key_np, labels, energy_thr=0.90)
 
-    # scatter: size vs effective rank
-    plt.figure(figsize=(6, 4))
-    plt.scatter(sizes, erank, s=20)
-    plt.xlabel("Cluster size")
-    plt.ylabel("Effective rank")
-    plt.title(f"Effective rank vs size (L{layer_idx} H{head_idx})")
-    plt.tight_layout()
-    plt.savefig(f"{out_dir}lowrank_effective_rank_vs_size.png", dpi=200)
+    # # scatter: size vs effective rank
+    # plt.figure(figsize=(6, 4))
+    # plt.scatter(sizes, erank, s=20)
+    # plt.xlabel("Cluster size")
+    # plt.ylabel("Effective rank")
+    # plt.title(f"Effective rank vs size (L{layer_idx} H{head_idx})")
+    # plt.tight_layout()
+    # plt.savefig(f"{out_dir}lowrank_effective_rank_vs_size.png", dpi=200)
 
-    # scatter: size vs r@90
-    plt.figure(figsize=(6, 4))
-    plt.scatter(sizes, r90, s=20)
-    plt.xlabel("Cluster size")
-    plt.ylabel("r @ 90% energy")
-    plt.title(f"r@90% energy vs size (L{layer_idx} H{head_idx})")
-    plt.tight_layout()
-    plt.savefig(f"{out_dir}lowrank_r90_vs_size.png", dpi=200)
+    # # scatter: size vs r@90
+    # plt.figure(figsize=(6, 4))
+    # plt.scatter(sizes, r90, s=20)
+    # plt.xlabel("Cluster size")
+    # plt.ylabel("r @ 90% energy")
+    # plt.title(f"r@90% energy vs size (L{layer_idx} H{head_idx})")
+    # plt.tight_layout()
+    # plt.savefig(f"{out_dir}lowrank_r90_vs_size.png", dpi=200)
 
     if not after_rope:
         raise ValueError("cluster-attention concentration expects after_rope=True (needs real Q,K after RoPE).")
-
+    print("layer_idx", layer_idx, "head_idx", head_idx)
     # get real Q and K (after_rope) for attention computation
     Q = rope_qkv[layer_idx]["q"][0, head_idx].float().cpu().numpy()  # [seq, d]
     # Q_dummy = np.random.randn(*Q.shape).astype(np.float32)
     K = rope_qkv[layer_idx]["k"][0, head_idx].float().cpu().numpy()  # [seq, d]
-
+    
     seq = K.shape[0]
-    q_subsample = 1024
+    q_subsample = 128
     if q_subsample is None or q_subsample >= seq:
         query_idx = np.arange(seq)
         
     else:
         rng = np.random.default_rng(0)
         # query_idx = np.sort(rng.choice(seq, size=q_subsample, replace=False))
-        # use last 256 tokens as queries for reproducibility
+        # use last tokens as queries for reproducibility
         query_idx = np.arange(seq - q_subsample, seq)
 
     stats = _cluster_attention_concentration(
@@ -216,15 +231,15 @@ def clustering(layer_idx, head_idx=0, after_rope=True, key_type='k', n_clusters=
         query_idx=query_idx,
         topm_list=[1,2,4,8],
     )
-
+    # import ipdb; ipdb.set_trace()
     # entropy hist
     plt.figure(figsize=(6, 4))
-    plt.hist(stats["entropy"], bins=50)
+    plt.plot(np.arange(len(stats["entropy"])), stats["entropy"])
     plt.title(f"q-attn entropy (L{layer_idx} H{head_idx}, k={n_clusters})")
-    plt.xlabel("Entropy")
-    plt.ylabel("Count")
+    plt.xlabel("position")
+    plt.ylabel("entropy")
     plt.tight_layout()
-    plt.savefig(f"{out_dir}q_attn_entropy_hist.png", dpi=200)
+    plt.savefig(f"{out_dir}q_attn_inter_entropy_hist.png", dpi=200)
     # intra-cluster entropy hist
     plt.figure(figsize=(6, 4))
     plt.hist(stats["intra_entropy"], bins=50)
@@ -237,12 +252,12 @@ def clustering(layer_idx, head_idx=0, after_rope=True, key_type='k', n_clusters=
     # top-m mass hists
     for m, arr in stats["topm_mass"].items():
         plt.figure(figsize=(6, 4))
-        plt.hist(arr, bins=50)
         plt.title(f"Top-{m} cluster mass (L{layer_idx} H{head_idx}, k={n_clusters})")
-        plt.xlabel("Mass")
-        plt.ylabel("Count")
+        plt.xlabel("Position")
+        plt.ylabel("Mass")
+        plt.plot(arr)
         plt.tight_layout()
-        plt.savefig(f"{out_dir}q_attn_top{m}_mass_hist.png", dpi=200)
+        plt.savefig(f"{out_dir}q_attn_inter_top{m}_mass_hist.png", dpi=200)
     # intra cluster top-k mass hists
     for m, arr in stats["intra_topk_mass"].items():
         plt.figure(figsize=(6, 4))
@@ -276,10 +291,10 @@ def clustering(layer_idx, head_idx=0, after_rope=True, key_type='k', n_clusters=
 #         print(f"Clustering with {num_clusters} clusters: \n \
             # Highest entropy observed: {highest_ent} (Layer {layer_idx}, Head {highest_ent_head})")
 
-num_clusters = 64
+num_clusters = 32
 stats = clustering(
-                layer_idx=8, 
-                head_idx=20, 
+                layer_idx=31, 
+                head_idx=25, 
                 after_rope=True, 
                 key_type='k', 
                 n_clusters=num_clusters, 

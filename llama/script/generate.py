@@ -4,7 +4,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.models.llama import modeling_llama, LlamaForCausalLM
 from datasets import load_dataset
 
-# load dataset
+## load dataset
 dataset_name="wikitext"
 start_index= 0
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
@@ -15,17 +15,33 @@ texts = '\n'.join([t for t in dataset['text'] if t.strip()])
 # dataset = load_dataset("emozilla/pg19-test", split="test")
 # texts = '\n'.join([t for t in dataset['text'] if t.strip()])
 
-# import ipdb; ipdb.set_trace()
+# dataset_name="gsm8k"
+# start_index= 0
+# dataset = load_dataset("openai/gsm8k", "main", split="test")
+# sample = dataset[0]
+# q = sample['question']
+# a = sample['answer']
+# full_text = f"Question: {q}\nAnswer: {a}"
+
+# # 1. 先 tokenize 只有问题的部分，用来确定长度
+# question_part = f"Question: {q}\nAnswer: "
+# question_encoding = tokenizer(question_part, return_tensors="pt", add_special_tokens=True)
+# answer_start_index = question_encoding["input_ids"].shape[1] # 这里的 index 就是 Answer 开始的位置
+
+# # 2. tokenize 整个序列用于 Forward
+# inputs_all = tokenizer(full_text, return_tensors="pt", add_special_tokens=True).to(model.device)
+
+
 llama_model = "meta-llama/Llama-2-7b-hf"
 model_name = "llama-2-7b-hf"
 tokenizer = AutoTokenizer.from_pretrained(
     llama_model,
     use_fast=False,        
 )
-
+dtype = torch.float32
 model = AutoModelForCausalLM.from_pretrained(
     llama_model,
-    torch_dtype="auto",  
+    dtype=dtype,  
     device_map="auto",
     attn_implementation="eager",
 )
@@ -99,7 +115,6 @@ def eager_wrapper(
         **kwargs,
     )
     attn[layer] = {
-        "weights": attn_weights.detach().cpu(),
         "output": attn_output.detach().cpu(),
     }
     return attn_output, attn_weights
@@ -120,13 +135,9 @@ save = {
     "model_config": model.config,
     "input": inputs,
     "output": outputs,
-    "before_rope": kv_info,
     "after_rope": rope_qkv,
-    "last_layer_attention": attn[model.config.num_hidden_layers - 1],
-    "last_layer": {k: v.detach().cpu() for k, v in last_layer.named_parameters()},
+    "attention_output": attn,
     "layer_input": layer_input,
-    "Wnorm": Wnorm,
-    "Wlm": Wlm,
     "gt_label": gt_label,
 }
 torch.save(save, f"../{model_name}_{dataset_name}_st{start_index}.pt")

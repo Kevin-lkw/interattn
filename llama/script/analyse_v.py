@@ -1,220 +1,269 @@
+
+from transformers import AutoModelForCausalLM
 import torch
-from matplotlib import pyplot as plt
 from torch.nn import functional as F
 import os
 from transformers import AutoTokenizer
 import math
+import numpy as np
+
+def set_seed(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
 
 llama_model = "meta-llama/Llama-2-7b-hf"
-model = "llama-2-7b-hf"
-
+model_name = "llama-2-7b-hf"
+dtype = torch.float32
+device = "cuda:0"
+# construct the last layer of llama
+model = AutoModelForCausalLM.from_pretrained(
+    llama_model,
+    dtype=dtype,  
+    device_map=device,
+    attn_implementation="eager",
+)
 tokenizer = AutoTokenizer.from_pretrained(
     llama_model,
     use_fast=False,        
 )
-dataset_name="wikitext"
+dataset_name = "wikitext"
 start = 0
-kv = torch.load(f"../{model}_{dataset_name}_st{start}.pt", weights_only=False)
+kv = torch.load(f"../{model_name}_{dataset_name}_st{start}.pt", weights_only=False)
 model_config = kv["model_config"]
-kv_info = kv["before_rope"]
 rope_qkv = kv["after_rope"]
-Wnorm = kv["Wnorm"] # Shape (hidden_size,)
-Wlm = kv["Wlm"] # Shape (vocab_size, hidden_size)
 inputs = kv["input"]
 outputs = kv["output"]
-attn = kv["last_layer_attention"]
-last_layer_param  = kv["last_layer"]
-last_layer_input = kv["last_layer_input"]
+attn_output = kv["attention_output"]
+layer_input = kv["layer_input"]
 gt_label = kv["gt_label"]
 # print("model_config", model_config)
 L = model_config.num_hidden_layers
+print(model)
 
 
-
-from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaDecoderLayer
-
-device = "cuda"
-# constant part
-modelNorm = LlamaRMSNorm(model_config.hidden_size, eps=model_config.rms_norm_eps).half().to(device)
-modelNorm.load_state_dict({"weight": Wnorm.to(device)}, strict=True)
-modelNorm.requires_grad_(False)
-modelNorm.eval()
-
-layer = LlamaDecoderLayer(model_config, layer_idx=L-1).half().to(device)
-layer.load_state_dict(last_layer_param, strict=True)
-layer.eval()
-def plain_forward(alpha, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm):
-        V_new = alpha.to(V_head.dtype) @ V_head # [n_pos, hd]
-        output = original.clone()
-        output[head_idx] = V_new
-        hidden = output.permute(1,0,2).reshape(len(pos_list), -1) # [n_pos, hidden_size]
-        hidden = hidden @ Wo.T # [n_pos, hidden_size]
-        hidden = hidden + residual_attn_in # add residual
-        
-        hidden = modelNorm(hidden)
-        hidden = hidden @ Wlm.T # [n_pos, vocab_size]
-        return hidden 
-
-def mlp_forward(alpha, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm):
-    V_new = alpha.to(V_head.dtype) @ V_head # [n_pos, hd]
-    output = original.clone()
-    output[head_idx] = V_new
-    hidden = output.permute(1,0,2).reshape(len(pos_list), -1) # [n_pos, hidden_size]
-    hidden = hidden @ Wo.T # [n_pos, hidden_size]
-    hidden = hidden + residual_attn_in # add residual
-    residual = hidden
-    hidden = layer.post_attention_layernorm(hidden)
-    
-    # MLP
-    hidden = layer.mlp(hidden)
-    hidden = hidden + residual
-    
-    
-    hidden_states_normed = modelNorm(hidden)
-    logits = hidden_states_normed @ Wlm.T
-    return logits
-
-    
-def optimize_alpha_star(head_idx, pos_list ,training_steps=100, lr=0.5, device="cuda"):
+def get_attention_map_after_rope(layer_idx, causal=True, dtype=torch.bfloat16, device="cuda"):
     """
-    head: int, the head to optimize
+    返回: attn [seq_len, seq_len] (softmax 后)
+    """
+    Q = rope_qkv[layer_idx]['q']  # [B, nh, seq, hd]
+    K = rope_qkv[layer_idx]['k']  # [B, nh, seq, hd]
+
+    q = Q[0].to(dtype).to(device)  # [nh, seq, hd]
+    k = K[0].to(dtype).to(device)  # [nh, seq, hd]
+    
+    hd = q.shape[-1]
+    scores = (q @ k.transpose(-1, -2)) / math.sqrt(hd)  # [nh, seq, seq]
+
+    if causal:
+        seq = scores.shape[1]
+        mask = torch.triu(torch.ones(seq, seq, device=scores.device, dtype=torch.bool), diagonal=1).unsqueeze(0)  # [1, seq, seq]
+        scores = scores.masked_fill(mask, float("-inf"))
+    attn = torch.softmax(scores, dim=-1)
+    return scores, attn
+
+def optimize_alpha_star(layer_idx, head_idx, pos_list ,training_steps, lr, mask, device="cuda"):
+    """
+    head: int, the head to optimize, int or list of int
     pos_list: list of int, the positions to optimize
     """
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+        
     # a[n_pos,seq]
     n_pos = len(pos_list)
-    # a_param = torch.zeros(n_pos, 4096, device=device, requires_grad=True)
-    a_param = torch.randn(n_pos, 4096, device=device, requires_grad=True)
-    
-    mask = torch.zeros(n_pos, 4096, device=device)
-    for i, pos in enumerate(pos_list):
-        mask[i, pos+1:] = float("-inf")
-    
-    gt_y = gt_label[0, pos_list].to(device)
+    # a_param = torch.zeros(len(head_idx), n_pos, 4096, device=device, requires_grad=True)
+    a_param = torch.nn.Parameter(torch.randn(len(head_idx), n_pos, 4096, device=device) * 0.1)
+    # attention_score = get_attention_map_after_rope(layer_idx, causal=True, dtype=dtype, device=device)
+    # a_param = attention_score[head_idx].to(device)[:, pos_list, :].clone().detach().requires_grad_(True)
+    a_param.retain_grad()
     
     opt = torch.optim.Adam([a_param], lr=lr)
     
     # compute the constant part
-    residual_attn_in = last_layer_input['hidden_states'][0,pos_list].to(device) # [n_pos, hidden_size]
-    original = attn['output'][0,pos_list].permute(1,0,2).to(device) # [nh, n_pos, hd]
-    V_head = rope_qkv[L-1]['v'].to(device)[0][head_idx]  # [B, nh, seq, hd]
-    Wo = last_layer_param['self_attn.o_proj.weight'].to(device)
-    Wlm = kv["Wlm"].to(device)
+    residual_attn_in = layer_input[layer_idx][0,pos_list].to(device) # [n_pos, hidden_size]
+    original = attn_output[layer_idx]['output'][0,pos_list].permute(1,0,2).to(device) # [nh, n_pos, hd]
+    V_head = rope_qkv[layer_idx]['v'].to(device)[0][head_idx]  # [nh, seq, hd]
+    layer = model.model.layers[layer_idx]
     
-    # def head_ablate_loss(head):
-    #     output = original.clone()
-    #     output[head].zero_()   # 或者 output[head] = 0
-    #     hidden = output.permute(1,0,2).reshape(n_pos, -1)
-    #     hidden = hidden @ Wo.T
-    #     hidden = hidden + residual_attn_in
-    #     residual = hidden
-    #     hidden = layer.post_attention_layernorm(hidden)
-    #     hidden = layer.mlp(hidden) + residual
-    #     logits = modelNorm(hidden) @ Wlm.T
-    #     return F.cross_entropy(logits.float(), gt_y).item()
-    # return head_ablate_loss(head)
-    
+    with torch.no_grad():
+        # calculate gt distribution p*
+        output = original.clone() # [nh, n_pos, hd]
+        hidden = layer.self_attn.o_proj(output.permute(1,0,2).reshape(len(pos_list), -1)) # [n_pos, hidden_size]
+        hidden = hidden + residual_attn_in # add residual
+        # hidden = modelNorm(hidden)
+        gt_logits = model.lm_head(hidden) # [n_pos, vocab_size]
+        p_teacher = F.softmax(gt_logits.float(), dim=-1).detach()  # [n_pos, vocab_size]
+        logp_teacher = F.log_softmax(gt_logits.float(), dim=-1).detach()  # [n_pos, vocab_size]
+    losses = []
+    p_alpha = 0
     for step in range(training_steps):
-        alpha = F.softmax(a_param + mask, dim=-1)    
+        alpha = F.softmax(a_param + mask, dim=-1)  
+        V_new = alpha @ V_head.float() # alpha [nh, n_pos, seq] @ V_head [nh, seq, hd] -> [nh, n_pos, hd]
+        V_new = V_new.to(original.dtype)
+        output = original.clone()
+        output[head_idx] = V_new.to(V_head.dtype)
+        hidden = output.permute(1,0,2).reshape(len(pos_list), -1) # [n_pos, hidden_size]
+        hidden = layer.self_attn.o_proj(hidden) # [n_pos, hidden_size]
+        hidden = hidden + residual_attn_in # add residual
+        # hidden = modelNorm(hidden)
+        hidden = model.lm_head(hidden) # [n_pos, vocab_size]
+        logits = hidden
+        p_alpha = F.softmax(logits.float(), dim=-1) # [n_pos, vocab_size]
+        logp_student = F.log_softmax(logits.float(), dim=-1)
+        # KL-Divergence loss (CE loss)
+        loss = (p_teacher * (logp_teacher-logp_student)).sum(dim=-1).mean()
         
-        logits = mlp_forward(alpha, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm)
-        loss = F.cross_entropy(logits.float(), gt_y, reduction='mean')
-        
-        if step % 10 == 0:
+        losses.append(loss.item())
+        if step % 100 == 0:
             print("step", step, "loss:", loss.item())
         opt.zero_grad()
         loss.backward()
         opt.step()
-    return F.softmax(a_param + mask, dim=-1).detach().cpu()
-
-head_idx = 25
-pos_list = list([4091])
-a_star = optimize_alpha_star(head_idx=head_idx, pos_list=pos_list, training_steps=200, lr=0.5, device=device)
-a_star_2 = optimize_alpha_star(head_idx=head_idx, pos_list=pos_list, training_steps=200, lr=0.5, device=device)
-
-# sparisity and entrophy
-a_star = a_star.cpu()
-entrophy = -(a_star * a_star.clamp_min(1e-8).log()).sum(dim=-1)
-print("entrophy", entrophy.mean().item())
-
-topk = 3
-topk_mass = a_star.topk(topk, dim=-1).values.sum(dim=-1)
-print("top{}_mass".format(topk), topk_mass.mean().item())
-
-# KL divergence with original alpha
-vanilla_alpha = attn['weights'][0][25, pos_list].cpu().float()
-def KL_divergence(p, q):
-    eps = 1e-12
-    p = p.clamp_min(eps)
-    q = q.clamp_min(eps)
-    kl_pq = (p * (p.log() - q.log())).sum(dim=-1)
-    kl_qp = (q * (q.log() - p.log())).sum(dim=-1)
-    return kl_pq, kl_qp
-kl_pq, kl_qp = KL_divergence(a_star, vanilla_alpha)
-print("KL(a_star || vanilla_alpha)", kl_pq.mean().item())
-print("KL(vanilla_alpha || a_star)", kl_qp.mean().item())
-
-kl_pq, kl_qp = KL_divergence(a_star, a_star_2)
-print("KL(a_star || a_star_2)", kl_pq.mean().item())
-print("KL(a_star_2 || a_star)", kl_qp.mean().item())
+    # verify KKT conditions
+    alpha = F.softmax(a_param + mask, dim=-1)
+    
+    return alpha, p_alpha, p_teacher, losses
 
 
-# avg topk overlap
+def gen_mask(layer_idx, pos_list, head_idx, strategy, budget, prompt_len=4032, seq_len=4096):
+    """
+    Return mask for alpha_param, with shape [nh, n_pos, seq_len]
+    """
+    mask = torch.zeros(len(pos_list), seq_len, device=device)
 
-def topk_overlap(p, q, topk=10):
-    p_topk_indices = torch.topk(p, k=topk, dim=-1).indices  # [n_pos, topk]
-    q_topk_indices = torch.topk(q, k=topk, dim=-1).indices  # [n_pos, topk]
+    visible = int(seq_len*budget)
+    print(f"visible {visible} tokens for strategy {strategy} with budget {budget}")
+    if strategy == "recency":
+        for i, pos in enumerate(pos_list):
+            if pos > visible:
+                mask[i, :pos-visible] = float("-inf")
+        mask = mask.unsqueeze(0).expand(len(head_idx), -1, -1)  # [nh, n_pos, seq_len]
+    elif strategy == "random":
+        for i,pos in enumerate(pos_list):
+            if pos > visible:
+                idx = torch.randperm(pos+1)[:visible]
+                idx_list = idx.tolist()
+                mask_list = list(set(range(pos+1)) - set(idx_list))
+                mask[i, mask_list] = float("-inf")
+        mask = mask.unsqueeze(0).expand(len(head_idx), -1, -1)  # [nh, n_pos, seq_len]
+    elif strategy == "attention_topk":
+        attention_unnormalize, _ = get_attention_map_after_rope(layer_idx, causal=True, dtype=dtype, device=device)
+        # this is logits before softmax, but since we only care about topk, it's fine
+        mask = torch.zeros(len(head_idx), len(pos_list), seq_len, device=device)
+        for head in head_idx:
+            attention_score_head = attention_unnormalize[head]  # [seq, seq]
+            for i,pos in enumerate(pos_list):
+                if pos > visible:
+                    topk = torch.topk(attention_score_head[pos,:pos+1], k=visible, largest=True).indices
+                    idx_list = topk.tolist()
+                    mask_list = list(set(range(pos+1)) - set(idx_list))
+                    mask[head, i, mask_list] = float("-inf")
+                    
+    elif strategy == "h2o":
+        recent_budget = visible // 2
+        hh_budget = visible - recent_budget  # handle odd visible
 
-    overlap_counts = []
+        _, attention_score = get_attention_map_after_rope(layer_idx, causal=True, dtype=dtype, device=device)
+        
+        mask = torch.zeros(len(head_idx), len(pos_list), seq_len, device=device)
+        for out_h, head in enumerate(head_idx):
+            attention_score_head = attention_score[head]  # [seq_len, seq_len]
 
-    for i in range(p_topk_indices.shape[0]):
-        overlap = set(p_topk_indices[i].tolist()) & set(q_topk_indices[i].tolist())
-        overlap_counts.append(len(overlap))
-    # print("overlap_counts", overlap_counts)
-    return sum(overlap_counts)/len(overlap_counts)/topk
+            # accumulated_attention[j] = how much token j has been attended to so far
+            accumulated_attention = torch.zeros(seq_len, device=device)
 
-topk=3
-print("Average top-{} overlap: {}".format(topk, topk_overlap(a_star, vanilla_alpha, topk=topk)))
-print("Average top-{} overlap: {}".format(topk, topk_overlap(a_star, a_star_2, topk=topk)))
+            # ------------------------------------------------------------
+            # 1) PREFILL initialization:
+            #    accumulate attention received from prompt queries [0, prompt_len)
+            # ------------------------------------------------------------
+            # Query q attends to keys [0..q] under causal mask, so summing rows
+            # gives "received attention so far" for each key position.
+            if prompt_len > 0:
+                accumulated_attention += attention_score_head[:prompt_len, :].sum(dim=0)
 
+            # ------------------------------------------------------------
+            # 2) ONLINE decode:
+            #    for each decode position pos:
+            #      - select HH using accumulated score BEFORE current step
+            #      - keep recent window
+            #      - then update accumulated score with current query row
+            # ------------------------------------------------------------
+            for i, pos in enumerate(pos_list):
+                total_available = pos + 1  # keys in [0, pos]
 
+                # no need to evict if current context length <= visible
+                if total_available <= visible:
+                    # still update score for next step
+                    accumulated_attention += attention_score_head[pos]
+                    continue
 
-# cosine in V space
-head = head_idx
-V = rope_qkv[L-1]['v'].float()  # [B, nh, seq, hd]
-V_head = V[0][head]
-V_1 = a_star @ V_head
-V_2 = a_star_2 @ V_head
-V_3 = vanilla_alpha @ V_head
-cos = F.cosine_similarity(V_1, V_2, dim=-1)          # [n_pos]
-rel = (V_1 - V_2).norm(dim=-1) / (V_1.norm(dim=-1) + 1e-12)
-print("mix cosine mean/med:", cos.mean().item(), cos.median().item())
-print("mix relerr mean/med:", rel.mean().item(), rel.median().item())
-cos_vanilla = F.cosine_similarity(V_1, V_3, dim=-1)
-rel_vanilla = (V_1 - V_3).norm(dim=-1) / (V_1.norm(dim=-1) + 1e-12)
-print("vanilla cosine mean/med:", cos_vanilla.mean().item(), cos_vanilla.median().item())
-print("vanilla relerr mean/med:", rel_vanilla.mean().item(), rel_vanilla.median().item())
+                # recent window: last `recent_budget` positions in [0, pos]
+                cur_recent_budget = min(recent_budget, total_available)
+                recent_start = total_available - cur_recent_budget
+                recent_idx = torch.arange(recent_start, total_available, device=device)
 
+                # HH candidates exclude recent window to avoid overlap
+                hh_candidate_end = recent_start  # candidates are [0, recent_start)
+                cur_hh_budget = min(hh_budget, hh_candidate_end)
 
-# logits
-vanilla = outputs["logits"]
-vanilla_logits = vanilla[0][pos_list]
-loss_baseline = F.cross_entropy(vanilla_logits.float(), gt_label[0, pos_list].to(vanilla_logits.device), reduction='none')
-print("baseline loss", loss_baseline.mean().item())
+                keep = torch.zeros(total_available, dtype=torch.bool, device=device)
 
-device='cuda'
-a_star = a_star.to(device)
-residual_attn_in = last_layer_input['hidden_states'][0,pos_list].to(device) # [n_pos, hidden_size]
-original = attn['output'][0,pos_list].permute(1,0,2).to(device) # [nh, n_pos, hd]
-V_head = rope_qkv[L-1]['v'].to(device)[0][head_idx]  # [B, nh, seq, hd]
-Wo = last_layer_param['self_attn.o_proj.weight'].to(device)
-Wlm = kv["Wlm"].to(device)
+                # keep recent tokens
+                keep[recent_idx] = True
 
-logits = mlp_forward(a_star, head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm)
-loss_mix = F.cross_entropy(logits.float(), gt_label[0, pos_list].to(logits.device), reduction='none')
-print("mix loss", loss_mix)
+                # keep heavy hitters from older prefix
+                if cur_hh_budget > 0:
+                    hh_scores = accumulated_attention[:hh_candidate_end]
+                    topk_hh = torch.topk(hh_scores, k=cur_hh_budget, largest=True).indices
+                    keep[topk_hh] = True
 
-logits_2 = mlp_forward(a_star_2.to(device), head_idx, V_head, pos_list, original, residual_attn_in, Wo, Wlm)
-loss_mix_2 = F.cross_entropy(logits_2.float(), gt_label[0, pos_list].to(logits_2.device), reduction='none')
-print("mix_2 loss", loss_mix_2)
+                # mask out everything else in [0, pos]
+                mask[out_h, i, :total_available][~keep] = float("-inf")
 
-print("delta",(loss_mix_2 - loss_mix).abs())
+                # IMPORTANT:
+                # update AFTER building current-step mask,
+                # because H2O uses only preceding attention statistics
+                accumulated_attention += attention_score_head[pos]
+            
+                
+    elif strategy == "kvmerger":
+        ...
+    else :
+        raise ValueError(f"Unknown strategy {strategy}")            
+    # causal mask
+    for i, pos in enumerate(pos_list):
+        mask[:, i, pos+1:] = float("-inf")
+    return mask  # [n_heads, n_pos, 4096]
+
+head_idx = list(range(32)) # [0,...,31]
+pos_list = list(range(4096-64, 4096))
+result = {}
+strategy = "h2o"
+layer_idx_list = [31]
+for layer_idx in layer_idx_list:
+    save_path = f"../result/layer{layer_idx}/{dataset_name}/{strategy}/result.pt"
+    if os.path.exists(save_path):
+        result = torch.load(save_path)
+        print(f"Loaded existing results for layer {layer_idx}. Existing budgets: {list(result.keys())}")
+    else:
+        result = {}
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        print(f"No existing file found for layer {layer_idx}, starting a new one.")
+        
+    for budget in [0.0005]:
+        if budget in result:
+            print(f"Budget {budget} already exists in layer {layer_idx}, skipping.")
+            continue
+        mask = gen_mask(layer_idx, pos_list, head_idx=head_idx, strategy=strategy, budget=budget)
+        print(f"Optimizing alpha_star for layer {layer_idx}, budget {budget}")
+        alpha, p_alpha, p_teacher, loss = optimize_alpha_star(
+            layer_idx=layer_idx, head_idx=head_idx, pos_list=pos_list, training_steps=10000, lr=0.05, mask=mask, device=device)
+        print( f"final loss for layer {layer_idx} with budget {budget}: ", loss[-1])
+        result[budget] = (alpha, p_alpha, p_teacher, loss)
+
+    # save the result
+    torch.save(result, f"../result/layer{layer_idx}/{dataset_name}/{strategy}/result.pt")
+    print("Optimization completed and results saved.")

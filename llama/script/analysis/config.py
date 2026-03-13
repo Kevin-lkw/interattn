@@ -73,7 +73,7 @@ def parse_args():
         "--layers",
         type=int,
         nargs="+",
-        default=[20, 25, 30],
+        default=[5, 10, 15, 20, 25, 30],
         help="Layer indices to process",
     )
     parser.add_argument(

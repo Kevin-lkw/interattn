@@ -35,6 +35,15 @@ def build_modified_attn_hidden(ctx, layer_idx, head_idx, pos_list, alpha, device
     return attn_hidden
 
 
+def get_tail_labels(ctx, pos_list, device):
+    labels = ctx.gt_label
+    if not torch.is_tensor(labels):
+        raise TypeError(f"Unsupported gt_label type: {type(labels)}")
+    if labels.dim() == 1:
+        labels = labels.unsqueeze(0)
+    return labels[:, pos_list].to(device)
+
+
 def compute_final_kl_with_reinjected_alpha(ctx, layer_idx, pos_list, attn_hidden_patch, model_inputs, ref_tail_logits):
     layer = ctx.model.model.layers[layer_idx]
     pos_idx = torch.tensor(pos_list, device=attn_hidden_patch.device, dtype=torch.long)
@@ -60,7 +69,30 @@ def compute_final_kl_with_reinjected_alpha(ctx, layer_idx, pos_list, attn_hidden
     logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
     logp_student = F.log_softmax(logits, dim=-1)
     kl = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1).mean().item()
-    return kl
+
+    labels = get_tail_labels(ctx, pos_list, logits.device)
+    teacher_nll = F.cross_entropy(
+        ref_tail_logits.reshape(-1, ref_tail_logits.size(-1)),
+        labels.reshape(-1),
+        reduction="mean",
+    ).item()
+    student_nll = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+        reduction="mean",
+    ).item()
+
+    return {
+        "sanity_kl": kl,
+        "teacher_nll": teacher_nll,
+        "student_nll": student_nll,
+        "nll_gap": student_nll - teacher_nll,
+    }
+
+
+def has_full_sanity_metrics(entry):
+    required_keys = ["sanity_kl", "teacher_nll", "student_nll", "nll_gap"]
+    return all(key in entry for key in required_keys)
 
 
 def unpack_result_entry(entry):

@@ -9,6 +9,7 @@ from .context import RunContext
 from .sanity import (
     build_modified_attn_hidden,
     compute_final_kl_with_reinjected_alpha,
+    has_full_sanity_metrics,
     move_model_inputs_to_device,
     unpack_result_entry,
 )
@@ -17,7 +18,7 @@ from .sanity import (
 def load_context(args, dtype, device):
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map={"": device},
         attn_implementation="eager",
     )
@@ -71,7 +72,7 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
     for budget in args.budgets:
         if budget in result:
             alpha_exist, wrapped_exist = unpack_result_entry(result[budget])
-            if args.sanity_check and "sanity_kl" not in wrapped_exist:
+            if args.sanity_check and not has_full_sanity_metrics(wrapped_exist):
                 attn_hidden_patch = build_modified_attn_hidden(
                     ctx=ctx,
                     layer_idx=layer_idx,
@@ -80,7 +81,7 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
                     alpha=alpha_exist,
                     device=ctx.device,
                 )
-                sanity_kl = compute_final_kl_with_reinjected_alpha(
+                metrics = compute_final_kl_with_reinjected_alpha(
                     ctx=ctx,
                     layer_idx=layer_idx,
                     pos_list=pos_list,
@@ -88,10 +89,14 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
                     model_inputs=model_inputs,
                     ref_tail_logits=ref_tail_logits,
                 )
-                wrapped_exist["sanity_kl"] = sanity_kl
+                wrapped_exist.update(metrics)
                 result[budget] = wrapped_exist
                 print(
-                    f"Sanity check (existing) layer {layer_idx}, budget {budget}, final KL: {sanity_kl:.6f}"
+                    f"Sanity check (existing) layer {layer_idx}, budget {budget}, "
+                    f"KL: {metrics['sanity_kl']:.6f}, "
+                    f"teacher NLL: {metrics['teacher_nll']:.6f}, "
+                    f"student NLL: {metrics['student_nll']:.6f}, "
+                    f"NLL gap: {metrics['nll_gap']:.6f}"
                 )
             else:
                 print(f"Budget {budget} already exists in layer {layer_idx}, skipping.")
@@ -132,7 +137,7 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
                 alpha=alpha,
                 device=ctx.device,
             )
-            sanity_kl = compute_final_kl_with_reinjected_alpha(
+            metrics = compute_final_kl_with_reinjected_alpha(
                 ctx=ctx,
                 layer_idx=layer_idx,
                 pos_list=pos_list,
@@ -140,9 +145,13 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
                 model_inputs=model_inputs,
                 ref_tail_logits=ref_tail_logits,
             )
-            entry["sanity_kl"] = sanity_kl
+            entry.update(metrics)
             print(
-                f"Sanity check layer {layer_idx}, budget {budget}, final KL gap: {sanity_kl:.6f}"
+                f"Sanity check layer {layer_idx}, budget {budget}, "
+                f"KL: {metrics['sanity_kl']:.6f}, "
+                f"teacher NLL: {metrics['teacher_nll']:.6f}, "
+                f"student NLL: {metrics['student_nll']:.6f}, "
+                f"NLL gap: {metrics['nll_gap']:.6f}"
             )
 
         result[budget] = entry
@@ -158,7 +167,6 @@ def main():
     device = args.device
 
     ctx = load_context(args, dtype=dtype, device=device)
-    print("num_hidden_layers:", ctx.model_config.num_hidden_layers)
 
     validate_args_with_cache(ctx, args)
 

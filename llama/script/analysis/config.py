@@ -70,11 +70,18 @@ def parse_args():
         help="Learning rate",
     )
     parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="logits_kl",
+        choices=["logits_kl", "v_l2", "v_kl"],
+        help="Training loss: logits-space KL, V-space L2, or V-space KL",
+    )
+    parser.add_argument(
         "--layers",
-        type=int,
+        type=str,
         nargs="+",
-        default=[5, 10, 15, 20, 25, 30],
-        help="Layer indices to process",
+        default=["5", "10", "15", "20", "25", "30"],
+        help="Layer indices to process, or use 'all' to run all layers",
     )
     parser.add_argument(
         "--budgets",

@@ -12,6 +12,13 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="wikitext", help="Dataset name in result path")
     parser.add_argument("--strategy", type=str, default="h2o", help="Strategy name in result path")
     parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="logits_kl",
+        choices=["logits_kl", "v_l2", "v_kl"],
+        help="Loss type subdirectory to read from",
+    )
+    parser.add_argument(
         "--layers",
         type=int,
         nargs="+",
@@ -96,11 +103,11 @@ def load_layer_metric_pair(result_path, metric_a, metric_b):
     return sorted_budgets, sorted_a, sorted_b
 
 
-def default_save_path(metric, dataset, strategy):
+def default_save_path(metric, dataset, strategy, loss_type):
     llama_dir = Path(__file__).resolve().parent.parent.parent
     out_dir = llama_dir / "result" / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir / f"sanity_{metric}_{dataset}_{strategy}.png"
+    return out_dir / f"sanity_{metric}_{dataset}_{strategy}_{loss_type}.png"
 
 
 def main():
@@ -114,7 +121,14 @@ def main():
     plotted_any = False
 
     for layer_idx in args.layers:
-        result_path = result_root / f"layer{layer_idx}" / args.dataset / args.strategy / "result.pt"
+        result_path = (
+            result_root
+            / f"layer{layer_idx}"
+            / args.dataset
+            / args.strategy
+            / args.loss_type
+            / "result.pt"
+        )
         if args.metric == "nll_pair":
             budgets, teacher_vals, student_vals = load_layer_metric_pair(
                 result_path,
@@ -166,12 +180,19 @@ def main():
     plt.xlabel("budget")
     ylabel = "NLL" if args.metric == "nll_pair" else args.metric
     plt.ylabel(ylabel)
-    plt.title(f"Sanity check curve: {args.metric} vs budget ({args.dataset}, {args.strategy})")
+    plt.title(
+        f"Sanity check curve: {args.metric} vs budget "
+        f"({args.dataset}, {args.strategy}, {args.loss_type})"
+    )
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
 
-    save_path = Path(args.save_path) if args.save_path else default_save_path(args.metric, args.dataset, args.strategy)
+    save_path = (
+        Path(args.save_path)
+        if args.save_path
+        else default_save_path(args.metric, args.dataset, args.strategy, args.loss_type)
+    )
     save_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, dpi=160)
     print(f"Saved plot to: {save_path}")

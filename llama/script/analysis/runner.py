@@ -58,8 +58,35 @@ def validate_args_with_cache(ctx, args):
         )
 
 
+def resolve_layers(layer_tokens, num_hidden_layers):
+    tokens = [str(x).strip().lower() for x in layer_tokens]
+    if "all" in tokens:
+        return list(range(num_hidden_layers))
+
+    layers = []
+    for token in layer_tokens:
+        try:
+            layer_idx = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid layer value '{token}'. Use integer indices or 'all'."
+            ) from exc
+
+        if layer_idx < 0 or layer_idx >= num_hidden_layers:
+            raise ValueError(
+                f"Layer index {layer_idx} out of range [0, {num_hidden_layers - 1}]"
+            )
+        layers.append(layer_idx)
+
+    return layers
+
+
+def get_result_path(layer_idx, dataset, strategy, loss_type):
+    return f"../result/layer{layer_idx}/{dataset}/{strategy}/{loss_type}/result.pt"
+
+
 def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, ref_tail_logits):
-    save_path = f"../result/layer{layer_idx}/{args.dataset}/{args.strategy}/result.pt"
+    save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
 
     if os.path.exists(save_path):
         result = torch.load(save_path)
@@ -122,11 +149,12 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
             training_steps=args.training_steps,
             lr=args.lr,
             mask=mask,
+            loss_type=args.loss_type,
             device=ctx.device,
         )
 
         print(f"final loss for layer {layer_idx} with budget {budget}: {loss[-1]}")
-        entry = {"opt": (alpha, p_alpha, p_teacher, loss)}
+        entry = {"opt": (alpha, p_alpha, p_teacher, loss), "loss_type": args.loss_type}
 
         if args.sanity_check:
             attn_hidden_patch = build_modified_attn_hidden(
@@ -173,6 +201,7 @@ def main():
     n_heads = ctx.model_config.num_attention_heads
     head_idx = list(range(n_heads))
     pos_list = list(range(args.seq_len - args.tail_len, args.seq_len))
+    layer_idx_list = resolve_layers(args.layers, ctx.model_config.num_hidden_layers)
 
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
     ctx.model.eval()
@@ -183,7 +212,7 @@ def main():
             ref_tail_logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
         print("Reference logits computed for sanity check.")
 
-    for layer_idx in args.layers:
+    for layer_idx in layer_idx_list:
         run_layer_budgets(
             ctx=ctx,
             args=args,

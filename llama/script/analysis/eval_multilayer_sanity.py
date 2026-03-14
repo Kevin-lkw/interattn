@@ -32,6 +32,13 @@ def parse_args():
     parser.add_argument("--model-name", type=str, default="llama-2-7b-hf")
     parser.add_argument("--dataset", type=str, default="wikitext")
     parser.add_argument("--strategy", type=str, default="h2o")
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="logits_kl",
+        choices=["logits_kl", "v_l2", "v_kl"],
+        help="Loss type subdirectory to read from",
+    )
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
@@ -113,8 +120,8 @@ def normalize_budget_key(result_dict, target_budget, atol=1e-12):
     return None
 
 
-def get_alpha_for_layer_budget(result_root, layer_idx, dataset, strategy, budget):
-    result_path = result_root / f"layer{layer_idx}" / dataset / strategy / "result.pt"
+def get_alpha_for_layer_budget(result_root, layer_idx, dataset, strategy, loss_type, budget):
+    result_path = result_root / f"layer{layer_idx}" / dataset / strategy / loss_type / "result.pt"
     if not result_path.exists():
         raise FileNotFoundError(f"Missing result file for layer {layer_idx}: {result_path}")
 
@@ -221,9 +228,9 @@ def compute_metrics(ref_tail_logits, student_tail_logits, labels):
     }
 
 
-def default_output_path(dataset, strategy, layers):
+def default_output_path(dataset, strategy, loss_type, layers):
     llama_dir = Path(__file__).resolve().parent.parent.parent
-    out_dir = llama_dir / "result" / "multilayer" / dataset / strategy
+    out_dir = llama_dir / "result" / "multilayer" / dataset / strategy / loss_type
     out_dir.mkdir(parents=True, exist_ok=True)
     layer_tag = "-".join(str(x) for x in layers)
     return out_dir / f"layers_{layer_tag}_sanity.pt"
@@ -324,6 +331,7 @@ def main():
         "layers": args.layers,
         "dataset": args.dataset,
         "strategy": args.strategy,
+        "loss_type": args.loss_type,
         "budgets": {},
     }
 
@@ -336,6 +344,7 @@ def main():
                     layer_idx=layer_idx,
                     dataset=args.dataset,
                     strategy=args.strategy,
+                    loss_type=args.loss_type,
                     budget=budget,
                 )
                 patch_hidden = build_modified_attn_hidden(
@@ -361,7 +370,7 @@ def main():
         summary["budgets"][float(budget)] = metrics
 
         print(
-            f"[multi-layer] layers={args.layers}, budget={budget}: "
+            f"[multi-layer] layers={args.layers}, budget={budget}, loss={args.loss_type}: "
             f"KL={metrics['sanity_kl']:.6f}, "
             f"teacher NLL={metrics['teacher_nll']:.6f}, "
             f"student NLL={metrics['student_nll']:.6f}, "
@@ -369,7 +378,7 @@ def main():
         )
 
     out_path = Path(args.output_path) if args.output_path else default_output_path(
-        args.dataset, args.strategy, args.layers
+        args.dataset, args.strategy, args.loss_type, args.layers
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(summary, out_path)

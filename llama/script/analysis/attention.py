@@ -35,7 +35,17 @@ def get_attention_map_after_rope(ctx, layer_idx, causal=True, dtype=None, device
     return scores, attn
 
 
-def optimize_alpha_star(ctx, layer_idx, head_idx, pos_list, training_steps, lr, mask, device=None):
+def optimize_alpha_star(
+    ctx,
+    layer_idx,
+    head_idx,
+    pos_list,
+    training_steps,
+    lr,
+    mask,
+    loss_type="logits_kl",
+    device=None,
+):
     """
     head_idx: int or list[int]
     pos_list: list[int]
@@ -68,36 +78,59 @@ def optimize_alpha_star(ctx, layer_idx, head_idx, pos_list, training_steps, lr, 
             f"Mask seq_len ({seq_len}) does not match cached V seq_len ({V_head.shape[1]})."
         )
 
-    with torch.no_grad():
-        output = original.clone()  # [nh, n_pos, hd]
-        hidden = layer.self_attn.o_proj(
-            output.permute(1, 0, 2).reshape(len(pos_list), -1)
-        )  # [n_pos, hidden_size]
-        hidden = hidden + residual_attn_in
-        gt_logits = ctx.model.lm_head(hidden)  # [n_pos, vocab_size]
-        p_teacher = F.softmax(gt_logits.float(), dim=-1).detach()
-        logp_teacher = F.log_softmax(gt_logits.float(), dim=-1).detach()
+    gt_v = original[head_idx].detach().float()  # [n_heads, n_pos, hd]
+
+    p_teacher = None
+    logp_teacher = None
+    p_teacher_v = None
+    logp_teacher_v = None
+
+    if loss_type == "logits_kl":
+        with torch.no_grad():
+            output = original.clone()  # [nh, n_pos, hd]
+            hidden = layer.self_attn.o_proj(
+                output.permute(1, 0, 2).reshape(len(pos_list), -1)
+            )  # [n_pos, hidden_size]
+            hidden = hidden + residual_attn_in
+            gt_logits = ctx.model.lm_head(hidden)  # [n_pos, vocab_size]
+            p_teacher = F.softmax(gt_logits.float(), dim=-1).detach()
+            logp_teacher = F.log_softmax(gt_logits.float(), dim=-1).detach()
+    elif loss_type == "v_kl":
+        with torch.no_grad():
+            p_teacher_v = F.softmax(gt_v, dim=-1).detach()
+            logp_teacher_v = F.log_softmax(gt_v, dim=-1).detach()
+    elif loss_type == "v_l2":
+        pass
+    else:
+        raise ValueError(
+            f"Unknown loss_type {loss_type}. Supported: logits_kl, v_l2, v_kl"
+        )
 
     losses = []
-    p_alpha = 0
+    p_alpha = None
 
     for step in range(training_steps):
         alpha = F.softmax(a_param + mask, dim=-1)
         V_new = alpha @ V_head.float()  # [nh, n_pos, hd]
         V_new = V_new.to(original.dtype)
 
-        output = original.clone()
-        output[head_idx] = V_new.to(V_head.dtype)
+        if loss_type == "logits_kl":
+            output = original.clone()
+            output[head_idx] = V_new.to(V_head.dtype)
 
-        hidden = output.permute(1, 0, 2).reshape(len(pos_list), -1)  # [n_pos, hidden_size]
-        hidden = layer.self_attn.o_proj(hidden)
-        hidden = hidden + residual_attn_in
-        logits = ctx.model.lm_head(hidden)
+            hidden = output.permute(1, 0, 2).reshape(len(pos_list), -1)  # [n_pos, hidden_size]
+            hidden = layer.self_attn.o_proj(hidden)
+            hidden = hidden + residual_attn_in
+            logits = ctx.model.lm_head(hidden)
 
-        p_alpha = F.softmax(logits.float(), dim=-1)
-        logp_student = F.log_softmax(logits.float(), dim=-1)
-
-        loss = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1).mean()
+            p_alpha = F.softmax(logits.float(), dim=-1)
+            logp_student = F.log_softmax(logits.float(), dim=-1)
+            loss = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1).mean()
+        elif loss_type == "v_l2":
+            loss = torch.norm(V_new.float() - gt_v, p=2, dim=-1).mean()
+        else:  # loss_type == "v_kl"
+            logp_student_v = F.log_softmax(V_new.float(), dim=-1)
+            loss = (p_teacher_v * (logp_teacher_v - logp_student_v)).sum(dim=-1).mean()
 
         losses.append(loss.item())
         if step % 100 == 0:

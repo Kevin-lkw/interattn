@@ -96,6 +96,13 @@ def parse_args():
         action="store_true",
         help="Do not open interactive plot window",
     )
+    parser.add_argument(
+        "--error-bar",
+        type=str,
+        default="std",
+        choices=["none", "std", "sem"],
+        help="Error bar type computed over tail tokens for each budget",
+    )
     return parser.parse_args()
 
 
@@ -163,24 +170,54 @@ def compute_metrics(ref_tail_logits, student_tail_logits, labels):
     p_teacher = F.softmax(ref_tail_logits, dim=-1)
     logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
     logp_student = F.log_softmax(student_tail_logits, dim=-1)
-    kl = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1).mean().item()
+    kl_token = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1)  # [B, T]
+    kl = kl_token.mean().item()
 
-    teacher_nll = F.cross_entropy(
+    teacher_nll_token = F.cross_entropy(
         ref_tail_logits.reshape(-1, ref_tail_logits.size(-1)),
         labels.reshape(-1),
-        reduction="mean",
-    ).item()
-    student_nll = F.cross_entropy(
+        reduction="none",
+    ).reshape(ref_tail_logits.size(0), ref_tail_logits.size(1))
+    teacher_nll = teacher_nll_token.mean().item()
+
+    student_nll_token = F.cross_entropy(
         student_tail_logits.reshape(-1, student_tail_logits.size(-1)),
         labels.reshape(-1),
-        reduction="mean",
-    ).item()
+        reduction="none",
+    ).reshape(student_tail_logits.size(0), student_tail_logits.size(1))
+    student_nll = student_nll_token.mean().item()
+
+    nll_gap_token = student_nll_token - teacher_nll_token
+
+    # reduce batch dimension first, then compute dispersion across tail tokens
+    kl_token_mean = kl_token.mean(dim=0)
+    teacher_nll_token_mean = teacher_nll_token.mean(dim=0)
+    student_nll_token_mean = student_nll_token.mean(dim=0)
+    nll_gap_token_mean = nll_gap_token.mean(dim=0)
+
+    def std_sem(x):
+        std = x.std(unbiased=False).item()
+        sem = (std / (x.numel() ** 0.5)) if x.numel() > 0 else 0.0
+        return std, sem
+
+    kl_std, kl_sem = std_sem(kl_token_mean)
+    teacher_nll_std, teacher_nll_sem = std_sem(teacher_nll_token_mean)
+    student_nll_std, student_nll_sem = std_sem(student_nll_token_mean)
+    nll_gap_std, nll_gap_sem = std_sem(nll_gap_token_mean)
 
     return {
         "sanity_kl": kl,
+        "sanity_kl_std": kl_std,
+        "sanity_kl_sem": kl_sem,
         "teacher_nll": teacher_nll,
+        "teacher_nll_std": teacher_nll_std,
+        "teacher_nll_sem": teacher_nll_sem,
         "student_nll": student_nll,
+        "student_nll_std": student_nll_std,
+        "student_nll_sem": student_nll_sem,
         "nll_gap": student_nll - teacher_nll,
+        "nll_gap_std": nll_gap_std,
+        "nll_gap_sem": nll_gap_sem,
     }
 
 
@@ -210,15 +247,33 @@ def plot_summary(summary, args, plot_path):
 
     budgets = sorted(float(k) for k in summary["budgets"].keys())
     metric_to_values = {m: [] for m in args.plot_metrics}
+    metric_to_errors = {m: [] for m in args.plot_metrics}
 
     for b in budgets:
         entry = summary["budgets"][b]
         for m in args.plot_metrics:
             metric_to_values[m].append(float(entry[m]))
+            if args.error_bar == "std":
+                metric_to_errors[m].append(float(entry.get(f"{m}_std", 0.0)))
+            elif args.error_bar == "sem":
+                metric_to_errors[m].append(float(entry.get(f"{m}_sem", 0.0)))
+            else:
+                metric_to_errors[m].append(0.0)
 
     plt.figure(figsize=(10, 6))
     for m in args.plot_metrics:
-        plt.plot(budgets, metric_to_values[m], marker="o", linewidth=2, label=m)
+        if args.error_bar == "none":
+            plt.plot(budgets, metric_to_values[m], marker="o", linewidth=2, label=m)
+        else:
+            plt.errorbar(
+                budgets,
+                metric_to_values[m],
+                yerr=metric_to_errors[m],
+                marker="o",
+                linewidth=2,
+                capsize=3,
+                label=f"{m} ({args.error_bar})",
+            )
 
     plt.xscale("log")
     if args.plot_logy:

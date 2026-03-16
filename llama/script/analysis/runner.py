@@ -1,16 +1,22 @@
 import os
 
 import torch
+from datasets import load_dataset
+from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .attention import gen_mask, optimize_alpha_star
 from .baseline_eval import run_multilayer_baseline_check
 from .config import parse_args, set_seed, str_to_torch_dtype
 from .context import RunContext
+from .online_routing import (
+    build_runtime_layer_ctx,
+    capture_layer_artifacts,
+    run_with_multilayer_patches,
+)
 from .sanity import (
     build_modified_attn_hidden,
-    compute_final_kl_with_reinjected_alpha,
-    has_full_sanity_metrics,
+    get_tail_labels,
     move_model_inputs_to_device,
     unpack_result_entry,
 )
@@ -28,30 +34,57 @@ def load_context(args, dtype, device):
         use_fast=False,
     )
 
-    kv_path = f"../{args.model_name}_{args.dataset}_st{args.start}.pt"
-    print(f"Loading KV cache from: {kv_path}")
-    kv = torch.load(kv_path, weights_only=False)
+    if args.dataset == "wikitext":
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        prompt = "\n".join([text for text in dataset["text"] if text.strip()])
+    elif args.dataset == "pg19":
+        dataset = load_dataset("emozilla/pg19-test", split="test")
+        prompt = "\n".join([text for text in dataset["text"] if text.strip()])
+    else:
+        raise ValueError(
+            f"Unsupported dataset '{args.dataset}'. Supported now: wikitext, pg19"
+        )
+
+    # Build one continuous context window and next-token labels directly from raw text.
+    encoded = tokenizer(
+        prompt,
+        max_length=args.start + args.seq_len + 1,
+        truncation=True,
+        return_tensors="pt",
+    )
+    total_len = encoded["input_ids"].shape[1]
+    required_len = args.start + args.seq_len + 1
+    if total_len < required_len:
+        raise ValueError(
+            f"Tokenized prompt length ({total_len}) is shorter than required ({required_len})."
+        )
+
+    inputs = {
+        key: value[:, args.start : args.start + args.seq_len]
+        for key, value in encoded.items()
+    }
+    gt_label = encoded["input_ids"][:, args.start + 1 : args.start + args.seq_len + 1]
 
     return RunContext(
         model=model,
         tokenizer=tokenizer,
-        rope_qkv=kv["after_rope"],
-        inputs=kv["input"],
-        outputs=kv["output"],
-        attn_output=kv["attention_output"],
-        layer_input=kv["layer_input"],
-        gt_label=kv["gt_label"],
-        model_config=kv["model_config"],
+        rope_qkv=None,
+        inputs=inputs,
+        outputs=None,
+        attn_output=None,
+        layer_input=None,
+        gt_label=gt_label,
+        model_config=model.config,
         dtype=dtype,
         device=device,
     )
 
 
 def validate_args_with_cache(ctx, args):
-    cache_seq_len = ctx.rope_qkv[0]["q"].shape[2]
-    if args.seq_len > cache_seq_len:
+    input_seq_len = ctx.inputs["input_ids"].shape[1]
+    if args.seq_len > input_seq_len:
         raise ValueError(
-            f"--seq-len ({args.seq_len}) exceeds cached sequence length ({cache_seq_len})."
+            f"--seq-len ({args.seq_len}) exceeds prepared sequence length ({input_seq_len})."
         )
     if args.tail_len > args.seq_len:
         raise ValueError(
@@ -81,107 +114,137 @@ def get_result_path(layer_idx, dataset, strategy, loss_type):
     return f"../result/layer{layer_idx}/{dataset}/{strategy}/{loss_type}/result.pt"
 
 
-def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, ref_tail_logits):
-    save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
+def normalize_budget_key(result_dict, target_budget, atol=1e-12):
+    for key in result_dict.keys():
+        if abs(float(key) - float(target_budget)) <= atol:
+            return key
+    return None
 
-    if os.path.exists(save_path):
-        result = torch.load(save_path)
-        print(f"Loaded existing results for layer {layer_idx}. Existing budgets: {list(result.keys())}")
-    else:
-        result = {}
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        print(f"No existing file found for layer {layer_idx}, starting a new one.")
 
-    for budget in args.budgets:
-        if budget in result:
-            alpha_exist, wrapped_exist = unpack_result_entry(result[budget])
-            if args.sanity_check and not has_full_sanity_metrics(wrapped_exist):
-                attn_hidden_patch = build_modified_attn_hidden(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    pos_list=pos_list,
-                    alpha=alpha_exist,
-                    device=ctx.device,
-                )
-                metrics = compute_final_kl_with_reinjected_alpha(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    pos_list=pos_list,
-                    attn_hidden_patch=attn_hidden_patch,
-                    model_inputs=model_inputs,
-                    ref_tail_logits=ref_tail_logits,
-                )
-                wrapped_exist.update(metrics)
-                result[budget] = wrapped_exist
-                print(
-                    f"Sanity check (existing) layer {layer_idx}, budget {budget}, "
-                    f"KL: {metrics['sanity_kl']:.6f}, "
-                    f"teacher NLL: {metrics['teacher_nll']:.6f}, "
-                    f"student NLL: {metrics['student_nll']:.6f}, "
-                    f"NLL gap: {metrics['nll_gap']:.6f}"
-                )
-            else:
-                print(f"Budget {budget} already exists in layer {layer_idx}, skipping.")
-            continue
+def load_or_init_layer_results(layer_idx_list, args):
+    layer_results = {}
+    for layer_idx in layer_idx_list:
+        save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
+        if os.path.exists(save_path):
+            result = torch.load(save_path, weights_only=False)
+            print(
+                f"Loaded existing results for layer {layer_idx}. Existing budgets: {list(result.keys())}"
+            )
+        else:
+            result = {}
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            print(f"No existing file found for layer {layer_idx}, starting a new one.")
+        layer_results[layer_idx] = result
+    return layer_results
 
-        mask = gen_mask(
+
+def save_layer_results(layer_idx_list, layer_results, args):
+    for layer_idx in layer_idx_list:
+        save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
+        torch.save(layer_results[layer_idx], save_path)
+        print(f"Optimization completed and results saved to {save_path}")
+
+
+def run_budget_online(
+    ctx,
+    args,
+    budget,
+    layer_idx_list,
+    head_idx,
+    pos_list,
+    model_inputs,
+    layer_results,
+):
+    # This dict carries patches that are immediately applied to later layers in this budget.
+    layer_to_patch = {}
+
+    for layer_idx in layer_idx_list:
+        artifacts = capture_layer_artifacts(
             ctx=ctx,
             layer_idx=layer_idx,
             pos_list=pos_list,
-            head_idx=head_idx,
-            strategy=args.strategy,
-            budget=budget,
-            prompt_len=args.prompt_len,
-            seq_len=args.seq_len,
+            model_inputs=model_inputs,
+            layer_to_patch=layer_to_patch,
         )
+        layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, artifacts)
 
-        print(f"Optimizing alpha_star for layer {layer_idx}, budget {budget}")
-        alpha, p_alpha, p_teacher, loss = optimize_alpha_star(
-            ctx=ctx,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            training_steps=args.training_steps,
-            lr=args.lr,
-            mask=mask,
-            loss_type=args.loss_type,
-            device=ctx.device,
-        )
+        layer_result = layer_results[layer_idx]
+        budget_key = normalize_budget_key(layer_result, budget)
+        reuse_existing = False
+        if budget_key is not None:
+            existing_entry = layer_result[budget_key]
+            if isinstance(existing_entry, dict) and existing_entry.get("optimized_online", False):
+                reuse_existing = True
 
-        print(f"final loss for layer {layer_idx} with budget {budget}: {loss[-1]}")
-        entry = {"opt": (alpha, p_alpha, p_teacher, loss), "loss_type": args.loss_type}
-
-        if args.sanity_check:
-            attn_hidden_patch = build_modified_attn_hidden(
-                ctx=ctx,
+        if reuse_existing:
+            alpha, _ = unpack_result_entry(layer_result[budget_key])
+            print(f"Layer {layer_idx}, budget {budget} already exists, reuse alpha*.")
+        else:
+            mask = gen_mask(
+                ctx=layer_ctx,
+                layer_idx=layer_idx,
+                pos_list=pos_list,
+                head_idx=head_idx,
+                strategy=args.strategy,
+                budget=budget,
+                prompt_len=args.prompt_len,
+                seq_len=args.seq_len,
+            )
+            print(f"Optimizing alpha_star for layer {layer_idx}, budget {budget}")
+            alpha, p_alpha, p_teacher, loss = optimize_alpha_star(
+                ctx=layer_ctx,
                 layer_idx=layer_idx,
                 head_idx=head_idx,
                 pos_list=pos_list,
-                alpha=alpha,
+                training_steps=args.training_steps,
+                lr=args.lr,
+                mask=mask,
+                loss_type=args.loss_type,
                 device=ctx.device,
             )
-            metrics = compute_final_kl_with_reinjected_alpha(
-                ctx=ctx,
-                layer_idx=layer_idx,
-                pos_list=pos_list,
-                attn_hidden_patch=attn_hidden_patch,
-                model_inputs=model_inputs,
-                ref_tail_logits=ref_tail_logits,
-            )
-            entry.update(metrics)
-            print(
-                f"Sanity check layer {layer_idx}, budget {budget}, "
-                f"KL: {metrics['sanity_kl']:.6f}, "
-                f"teacher NLL: {metrics['teacher_nll']:.6f}, "
-                f"student NLL: {metrics['student_nll']:.6f}, "
-                f"NLL gap: {metrics['nll_gap']:.6f}"
-            )
+            print(f"final loss for layer {layer_idx} with budget {budget}: {loss[-1]}")
+            layer_result[float(budget)] = {
+                "opt": (alpha, p_alpha, p_teacher, loss),
+                "loss_type": args.loss_type,
+                "optimized_online": True,
+            }
 
-        result[budget] = entry
+        patch_hidden = build_modified_attn_hidden(
+            ctx=layer_ctx,
+            layer_idx=layer_idx,
+            head_idx=head_idx,
+            pos_list=pos_list,
+            alpha=alpha,
+            device=ctx.device,
+        )
+        layer_to_patch[layer_idx] = patch_hidden
 
-    torch.save(result, save_path)
-    print(f"Optimization completed and results saved to {save_path}")
+    return layer_to_patch
+
+
+def compute_metrics(ref_tail_logits, student_tail_logits, labels):
+    p_teacher = F.softmax(ref_tail_logits, dim=-1)
+    logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
+    logp_student = F.log_softmax(student_tail_logits, dim=-1)
+    kl = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1).mean().item()
+
+    teacher_nll = F.cross_entropy(
+        ref_tail_logits.reshape(-1, ref_tail_logits.size(-1)),
+        labels.reshape(-1),
+        reduction="mean",
+    ).item()
+    student_nll = F.cross_entropy(
+        student_tail_logits.reshape(-1, student_tail_logits.size(-1)),
+        labels.reshape(-1),
+        reduction="mean",
+    ).item()
+
+    return {
+        "sanity_kl": kl,
+        "teacher_nll": teacher_nll,
+        "student_nll": student_nll,
+        "nll_gap": student_nll - teacher_nll,
+    }
 
 
 def main():
@@ -214,17 +277,42 @@ def main():
         with torch.no_grad():
             ref_tail_logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
         print("Reference logits computed for sanity check.")
+        labels = get_tail_labels(ctx, pos_list, ctx.device)
 
-    for layer_idx in layer_idx_list:
-        run_layer_budgets(
+    layer_results = load_or_init_layer_results(layer_idx_list, args)
+    budget_to_final_metrics = {}
+
+    for budget in args.budgets:
+        print(f"\n[online optimize] budget={budget}")
+        final_layer_patch = run_budget_online(
             ctx=ctx,
             args=args,
-            layer_idx=layer_idx,
+            budget=budget,
+            layer_idx_list=layer_idx_list,
             head_idx=head_idx,
             pos_list=pos_list,
             model_inputs=model_inputs,
-            ref_tail_logits=ref_tail_logits,
+            layer_results=layer_results,
         )
+
+        if args.sanity_check:
+            student_tail_logits = run_with_multilayer_patches(
+                ctx=ctx,
+                layer_to_patch=final_layer_patch,
+                pos_list=pos_list,
+                model_inputs=model_inputs,
+            )
+            final_metrics = compute_metrics(ref_tail_logits, student_tail_logits, labels)
+            budget_to_final_metrics[float(budget)] = final_metrics
+            print(
+                f"[online sanity] budget={budget}: "
+                f"KL={final_metrics['sanity_kl']:.6f}, "
+                f"teacher NLL={final_metrics['teacher_nll']:.6f}, "
+                f"student NLL={final_metrics['student_nll']:.6f}, "
+                f"NLL gap={final_metrics['nll_gap']:.6f}"
+            )
+
+    save_layer_results(layer_idx_list, layer_results, args)
 
     if args.baseline_check:
         print("Running one-shot multi-layer baseline comparison...")

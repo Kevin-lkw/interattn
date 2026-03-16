@@ -4,6 +4,11 @@ import torch
 from torch.nn import functional as F
 
 from .attention import build_qk_routing_alpha, gen_mask
+from .online_routing import (
+    build_runtime_layer_ctx,
+    capture_layer_artifacts,
+    run_with_multilayer_patches,
+)
 from .sanity import build_modified_attn_hidden, get_tail_labels, unpack_result_entry
 
 
@@ -12,43 +17,6 @@ def normalize_budget_key(result_dict, target_budget, atol=1e-12):
         if abs(float(key) - float(target_budget)) <= atol:
             return key
     return None
-
-
-def run_with_multilayer_patches(ctx, layer_to_patch, pos_list, model_inputs):
-    if not layer_to_patch:
-        raise ValueError("layer_to_patch is empty")
-
-    pos_idx = torch.tensor(pos_list, device=ctx.device, dtype=torch.long)
-    handles = []
-
-    def hook_factory(layer_idx):
-        patch_hidden = layer_to_patch[layer_idx]
-
-        def _hook(_module, _module_inputs, module_output):
-            if isinstance(module_output, tuple):
-                attn_out = module_output[0].clone()
-                attn_out[:, pos_idx, :] = patch_hidden.unsqueeze(0).to(attn_out.dtype)
-                return (attn_out,) + module_output[1:]
-
-            attn_out = module_output.clone()
-            attn_out[:, pos_idx, :] = patch_hidden.unsqueeze(0).to(attn_out.dtype)
-            return attn_out
-
-        return _hook
-
-    for layer_idx in layer_to_patch.keys():
-        layer = ctx.model.model.layers[layer_idx]
-        handle = layer.self_attn.register_forward_hook(hook_factory(layer_idx))
-        handles.append(handle)
-
-    try:
-        with torch.no_grad():
-            logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    return logits
 
 
 def compute_metrics(ref_tail_logits, student_tail_logits, labels):
@@ -138,8 +106,17 @@ def run_multilayer_baseline_check(
                     )
 
                 alpha_opt, _ = unpack_result_entry(result_dict[budget_key])
-                optimal_layer_patch[layer_idx] = build_modified_attn_hidden(
+                # Recompute this layer runtime tensors after applying previous optimal patches.
+                optimal_artifacts = capture_layer_artifacts(
                     ctx=ctx,
+                    layer_idx=layer_idx,
+                    pos_list=pos_list,
+                    model_inputs=model_inputs,
+                    layer_to_patch=optimal_layer_patch,
+                )
+                optimal_layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, optimal_artifacts)
+                optimal_layer_patch[layer_idx] = build_modified_attn_hidden(
+                    ctx=optimal_layer_ctx,
                     layer_idx=layer_idx,
                     head_idx=head_idx,
                     pos_list=pos_list,
@@ -147,8 +124,17 @@ def run_multilayer_baseline_check(
                     device=ctx.device,
                 )
 
-                mask = gen_mask(
+                # Baseline also needs online layer states under its own previous patches.
+                baseline_artifacts = capture_layer_artifacts(
                     ctx=ctx,
+                    layer_idx=layer_idx,
+                    pos_list=pos_list,
+                    model_inputs=model_inputs,
+                    layer_to_patch=baseline_layer_patch,
+                )
+                baseline_layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, baseline_artifacts)
+                mask = gen_mask(
+                    ctx=baseline_layer_ctx,
                     layer_idx=layer_idx,
                     pos_list=pos_list,
                     head_idx=head_idx,
@@ -158,7 +144,7 @@ def run_multilayer_baseline_check(
                     seq_len=args.seq_len,
                 )
                 alpha_baseline = build_qk_routing_alpha(
-                    ctx=ctx,
+                    ctx=baseline_layer_ctx,
                     layer_idx=layer_idx,
                     head_idx=head_idx,
                     pos_list=pos_list,
@@ -166,7 +152,7 @@ def run_multilayer_baseline_check(
                     device=ctx.device,
                 )
                 baseline_layer_patch[layer_idx] = build_modified_attn_hidden(
-                    ctx=ctx,
+                    ctx=baseline_layer_ctx,
                     layer_idx=layer_idx,
                     head_idx=head_idx,
                     pos_list=pos_list,

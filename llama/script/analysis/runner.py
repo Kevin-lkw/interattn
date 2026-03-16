@@ -3,7 +3,8 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .attention import build_qk_routing_alpha, gen_mask, optimize_alpha_star
+from .attention import gen_mask, optimize_alpha_star
+from .baseline_eval import run_multilayer_baseline_check
 from .config import parse_args, set_seed, str_to_torch_dtype
 from .context import RunContext
 from .sanity import (
@@ -80,16 +81,6 @@ def get_result_path(layer_idx, dataset, strategy, loss_type):
     return f"../result/layer{layer_idx}/{dataset}/{strategy}/{loss_type}/result.pt"
 
 
-def has_full_baseline_metrics(entry):
-    required_keys = [
-        "baseline_sanity_kl",
-        "baseline_teacher_nll",
-        "baseline_student_nll",
-        "baseline_nll_gap",
-    ]
-    return all(key in entry for key in required_keys)
-
-
 def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, ref_tail_logits):
     save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
 
@@ -104,7 +95,6 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
     for budget in args.budgets:
         if budget in result:
             alpha_exist, wrapped_exist = unpack_result_entry(result[budget])
-            mask_for_baseline = None
             if args.sanity_check and not has_full_sanity_metrics(wrapped_exist):
                 attn_hidden_patch = build_modified_attn_hidden(
                     ctx=ctx,
@@ -131,71 +121,8 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
                     f"student NLL: {metrics['student_nll']:.6f}, "
                     f"NLL gap: {metrics['nll_gap']:.6f}"
                 )
-            elif not args.sanity_check:
+            else:
                 print(f"Budget {budget} already exists in layer {layer_idx}, skipping.")
-
-            if args.sanity_check and args.baseline_check and not has_full_baseline_metrics(wrapped_exist):
-                if mask_for_baseline is None:
-                    mask_for_baseline = gen_mask(
-                        ctx=ctx,
-                        layer_idx=layer_idx,
-                        pos_list=pos_list,
-                        head_idx=head_idx,
-                        strategy=args.strategy,
-                        budget=budget,
-                        prompt_len=args.prompt_len,
-                        seq_len=args.seq_len,
-                    )
-                baseline_alpha = build_qk_routing_alpha(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    pos_list=pos_list,
-                    mask=mask_for_baseline,
-                    device=ctx.device,
-                )
-                baseline_patch = build_modified_attn_hidden(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    pos_list=pos_list,
-                    alpha=baseline_alpha,
-                    device=ctx.device,
-                )
-                baseline_metrics = compute_final_kl_with_reinjected_alpha(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    pos_list=pos_list,
-                    attn_hidden_patch=baseline_patch,
-                    model_inputs=model_inputs,
-                    ref_tail_logits=ref_tail_logits,
-                )
-                wrapped_exist.update({f"baseline_{k}": v for k, v in baseline_metrics.items()})
-                if has_full_sanity_metrics(wrapped_exist):
-                    wrapped_exist["delta_sanity_kl"] = (
-                        wrapped_exist["baseline_sanity_kl"] - wrapped_exist["sanity_kl"]
-                    )
-                    wrapped_exist["delta_student_nll"] = (
-                        wrapped_exist["baseline_student_nll"] - wrapped_exist["student_nll"]
-                    )
-                    wrapped_exist["delta_nll_gap"] = (
-                        wrapped_exist["baseline_nll_gap"] - wrapped_exist["nll_gap"]
-                    )
-                result[budget] = wrapped_exist
-                print(
-                    f"Baseline check (existing) layer {layer_idx}, budget {budget}, "
-                    f"KL: {baseline_metrics['sanity_kl']:.6f}, "
-                    f"teacher NLL: {baseline_metrics['teacher_nll']:.6f}, "
-                    f"student NLL: {baseline_metrics['student_nll']:.6f}, "
-                    f"NLL gap: {baseline_metrics['nll_gap']:.6f}"
-                )
-                if has_full_sanity_metrics(wrapped_exist):
-                    print(
-                        f"Delta(alpha* vs baseline) layer {layer_idx}, budget {budget}: "
-                        f"dKL={wrapped_exist['delta_sanity_kl']:.6f}, "
-                        f"dStudentNLL={wrapped_exist['delta_student_nll']:.6f}, "
-                        f"dNLLGap={wrapped_exist['delta_nll_gap']:.6f}"
-                    )
             continue
 
         mask = gen_mask(
@@ -251,49 +178,6 @@ def run_layer_budgets(ctx, args, layer_idx, head_idx, pos_list, model_inputs, re
                 f"NLL gap: {metrics['nll_gap']:.6f}"
             )
 
-            if args.baseline_check:
-                baseline_alpha = build_qk_routing_alpha(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    pos_list=pos_list,
-                    mask=mask,
-                    device=ctx.device,
-                )
-                baseline_patch = build_modified_attn_hidden(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    pos_list=pos_list,
-                    alpha=baseline_alpha,
-                    device=ctx.device,
-                )
-                baseline_metrics = compute_final_kl_with_reinjected_alpha(
-                    ctx=ctx,
-                    layer_idx=layer_idx,
-                    pos_list=pos_list,
-                    attn_hidden_patch=baseline_patch,
-                    model_inputs=model_inputs,
-                    ref_tail_logits=ref_tail_logits,
-                )
-                entry.update({f"baseline_{k}": v for k, v in baseline_metrics.items()})
-                entry["delta_sanity_kl"] = entry["baseline_sanity_kl"] - entry["sanity_kl"]
-                entry["delta_student_nll"] = entry["baseline_student_nll"] - entry["student_nll"]
-                entry["delta_nll_gap"] = entry["baseline_nll_gap"] - entry["nll_gap"]
-                print(
-                    f"Baseline check layer {layer_idx}, budget {budget}, "
-                    f"KL: {baseline_metrics['sanity_kl']:.6f}, "
-                    f"teacher NLL: {baseline_metrics['teacher_nll']:.6f}, "
-                    f"student NLL: {baseline_metrics['student_nll']:.6f}, "
-                    f"NLL gap: {baseline_metrics['nll_gap']:.6f}"
-                )
-                print(
-                    f"Delta(alpha* vs baseline) layer {layer_idx}, budget {budget}: "
-                    f"dKL={entry['delta_sanity_kl']:.6f}, "
-                    f"dStudentNLL={entry['delta_student_nll']:.6f}, "
-                    f"dNLLGap={entry['delta_nll_gap']:.6f}"
-                )
-
         result[budget] = entry
 
     torch.save(result, save_path)
@@ -336,6 +220,18 @@ def main():
             ctx=ctx,
             args=args,
             layer_idx=layer_idx,
+            head_idx=head_idx,
+            pos_list=pos_list,
+            model_inputs=model_inputs,
+            ref_tail_logits=ref_tail_logits,
+        )
+
+    if args.baseline_check:
+        print("Running one-shot multi-layer baseline comparison...")
+        run_multilayer_baseline_check(
+            ctx=ctx,
+            args=args,
+            target_layers=layer_idx_list,
             head_idx=head_idx,
             pos_list=pos_list,
             model_inputs=model_inputs,

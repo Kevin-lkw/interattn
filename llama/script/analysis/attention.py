@@ -185,7 +185,6 @@ def gen_mask(
     mask = torch.zeros(len(pos_list), seq_len, device=device)
 
     visible = int(seq_len * budget)
-    print("visible tokens:", visible)
     print(f"visible {visible} tokens for strategy {strategy} with budget {budget}")
 
     if strategy == "recency":

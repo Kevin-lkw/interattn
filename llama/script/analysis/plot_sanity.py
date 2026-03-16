@@ -4,7 +4,21 @@ import matplotlib.pyplot as plt
 import torch
 
 
-VALID_METRICS = ["sanity_kl", "nll_gap", "teacher_nll", "student_nll", "nll_pair"]
+VALID_METRICS = [
+    "sanity_kl",
+    "nll_gap",
+    "teacher_nll",
+    "student_nll",
+    "nll_pair",
+    "baseline_sanity_kl",
+    "baseline_nll_gap",
+    "baseline_teacher_nll",
+    "baseline_student_nll",
+    "baseline_nll_pair",
+    "delta_sanity_kl",
+    "delta_student_nll",
+    "delta_nll_gap",
+]
 
 
 def parse_args():
@@ -164,11 +178,13 @@ def main():
             / args.loss_type
             / "result.pt"
         )
-        if args.metric == "nll_pair":
+        if args.metric in ["nll_pair", "baseline_nll_pair"]:
+            metric_a = "teacher_nll" if args.metric == "nll_pair" else "baseline_teacher_nll"
+            metric_b = "student_nll" if args.metric == "nll_pair" else "baseline_student_nll"
             budgets, teacher_vals, student_vals = load_layer_metric_pair(
                 result_path,
-                "teacher_nll",
-                "student_nll",
+                metric_a,
+                metric_b,
             )
             if not budgets:
                 print(
@@ -182,7 +198,7 @@ def main():
                 marker="o",
                 linewidth=2,
                 linestyle="--",
-                label=f"layer {layer_idx} teacher_nll",
+                label=f"layer {layer_idx} {metric_a}",
             )
             plt.plot(
                 budgets,
@@ -190,7 +206,7 @@ def main():
                 marker="o",
                 linewidth=2,
                 linestyle="-",
-                label=f"layer {layer_idx} student_nll",
+                label=f"layer {layer_idx} {metric_b}",
             )
             plotted_any = True
         else:
@@ -213,7 +229,7 @@ def main():
         plt.yscale("log")
 
     plt.xlabel("budget")
-    ylabel = "NLL" if args.metric == "nll_pair" else args.metric
+    ylabel = "NLL" if args.metric in ["nll_pair", "baseline_nll_pair"] else args.metric
     plt.ylabel(ylabel)
     plt.title(
         f"Sanity check curve: {args.metric} vs budget "

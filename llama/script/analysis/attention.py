@@ -144,6 +144,30 @@ def optimize_alpha_star(
     return alpha, p_alpha, p_teacher, losses
 
 
+def build_qk_routing_alpha(ctx, layer_idx, head_idx, pos_list, mask, device=None):
+    """Build baseline routing weights by applying original QK scores over the compressed KV mask."""
+    if device is None:
+        device = ctx.device
+
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+
+    qk_scores, _ = get_attention_map_after_rope(
+        ctx,
+        layer_idx,
+        causal=True,
+        dtype=torch.float32,
+        device=device,
+    )
+    qk_logits = qk_scores[head_idx][:, pos_list, :].to(torch.float32)
+    if qk_logits.shape != mask.shape:
+        raise ValueError(
+            f"Baseline QK logits shape {qk_logits.shape} does not match mask shape {mask.shape}."
+        )
+
+    return F.softmax(qk_logits + mask.to(torch.float32), dim=-1)
+
+
 def gen_mask(
     ctx,
     layer_idx,

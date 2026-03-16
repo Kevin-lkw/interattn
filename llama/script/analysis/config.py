@@ -119,6 +119,11 @@ def parse_args():
         action="store_true",
         help="Run full-model sanity check by reinjecting alpha* and reporting final KL",
     )
+    parser.add_argument(
+        "--baseline-check",
+        action="store_true",
+        help="Evaluate baseline routing (QK routing on compressed KV) for comparison with alpha*",
+    )
 
     return parser.parse_args()
 

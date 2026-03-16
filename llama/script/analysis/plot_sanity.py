@@ -18,12 +18,18 @@ def parse_args():
         choices=["logits_kl", "v_l2", "v_kl"],
         help="Loss type subdirectory to read from",
     )
-    parser.add_argument(
+    layer_group = parser.add_mutually_exclusive_group()
+    layer_group.add_argument(
         "--layers",
         type=int,
         nargs="+",
-        default=[5, 10, 15, 20, 25, 30],
+        default=None,
         help="Layer indices to plot",
+    )
+    layer_group.add_argument(
+        "--all-layers",
+        action="store_true",
+        help="Plot all layers that have result files",
     )
     parser.add_argument(
         "--metric",
@@ -110,6 +116,18 @@ def default_save_path(metric, dataset, strategy, loss_type):
     return out_dir / f"sanity_{metric}_{dataset}_{strategy}_{loss_type}.png"
 
 
+def discover_available_layers(result_root, dataset, strategy, loss_type):
+    layer_indices = []
+    for pt_path in result_root.glob(f"layer*/{dataset}/{strategy}/{loss_type}/result.pt"):
+        layer_dir_name = pt_path.parents[3].name
+        if not layer_dir_name.startswith("layer"):
+            continue
+        suffix = layer_dir_name[len("layer"):]
+        if suffix.isdigit():
+            layer_indices.append(int(suffix))
+    return sorted(set(layer_indices))
+
+
 def main():
     args = parse_args()
     
@@ -117,10 +135,27 @@ def main():
     llama_dir = script_dir.parent
     result_root = llama_dir / "result"
 
+    if args.all_layers:
+        target_layers = discover_available_layers(
+            result_root,
+            args.dataset,
+            args.strategy,
+            args.loss_type,
+        )
+        if not target_layers:
+            raise RuntimeError(
+                "--all-layers was set but no layer result files were found under "
+                f"{result_root} for ({args.dataset}, {args.strategy}, {args.loss_type})."
+            )
+    elif args.layers is None:
+        target_layers = [5, 10, 15, 20, 25, 30]
+    else:
+        target_layers = args.layers
+
     plt.figure(figsize=(10, 6))
     plotted_any = False
 
-    for layer_idx in args.layers:
+    for layer_idx in target_layers:
         result_path = (
             result_root
             / f"layer{layer_idx}"

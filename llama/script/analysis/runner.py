@@ -58,20 +58,15 @@ def validate_args_with_cache(ctx, args):
         )
 
 
-def resolve_layers(layer_tokens, num_hidden_layers):
-    tokens = [str(x).strip().lower() for x in layer_tokens]
-    if "all" in tokens:
+def resolve_layers(layer_indices, all_layers, num_hidden_layers):
+    if all_layers:
         return list(range(num_hidden_layers))
 
-    layers = []
-    for token in layer_tokens:
-        try:
-            layer_idx = int(token)
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid layer value '{token}'. Use integer indices or 'all'."
-            ) from exc
+    if layer_indices is None:
+        layer_indices = [5, 10, 15, 20, 25, 30]
 
+    layers = []
+    for layer_idx in layer_indices:
         if layer_idx < 0 or layer_idx >= num_hidden_layers:
             raise ValueError(
                 f"Layer index {layer_idx} out of range [0, {num_hidden_layers - 1}]"
@@ -201,7 +196,11 @@ def main():
     n_heads = ctx.model_config.num_attention_heads
     head_idx = list(range(n_heads))
     pos_list = list(range(args.seq_len - args.tail_len, args.seq_len))
-    layer_idx_list = resolve_layers(args.layers, ctx.model_config.num_hidden_layers)
+    layer_idx_list = resolve_layers(
+        args.layers,
+        args.all_layers,
+        ctx.model_config.num_hidden_layers,
+    )
 
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
     ctx.model.eval()

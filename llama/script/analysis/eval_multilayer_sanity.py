@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument(
         "--loss-type",
         type=str,
-        default="logits_kl",
+        default="v_l2",
         choices=["logits_kl", "v_l2", "v_kl"],
         help="Loss type subdirectory to read from",
     )
@@ -49,12 +49,18 @@ def parse_args():
     )
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--tail-len", type=int, default=64)
-    parser.add_argument(
+    layer_group = parser.add_mutually_exclusive_group()
+    layer_group.add_argument(
         "--layers",
         type=int,
         nargs="+",
-        default=[5, 10, 15, 20, 25, 30],
+        default=None,
         help="Layers to replace simultaneously",
+    )
+    layer_group.add_argument(
+        "--all-layers",
+        action="store_true",
+        help="Process all transformer layers",
     )
     parser.add_argument(
         "--budgets",
@@ -313,6 +319,13 @@ def main():
     validate_args_with_cache(ctx, args)
 
     ctx.model.eval()
+    if args.all_layers:
+        target_layers = list(range(ctx.model_config.num_hidden_layers))
+    elif args.layers is None:
+        target_layers = [5, 10, 15, 20, 25, 30]
+    else:
+        target_layers = args.layers
+
     n_heads = ctx.model_config.num_attention_heads
     head_idx = list(range(n_heads))
     pos_list = list(range(args.seq_len - args.tail_len, args.seq_len))
@@ -328,7 +341,7 @@ def main():
     result_root = llama_dir / "result"
 
     summary = {
-        "layers": args.layers,
+        "layers": target_layers,
         "dataset": args.dataset,
         "strategy": args.strategy,
         "loss_type": args.loss_type,
@@ -338,7 +351,7 @@ def main():
     for budget in args.budgets:
         layer_to_patch = {}
         try:
-            for layer_idx in args.layers:
+            for layer_idx in target_layers:
                 alpha = get_alpha_for_layer_budget(
                     result_root=result_root,
                     layer_idx=layer_idx,
@@ -370,7 +383,7 @@ def main():
         summary["budgets"][float(budget)] = metrics
 
         print(
-            f"[multi-layer] layers={args.layers}, budget={budget}, loss={args.loss_type}: "
+            f"[multi-layer] layers={target_layers}, budget={budget}, loss={args.loss_type}: "
             f"KL={metrics['sanity_kl']:.6f}, "
             f"teacher NLL={metrics['teacher_nll']:.6f}, "
             f"student NLL={metrics['student_nll']:.6f}, "
@@ -378,7 +391,7 @@ def main():
         )
 
     out_path = Path(args.output_path) if args.output_path else default_output_path(
-        args.dataset, args.strategy, args.loss_type, args.layers
+        args.dataset, args.strategy, args.loss_type, target_layers
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(summary, out_path)

@@ -76,12 +76,18 @@ def parse_args():
         choices=["logits_kl", "v_l2", "v_kl"],
         help="Training loss: logits-space KL, V-space L2, or V-space KL",
     )
-    parser.add_argument(
+    layer_group = parser.add_mutually_exclusive_group()
+    layer_group.add_argument(
         "--layers",
-        type=str,
+        type=int,
         nargs="+",
-        default=["5", "10", "15", "20", "25", "30"],
-        help="Layer indices to process, or use 'all' to run all layers",
+        default=None,
+        help="Layer indices to process",
+    )
+    layer_group.add_argument(
+        "--all-layers",
+        action="store_true",
+        help="Process all transformer layers",
     )
     parser.add_argument(
         "--budgets",

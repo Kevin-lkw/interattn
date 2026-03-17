@@ -166,16 +166,18 @@ def run_budget_online(
 
         layer_result = layer_results[layer_idx]
         budget_key = normalize_budget_key(layer_result, budget)
-        reuse_existing = False
+        patch_hidden = None
         if budget_key is not None:
             existing_entry = layer_result[budget_key]
-            if isinstance(existing_entry, dict) and existing_entry.get("optimized_online", False):
-                reuse_existing = True
+            if (
+                isinstance(existing_entry, dict)
+                and existing_entry.get("optimized_online", False)
+                and "patch_hidden" in existing_entry
+            ):
+                patch_hidden = existing_entry["patch_hidden"].to(ctx.device)
+                print(f"Layer {layer_idx}, budget {budget} already exists, reuse patch_hidden.")
 
-        if reuse_existing:
-            alpha, _ = unpack_result_entry(layer_result[budget_key])
-            print(f"Layer {layer_idx}, budget {budget} already exists, reuse alpha*.")
-        else:
+        if patch_hidden is None:
             mask = gen_mask(
                 ctx=layer_ctx,
                 layer_idx=layer_idx,
@@ -198,20 +200,20 @@ def run_budget_online(
                 device=ctx.device,
             )
             print(f"final loss for layer {layer_idx} with budget {budget}: {loss[-1]}")
+            patch_hidden = build_modified_attn_hidden(
+                ctx=layer_ctx,
+                layer_idx=layer_idx,
+                head_idx=head_idx,
+                pos_list=pos_list,
+                alpha=alpha,
+                device=ctx.device,
+            )
             layer_result[float(budget)] = {
-                "opt": (alpha, p_alpha, p_teacher, loss),
+                "patch_hidden": patch_hidden.detach().cpu(),
                 "loss_type": args.loss_type,
                 "optimized_online": True,
             }
 
-        patch_hidden = build_modified_attn_hidden(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            alpha=alpha,
-            device=ctx.device,
-        )
         layer_to_patch[layer_idx] = patch_hidden
 
     return layer_to_patch

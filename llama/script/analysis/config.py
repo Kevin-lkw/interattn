@@ -99,7 +99,7 @@ def parse_args():
     parser.add_argument(
         "--seq-len",
         type=int,
-        default=4096,
+        default=2048,
         help="Sequence length",
     )
     parser.add_argument(

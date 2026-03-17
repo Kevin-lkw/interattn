@@ -126,7 +126,17 @@ def normalize_budget_key(result_dict, target_budget, atol=1e-12):
     return None
 
 
-def get_alpha_for_layer_budget(result_root, layer_idx, dataset, strategy, loss_type, budget):
+def get_patch_hidden_for_layer_budget(
+    result_root,
+    layer_idx,
+    dataset,
+    strategy,
+    loss_type,
+    budget,
+    ctx=None,
+    head_idx=None,
+    pos_list=None,
+):
     result_path = result_root / f"layer{layer_idx}" / dataset / strategy / loss_type / "result.pt"
     if not result_path.exists():
         raise FileNotFoundError(f"Missing result file for layer {layer_idx}: {result_path}")
@@ -138,8 +148,23 @@ def get_alpha_for_layer_budget(result_root, layer_idx, dataset, strategy, loss_t
             f"Budget {budget} not found in layer {layer_idx} result. Existing: {list(result.keys())}"
         )
 
-    alpha, _ = unpack_result_entry(result[budget_key])
-    return alpha
+    entry = result[budget_key]
+    if isinstance(entry, dict) and "patch_hidden" in entry:
+        return entry["patch_hidden"]
+
+    if ctx is None or head_idx is None or pos_list is None:
+        raise ValueError(
+            "Legacy alpha entry found but runtime context is missing for conversion to patch_hidden."
+        )
+    alpha, _ = unpack_result_entry(entry)
+    return build_modified_attn_hidden(
+        ctx=ctx,
+        layer_idx=layer_idx,
+        head_idx=head_idx,
+        pos_list=pos_list,
+        alpha=alpha,
+        device=ctx.device,
+    )
 
 
 def run_with_multilayer_patches(ctx, layer_to_patch, pos_list, model_inputs):
@@ -352,23 +377,18 @@ def main():
         layer_to_patch = {}
         try:
             for layer_idx in target_layers:
-                alpha = get_alpha_for_layer_budget(
+                patch_hidden = get_patch_hidden_for_layer_budget(
                     result_root=result_root,
                     layer_idx=layer_idx,
                     dataset=args.dataset,
                     strategy=args.strategy,
                     loss_type=args.loss_type,
                     budget=budget,
-                )
-                patch_hidden = build_modified_attn_hidden(
                     ctx=ctx,
-                    layer_idx=layer_idx,
                     head_idx=head_idx,
                     pos_list=pos_list,
-                    alpha=alpha,
-                    device=ctx.device,
                 )
-                layer_to_patch[layer_idx] = patch_hidden
+                layer_to_patch[layer_idx] = patch_hidden.to(ctx.device)
         except (FileNotFoundError, KeyError, ValueError) as exc:
             print(f"[WARN] Skip budget {budget}: {exc}")
             continue

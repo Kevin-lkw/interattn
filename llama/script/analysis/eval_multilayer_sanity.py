@@ -328,7 +328,7 @@ def main():
 
     n_heads = ctx.model_config.num_attention_heads
     head_idx = list(range(n_heads))
-    pos_list = list(range(args.seq_len - args.tail_len, args.seq_len))
+    pos_list = list(range(args.seq_len))
 
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
     labels = get_tail_labels(ctx, pos_list, ctx.device)

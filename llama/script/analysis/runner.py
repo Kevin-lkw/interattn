@@ -86,10 +86,6 @@ def validate_args_with_cache(ctx, args):
         raise ValueError(
             f"--seq-len ({args.seq_len}) exceeds prepared sequence length ({input_seq_len})."
         )
-    if args.tail_len > args.seq_len:
-        raise ValueError(
-            f"--tail-len ({args.tail_len}) must be <= --seq-len ({args.seq_len})."
-        )
 
 
 def resolve_layers(layer_indices, all_layers, num_hidden_layers):
@@ -258,7 +254,7 @@ def main():
 
     n_heads = ctx.model_config.num_attention_heads
     head_idx = list(range(n_heads))
-    pos_list = list(range(args.seq_len - args.tail_len, args.seq_len))
+    pos_list = list(range(args.seq_len))
     layer_idx_list = resolve_layers(
         args.layers,
         args.all_layers,

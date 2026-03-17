@@ -103,12 +103,6 @@ def parse_args():
         help="Sequence length",
     )
     parser.add_argument(
-        "--tail-len",
-        type=int,
-        default=4096,
-        help="Optimize positions from [seq_len-tail_len, seq_len)",
-    )
-    parser.add_argument(
         "--sanity-check",
         action="store_true",
         help="Run full-model sanity check by reinjecting alpha* and reporting final KL",

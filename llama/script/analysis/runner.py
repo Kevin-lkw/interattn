@@ -309,14 +309,13 @@ def main():
 
     save_layer_results(layer_idx_list, layer_results, args)
 
-    if args.baseline_check:
-        print("Running one-shot multi-layer baseline comparison...")
-        run_multilayer_baseline_check(
-            ctx=ctx,
-            args=args,
-            target_layers=layer_idx_list,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            model_inputs=model_inputs,
-            ref_tail_logits=ref_tail_logits,
-        )
+    print("Running one-shot multi-layer baseline comparison...")
+    run_multilayer_baseline_check(
+        ctx=ctx,
+        args=args,
+        target_layers=layer_idx_list,
+        head_idx=head_idx,
+        pos_list=pos_list,
+        model_inputs=model_inputs,
+        ref_tail_logits=ref_tail_logits,
+    )

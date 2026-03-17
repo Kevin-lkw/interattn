@@ -54,6 +54,14 @@ def run_multilayer_baseline_check(
     model_inputs,
     ref_tail_logits,
 ):
+    # if result already exists, skip computation and directly load for summary printing
+    out_path = default_output_path(args.dataset, args.strategy, args.loss_type, target_layers)
+    if out_path.exists():
+        print(f"Found existing baseline comparison result at {out_path}, loading...")
+        summary = torch.load(out_path)
+        print("Loaded summary:")
+        print(summary)
+        return summary, out_path
     labels = get_tail_labels(ctx, pos_list, ctx.device)
 
     summary = {
@@ -131,7 +139,6 @@ def run_multilayer_baseline_check(
             f"NLL gap={baseline_metrics['nll_gap']:.6f}"
         )
 
-    out_path = default_output_path(args.dataset, args.strategy, args.loss_type, target_layers)
     torch.save(summary, out_path)
     print(f"Saved multi-layer baseline comparison to: {out_path}")
 

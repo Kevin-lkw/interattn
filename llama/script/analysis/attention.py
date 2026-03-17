@@ -175,7 +175,6 @@ def gen_mask(
     head_idx,
     strategy,
     budget,
-    prompt_len=4032,
     seq_len=4096,
 ):
     """
@@ -233,9 +232,6 @@ def gen_mask(
         for out_h, head in enumerate(head_idx):
             attention_score_head = attention_score[head]  # [seq_len, seq_len]
             accumulated_attention = torch.zeros(seq_len, device=device)
-
-            if prompt_len > 0:
-                accumulated_attention += attention_score_head[:prompt_len, :].sum(dim=0)
 
             for i, pos in enumerate(pos_list):
                 total_available = pos + 1

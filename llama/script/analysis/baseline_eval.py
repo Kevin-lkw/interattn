@@ -85,7 +85,6 @@ def run_multilayer_baseline_check(
                     head_idx=head_idx,
                     strategy=args.strategy,
                     budget=budget,
-                    prompt_len=args.prompt_len,
                     seq_len=args.seq_len,
                 )
                 alpha_baseline = build_qk_routing_alpha(

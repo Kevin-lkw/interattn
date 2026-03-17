@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument(
         "--lr",
         type=float,
-        default=0.05,
+        default=0.1,
         help="Learning rate",
     )
     parser.add_argument(
@@ -105,14 +105,8 @@ def parse_args():
     parser.add_argument(
         "--tail-len",
         type=int,
-        default=64,
+        default=4096,
         help="Optimize positions from [seq_len-tail_len, seq_len)",
-    )
-    parser.add_argument(
-        "--prompt-len",
-        type=int,
-        default=4032,
-        help="Prompt length used in h2o",
     )
     parser.add_argument(
         "--sanity-check",

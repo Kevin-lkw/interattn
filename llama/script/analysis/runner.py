@@ -187,7 +187,6 @@ def run_budget_online(
                 head_idx=head_idx,
                 strategy=args.strategy,
                 budget=budget,
-                prompt_len=args.prompt_len,
                 seq_len=args.seq_len,
             )
             print(f"Optimizing alpha_star for layer {layer_idx}, budget {budget}")

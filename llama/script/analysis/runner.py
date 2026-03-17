@@ -270,13 +270,11 @@ def main():
     ctx.model.eval()
 
     ref_tail_logits = None
-    if args.baseline_check and not args.sanity_check:
-        raise ValueError("--baseline-check requires --sanity-check because it compares final logits/NLL.")
-
-    if args.sanity_check:
+    labels = None
+    if args.sanity_check or args.baseline_check:
         with torch.no_grad():
             ref_tail_logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
-        print("Reference logits computed for sanity check.")
+        print("Reference logits computed for check routines.")
         labels = get_tail_labels(ctx, pos_list, ctx.device)
 
     layer_results = load_or_init_layer_results(layer_idx_list, args)

@@ -16,6 +16,13 @@ def parse_args():
     parser.add_argument("--strategy", type=str, default="attention_topk")
     parser.add_argument("--loss-type", type=str, default="v_l2")
     parser.add_argument(
+        "--metric",
+        type=str,
+        default="nll_gap",
+        choices=["nll_gap", "sanity_kl"],
+        help="Metric to plot on y-axis.",
+    )
+    parser.add_argument(
         "--optimal-path",
         type=str,
         default=None,
@@ -78,18 +85,21 @@ def normalize_budget_metrics(raw):
     return normalized
 
 
-def metric_to_stderr(metric: dict, token_count: int | None):
-    if "nll_gap_stderr" in metric:
-        return float(metric["nll_gap_stderr"])
-    if "nll_gap_std" in metric:
-        std = float(metric["nll_gap_std"])
+def metric_to_stderr(metric: dict, metric_key: str, token_count: int | None):
+    stderr_key = f"{metric_key}_stderr"
+    std_key = f"{metric_key}_std"
+
+    if stderr_key in metric:
+        return float(metric[stderr_key])
+    if std_key in metric:
+        std = float(metric[std_key])
         if token_count is not None and token_count > 0:
             return std / math.sqrt(token_count)
         return std
     return 0.0
 
 
-def to_series(metrics_by_budget: dict, token_count: int | None, name: str):
+def to_series(metrics_by_budget: dict, metric_key: str, token_count: int | None, name: str):
     xs = []
     ys = []
     es = []
@@ -101,22 +111,33 @@ def to_series(metrics_by_budget: dict, token_count: int | None, name: str):
             continue
 
         metric = metrics_by_budget[budget]
-        if "nll_gap" not in metric:
-            raise KeyError(f"Missing 'nll_gap' in {name} metrics for budget={budget}")
+        if metric_key not in metric:
+            raise KeyError(f"Missing '{metric_key}' in {name} metrics for budget={budget}")
 
         xs.append(float(budget))
-        ys.append(float(metric["nll_gap"]))
-        es.append(metric_to_stderr(metric, token_count))
+        ys.append(float(metric[metric_key]))
+        es.append(metric_to_stderr(metric, metric_key, token_count))
 
     if dropped_non_positive > 0:
         print(f"[WARN] {name}: dropped {dropped_non_positive} non-positive budgets for log-scale x-axis.")
     return xs, ys, es
 
 
-def default_paths(dataset: str, strategy: str, loss_type: str):
+def print_metric_values(metric_name: str, x_opt, y_opt, x_base, y_base):
+    print(f"\nMetric: {metric_name}")
+    print("[Optimal routing]")
+    for budget, value in zip(x_opt, y_opt):
+        print(f"  budget={budget:g}, value={value:.8f}, abs={abs(value):.8f}")
+
+    print("[Baseline routing]")
+    for budget, value in zip(x_base, y_base):
+        print(f"  budget={budget:g}, value={value:.8f}, abs={abs(value):.8f}")
+
+
+def default_paths(dataset: str, strategy: str, loss_type: str, metric: str):
     optimal = f"../result/{dataset}/{strategy}/{loss_type}/layer_all/budget_to_final_metrics.pt"
     baseline = f"../result/{dataset}/{strategy}/qk_routing.pt"
-    output = f"../result/{dataset}/{strategy}/{loss_type}/layer_all/nll_gap_vs_budget_compare.png"
+    output = f"../result/{dataset}/{strategy}/{loss_type}/layer_all/{metric}_vs_budget_compare.png"
     return optimal, baseline, output
 
 
@@ -127,6 +148,7 @@ def main():
         args.dataset,
         args.strategy,
         args.loss_type,
+        args.metric,
     )
 
     optimal_path = args.optimal_path if args.optimal_path else default_optimal
@@ -139,8 +161,10 @@ def main():
     optimal_metrics = normalize_budget_metrics(optimal_raw)
     baseline_metrics = normalize_budget_metrics(baseline_raw)
 
-    x_opt, y_opt, e_opt = to_series(optimal_metrics, args.token_count, "optimal")
-    x_base, y_base, e_base = to_series(baseline_metrics, args.token_count, "baseline")
+    x_opt, y_opt, e_opt = to_series(optimal_metrics, args.metric, args.token_count, "optimal")
+    x_base, y_base, e_base = to_series(baseline_metrics, args.metric, args.token_count, "baseline")
+
+    print_metric_values(args.metric, x_opt, y_opt, x_base, y_base)
 
     if len(x_opt) == 0 and len(x_base) == 0:
         raise ValueError("No valid positive budgets found in either optimal or baseline results.")
@@ -173,14 +197,18 @@ def main():
 
     ax.set_xscale("log")
     ax.set_xlabel("Budget (log scale)")
-    ax.set_ylabel("NLL gap (student - teacher)")
+    if args.metric == "sanity_kl":
+        ax.set_ylabel("KL divergence")
+    else:
+        ax.set_ylabel("NLL gap (student - teacher)")
     ax.grid(True, linestyle="--", alpha=0.35)
     ax.legend()
 
     if args.title:
         ax.set_title(args.title)
     else:
-        ax.set_title(f"NLL gap vs Budget ({args.dataset}, {args.strategy})")
+        title_name = "KL divergence" if args.metric == "sanity_kl" else "NLL gap"
+        ax.set_title(f"{title_name} vs Budget ({args.dataset}, {args.strategy})")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=args.dpi)

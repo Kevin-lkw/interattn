@@ -23,25 +23,37 @@ def run_multilayer_baseline_check(
     model_inputs,
     ref_tail_logits,
 ):
-    # if result already exists, skip computation and directly load for summary printing
     out_path  = Path(f"../result/{args.dataset}/{args.strategy}/qk_routing.pt")
-    
+
     if out_path.exists():
         print(f"Found existing baseline comparison result at {out_path}, loading...")
         summary = torch.load(out_path)
-        print("Loaded summary:")
+    else:
+        summary = {
+            "layers": target_layers,
+            "dataset": args.dataset,
+            "strategy": args.strategy,
+            "budgets": {},
+        }
+
+    existing_budget_keys = summary.get("budgets", {}).keys()
+    existing_budgets = set()
+    for key in existing_budget_keys:
+        try:
+            existing_budgets.add(float(key))
+        except (TypeError, ValueError):
+            continue
+
+    missing_budgets = [budget for budget in args.budgets if float(budget) not in existing_budgets]
+    if not missing_budgets:
+        print("No new budgets to evaluate. Reusing existing baseline summary.")
         print(summary)
         return summary, out_path
+
     labels = get_tail_labels(ctx, pos_list, ctx.device)
 
-    summary = {
-        "layers": target_layers,
-        "dataset": args.dataset,
-        "strategy": args.strategy,
-        "budgets": {},
-    }
-
-    for budget in args.budgets:
+    for budget in missing_budgets:
+        budget_key = float(budget)
         baseline_layer_patch = {}
 
         try:
@@ -93,9 +105,9 @@ def run_multilayer_baseline_check(
 
         baseline_metrics = compute_metrics(ref_tail_logits, baseline_tail_logits, labels)
 
-        summary["budgets"][float(budget)] = baseline_metrics
+        summary["budgets"][budget_key] = baseline_metrics
 
     torch.save(summary, out_path)
-    print(f"Saved multi-layer baseline comparison to: {out_path}")
+    print(f"Saved/updated multi-layer baseline comparison to: {out_path}")
 
     return summary, out_path

@@ -9,9 +9,8 @@ from .online_routing import (
     capture_layer_artifacts,
     run_with_multilayer_patches,
 )
-from .sanity import build_modified_attn_hidden, get_tail_labels
+from .sanity import build_modified_attn_hidden, get_tail_labels, compute_metrics
 
-from .runner import compute_metrics
 
 
 
@@ -25,7 +24,8 @@ def run_multilayer_baseline_check(
     ref_tail_logits,
 ):
     # if result already exists, skip computation and directly load for summary printing
-    out_path  = f"../result/{args.dataset}/{args.strategy}/qk_routing.pt"
+    out_path  = Path(f"../result/{args.dataset}/{args.strategy}/qk_routing.pt")
+    
     if out_path.exists():
         print(f"Found existing baseline comparison result at {out_path}, loading...")
         summary = torch.load(out_path)

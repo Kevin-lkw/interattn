@@ -20,6 +20,7 @@ from .sanity import (
     build_modified_attn_hidden,
     get_tail_labels,
     move_model_inputs_to_device,
+    compute_metrics,
 )
 
 
@@ -141,6 +142,7 @@ def save_results(layer_idx_list, layer_results, budget_to_final_metrics, args):
         torch.save(layer_results[layer_idx], save_path)
         print(f"Optimization completed and results saved to {save_path}")
     save_path = f"../result/{args.dataset}/{args.strategy}/{args.loss_type}/layer_all/budget_to_final_metrics.pt"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(budget_to_final_metrics, save_path)
 
 def run_budget_online(
@@ -225,40 +227,6 @@ def run_budget_online(
         print("estimated time for this budget: ", f"{(t1 - t0) * (len(layer_idx_list)) / 60:.2f} minutes")
     return layer_to_patch
 
-def compute_metrics(ref_tail_logits, student_tail_logits, labels, unbiased=False):
-    # [*, vocab]
-    p_teacher = F.softmax(ref_tail_logits, dim=-1)
-    logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
-    logp_student = F.log_softmax(student_tail_logits, dim=-1)
-
-    # 逐 token KL: shape = labels.shape
-    kl_per_token = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1)
-
-    # 逐 token NLL
-    teacher_nll_per_token = F.cross_entropy(
-        ref_tail_logits.reshape(-1, ref_tail_logits.size(-1)),
-        labels.reshape(-1),
-        reduction="none",
-    ).reshape(labels.shape)
-
-    student_nll_per_token = F.cross_entropy(
-        student_tail_logits.reshape(-1, student_tail_logits.size(-1)),
-        labels.reshape(-1),
-        reduction="none",
-    ).reshape(labels.shape)
-
-    nll_gap_per_token = student_nll_per_token - teacher_nll_per_token
-
-    return {
-        "sanity_kl": kl_per_token.mean().item(),
-        "sanity_kl_std": kl_per_token.std(unbiased=unbiased).item(),
-        "teacher_nll": teacher_nll_per_token.mean().item(),
-        "teacher_nll_std": teacher_nll_per_token.std(unbiased=unbiased).item(),
-        "student_nll": student_nll_per_token.mean().item(),
-        "student_nll_std": student_nll_per_token.std(unbiased=unbiased).item(),
-        "nll_gap": nll_gap_per_token.mean().item(),
-        "nll_gap_std": nll_gap_per_token.std(unbiased=unbiased).item(),
-    }
 
 def main():
     set_seed(42)
@@ -284,11 +252,11 @@ def main():
 
     ref_tail_logits = None
     labels = None
-    if args.sanity_check or args.baseline_check:
-        with torch.no_grad():
-            ref_tail_logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
-        print("Reference logits computed for check routines.")
-        labels = get_tail_labels(ctx, pos_list, ctx.device)
+    
+    with torch.no_grad():
+        ref_tail_logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
+    print("Reference logits computed for check routines.")
+    labels = get_tail_labels(ctx, pos_list, ctx.device)
 
     layer_results = load_or_init_layer_results(layer_idx_list, args)
     budget_to_final_metrics = {}

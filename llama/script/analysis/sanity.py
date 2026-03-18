@@ -1,6 +1,41 @@
 import torch
 from torch.nn import functional as F
 
+def compute_metrics(ref_tail_logits, student_tail_logits, labels, unbiased=False):
+    # [*, vocab]
+    p_teacher = F.softmax(ref_tail_logits, dim=-1)
+    logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
+    logp_student = F.log_softmax(student_tail_logits, dim=-1)
+
+    # 逐 token KL: shape = labels.shape
+    kl_per_token = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1)
+
+    # 逐 token NLL
+    teacher_nll_per_token = F.cross_entropy(
+        ref_tail_logits.reshape(-1, ref_tail_logits.size(-1)),
+        labels.reshape(-1),
+        reduction="none",
+    ).reshape(labels.shape)
+
+    student_nll_per_token = F.cross_entropy(
+        student_tail_logits.reshape(-1, student_tail_logits.size(-1)),
+        labels.reshape(-1),
+        reduction="none",
+    ).reshape(labels.shape)
+
+    nll_gap_per_token = student_nll_per_token - teacher_nll_per_token
+
+    return {
+        "sanity_kl": kl_per_token.mean().item(),
+        "sanity_kl_std": kl_per_token.std(unbiased=unbiased).item(),
+        "teacher_nll": teacher_nll_per_token.mean().item(),
+        "teacher_nll_std": teacher_nll_per_token.std(unbiased=unbiased).item(),
+        "student_nll": student_nll_per_token.mean().item(),
+        "student_nll_std": student_nll_per_token.std(unbiased=unbiased).item(),
+        "nll_gap": nll_gap_per_token.mean().item(),
+        "nll_gap_std": nll_gap_per_token.std(unbiased=unbiased).item(),
+    }
+
 
 def move_model_inputs_to_device(raw_inputs, device):
     if isinstance(raw_inputs, dict):

@@ -93,13 +93,13 @@ def parse_args():
         "--budgets",
         type=float,
         nargs="+",
-        default=[0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1],
+        default=[0.05, 0.1, 0.25, 0.5, 1],
         help="Budget list",
     )
     parser.add_argument(
         "--seq-len",
         type=int,
-        default=2048,
+        default=512,
         help="Sequence length",
     )
     parser.add_argument(

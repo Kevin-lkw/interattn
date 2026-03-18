@@ -132,11 +132,13 @@ def optimize_alpha_star(
             logp_student_v = F.log_softmax(V_new.float(), dim=-1)
             loss = (p_teacher_v * (logp_teacher_v - logp_student_v)).sum(dim=-1).mean()
 
-        losses.append(loss.item())
+        
         if step % 100 == 0:
-            print("step", step, "loss:", loss.item())
+            loss_v = loss.detach().float().cpu().item()
+            losses.append((step, loss_v))
+            print("step", step, "loss:", loss_v)
 
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
 

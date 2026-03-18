@@ -1,4 +1,5 @@
 import os
+import time
 
 import torch
 from datasets import load_dataset
@@ -155,6 +156,8 @@ def run_budget_online(
     layer_to_patch = {}
 
     for layer_idx in layer_idx_list:
+        import time
+        t0 = time.time()
         artifacts = capture_layer_artifacts(
             ctx=ctx,
             layer_idx=layer_idx,
@@ -215,7 +218,9 @@ def run_budget_online(
             }
 
         layer_to_patch[layer_idx] = patch_hidden
-
+        t1 = time.time()
+        print(f"Layer {layer_idx} done for budget {budget} in {t1 - t0:.2f} seconds.")
+        print("estimated time for this budget: ", f"{(t1 - t0) * (len(layer_idx_list)) / 60:.2f} minutes")
     return layer_to_patch
 
 

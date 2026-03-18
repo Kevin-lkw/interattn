@@ -94,19 +94,3 @@ def has_full_sanity_metrics(entry):
     required_keys = ["sanity_kl", "teacher_nll", "student_nll", "nll_gap"]
     return all(key in entry for key in required_keys)
 
-
-def unpack_result_entry(entry):
-    if isinstance(entry, dict):
-        opt_blob = entry.get("opt")
-        if isinstance(opt_blob, (list, tuple)) and len(opt_blob) >= 1:
-            alpha = opt_blob[0]
-        else:
-            raise ValueError("Result entry dict exists but missing valid 'opt' payload.")
-        return alpha, entry
-
-    if isinstance(entry, (list, tuple)) and len(entry) >= 1:
-        alpha = entry[0]
-        wrapped = {"opt": entry}
-        return alpha, wrapped
-
-    raise ValueError(f"Unsupported result entry type: {type(entry)}")

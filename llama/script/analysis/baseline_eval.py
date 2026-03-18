@@ -11,38 +11,8 @@ from .online_routing import (
 )
 from .sanity import build_modified_attn_hidden, get_tail_labels
 
+from .runner import compute_metrics
 
-def compute_metrics(ref_tail_logits, student_tail_logits, labels):
-    p_teacher = F.softmax(ref_tail_logits, dim=-1)
-    logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
-    logp_student = F.log_softmax(student_tail_logits, dim=-1)
-    kl = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1).mean().item()
-
-    teacher_nll = F.cross_entropy(
-        ref_tail_logits.reshape(-1, ref_tail_logits.size(-1)),
-        labels.reshape(-1),
-        reduction="mean",
-    ).item()
-    student_nll = F.cross_entropy(
-        student_tail_logits.reshape(-1, student_tail_logits.size(-1)),
-        labels.reshape(-1),
-        reduction="mean",
-    ).item()
-
-    return {
-        "sanity_kl": kl,
-        "teacher_nll": teacher_nll,
-        "student_nll": student_nll,
-        "nll_gap": student_nll - teacher_nll,
-    }
-
-
-def default_output_path(dataset, strategy, loss_type, layers):
-    llama_dir = Path(__file__).resolve().parent.parent.parent
-    out_dir = llama_dir / "result" / "multilayer" / dataset / strategy / loss_type
-    out_dir.mkdir(parents=True, exist_ok=True)
-    layer_tag = "-".join(str(x) for x in layers)
-    return out_dir / f"layers_{layer_tag}_baseline_compare.pt"
 
 
 def run_multilayer_baseline_check(
@@ -55,7 +25,7 @@ def run_multilayer_baseline_check(
     ref_tail_logits,
 ):
     # if result already exists, skip computation and directly load for summary printing
-    out_path = default_output_path(args.dataset, args.strategy, args.loss_type, target_layers)
+    out_path  = f"../result/{args.dataset}/{args.strategy}/qk_routing.pt"
     if out_path.exists():
         print(f"Found existing baseline comparison result at {out_path}, loading...")
         summary = torch.load(out_path)
@@ -68,7 +38,6 @@ def run_multilayer_baseline_check(
         "layers": target_layers,
         "dataset": args.dataset,
         "strategy": args.strategy,
-        "loss_type": args.loss_type,
         "budgets": {},
     }
 
@@ -124,20 +93,7 @@ def run_multilayer_baseline_check(
 
         baseline_metrics = compute_metrics(ref_tail_logits, baseline_tail_logits, labels)
 
-        summary["budgets"][float(budget)] = {
-            "baseline_sanity_kl": baseline_metrics["sanity_kl"],
-            "baseline_teacher_nll": baseline_metrics["teacher_nll"],
-            "baseline_student_nll": baseline_metrics["student_nll"],
-            "baseline_nll_gap": baseline_metrics["nll_gap"],
-        }
-
-        print(
-            f"[baseline multi-layer] layers={target_layers}, budget={budget}: "
-            f"KL={baseline_metrics['sanity_kl']:.6f}, "
-            f"teacher NLL={baseline_metrics['teacher_nll']:.6f}, "
-            f"student NLL={baseline_metrics['student_nll']:.6f}, "
-            f"NLL gap={baseline_metrics['nll_gap']:.6f}"
-        )
+        summary["budgets"][float(budget)] = baseline_metrics
 
     torch.save(summary, out_path)
     print(f"Saved multi-layer baseline comparison to: {out_path}")

@@ -1,6 +1,7 @@
 import os
 import time
 
+from numpy import save
 import torch
 from datasets import load_dataset
 from torch.nn import functional as F
@@ -19,7 +20,6 @@ from .sanity import (
     build_modified_attn_hidden,
     get_tail_labels,
     move_model_inputs_to_device,
-    unpack_result_entry,
 )
 
 
@@ -108,7 +108,7 @@ def resolve_layers(layer_indices, all_layers, num_hidden_layers):
 
 
 def get_result_path(layer_idx, dataset, strategy, loss_type):
-    return f"../result/layer{layer_idx}/{dataset}/{strategy}/{loss_type}/result.pt"
+    return f"../result/{dataset}/{strategy}/{loss_type}/layer{layer_idx}/result.pt"
 
 
 def normalize_budget_key(result_dict, target_budget, atol=1e-12):
@@ -135,12 +135,13 @@ def load_or_init_layer_results(layer_idx_list, args):
     return layer_results
 
 
-def save_layer_results(layer_idx_list, layer_results, args):
+def save_results(layer_idx_list, layer_results, budget_to_final_metrics, args):
     for layer_idx in layer_idx_list:
         save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
         torch.save(layer_results[layer_idx], save_path)
         print(f"Optimization completed and results saved to {save_path}")
-
+    save_path = f"../result/{args.dataset}/{args.strategy}/{args.loss_type}/layer_all/budget_to_final_metrics.pt"
+    torch.save(budget_to_final_metrics, save_path)
 
 def run_budget_online(
     ctx,
@@ -213,6 +214,7 @@ def run_budget_online(
             )
             layer_result[float(budget)] = {
                 "patch_hidden": patch_hidden.detach().cpu(),
+                "loss": loss,
                 "loss_type": args.loss_type,
                 "optimized_online": True,
             }
@@ -223,31 +225,40 @@ def run_budget_online(
         print("estimated time for this budget: ", f"{(t1 - t0) * (len(layer_idx_list)) / 60:.2f} minutes")
     return layer_to_patch
 
-
-def compute_metrics(ref_tail_logits, student_tail_logits, labels):
+def compute_metrics(ref_tail_logits, student_tail_logits, labels, unbiased=False):
+    # [*, vocab]
     p_teacher = F.softmax(ref_tail_logits, dim=-1)
     logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
     logp_student = F.log_softmax(student_tail_logits, dim=-1)
-    kl = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1).mean().item()
 
-    teacher_nll = F.cross_entropy(
+    # 逐 token KL: shape = labels.shape
+    kl_per_token = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1)
+
+    # 逐 token NLL
+    teacher_nll_per_token = F.cross_entropy(
         ref_tail_logits.reshape(-1, ref_tail_logits.size(-1)),
         labels.reshape(-1),
-        reduction="mean",
-    ).item()
-    student_nll = F.cross_entropy(
+        reduction="none",
+    ).reshape(labels.shape)
+
+    student_nll_per_token = F.cross_entropy(
         student_tail_logits.reshape(-1, student_tail_logits.size(-1)),
         labels.reshape(-1),
-        reduction="mean",
-    ).item()
+        reduction="none",
+    ).reshape(labels.shape)
+
+    nll_gap_per_token = student_nll_per_token - teacher_nll_per_token
 
     return {
-        "sanity_kl": kl,
-        "teacher_nll": teacher_nll,
-        "student_nll": student_nll,
-        "nll_gap": student_nll - teacher_nll,
+        "sanity_kl": kl_per_token.mean().item(),
+        "sanity_kl_std": kl_per_token.std(unbiased=unbiased).item(),
+        "teacher_nll": teacher_nll_per_token.mean().item(),
+        "teacher_nll_std": teacher_nll_per_token.std(unbiased=unbiased).item(),
+        "student_nll": student_nll_per_token.mean().item(),
+        "student_nll_std": student_nll_per_token.std(unbiased=unbiased).item(),
+        "nll_gap": nll_gap_per_token.mean().item(),
+        "nll_gap_std": nll_gap_per_token.std(unbiased=unbiased).item(),
     }
-
 
 def main():
     set_seed(42)
@@ -295,24 +306,22 @@ def main():
             layer_results=layer_results,
         )
 
-        if args.sanity_check:
-            student_tail_logits = run_with_multilayer_patches(
-                ctx=ctx,
-                layer_to_patch=final_layer_patch,
-                pos_list=pos_list,
-                model_inputs=model_inputs,
-            )
-            final_metrics = compute_metrics(ref_tail_logits, student_tail_logits, labels)
-            budget_to_final_metrics[float(budget)] = final_metrics
-            print(
-                f"[online sanity] budget={budget}: "
-                f"KL={final_metrics['sanity_kl']:.6f}, "
-                f"teacher NLL={final_metrics['teacher_nll']:.6f}, "
-                f"student NLL={final_metrics['student_nll']:.6f}, "
-                f"NLL gap={final_metrics['nll_gap']:.6f}"
-            )
-
-    save_layer_results(layer_idx_list, layer_results, args)
+        student_tail_logits = run_with_multilayer_patches(
+            ctx=ctx,
+            layer_to_patch=final_layer_patch,
+            pos_list=pos_list,
+            model_inputs=model_inputs,
+        )
+        final_metrics = compute_metrics(ref_tail_logits, student_tail_logits, labels)
+        budget_to_final_metrics[float(budget)] = final_metrics
+        print(
+            f"[online sanity] budget={budget}: "
+            f"KL={final_metrics['sanity_kl']:.6f}, "
+            f"teacher NLL={final_metrics['teacher_nll']:.6f}, "
+            f"student NLL={final_metrics['student_nll']:.6f}, "
+            f"NLL gap={final_metrics['nll_gap']:.6f}"
+        )
+    save_results(layer_idx_list, layer_results, budget_to_final_metrics, args)
 
     print("Running one-shot multi-layer baseline comparison...")
     run_multilayer_baseline_check(

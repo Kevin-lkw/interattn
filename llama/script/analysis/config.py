@@ -102,11 +102,6 @@ def parse_args():
         default=512,
         help="Sequence length",
     )
-    parser.add_argument(
-        "--sanity-check",
-        action="store_true",
-        help="Run full-model sanity check by reinjecting alpha* and reporting final KL",
-    )
     return parser.parse_args()
 
 

@@ -31,7 +31,7 @@ def parse_args():
         "--metric",
         type=str,
         default="nll_gap",
-        choices=["nll_gap", "sanity_kl"],
+        choices=["nll_gap", "sanity_kl", "student_nll", "student_ppl", "ppl_ratio"],
         help="Metric to plot on y-axis.",
     )
     parser.add_argument(
@@ -75,7 +75,7 @@ def parse_args():
         "--budgets",
         type=float,
         nargs="+",
-        default=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+        default=[ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
         help="Budgets to include in the plot. Defaults to a fixed preset.",
     )
     parser.add_argument("--show", action="store_true")
@@ -116,6 +116,36 @@ def metric_to_stderr(metric: dict, metric_key: str, token_count: int | None):
             return std / math.sqrt(token_count)
         return std
     return 0.0
+
+
+def metric_value_and_stderr(metric: dict, metric_key: str, token_count: int | None):
+    if metric_key in {"nll_gap", "sanity_kl", "student_nll"}:
+        if metric_key not in metric:
+            raise KeyError(f"Missing '{metric_key}' in metrics entry")
+        value = float(metric[metric_key])
+        stderr = metric_to_stderr(metric, metric_key, token_count)
+        return value, stderr
+
+    if metric_key == "student_ppl":
+        if "student_nll" not in metric:
+            raise KeyError("Missing 'student_nll' for student_ppl conversion")
+        nll = float(metric["student_nll"])
+        ppl = math.exp(nll)
+        nll_stderr = metric_to_stderr(metric, "student_nll", token_count)
+        # Delta method: y=exp(x), so sigma_y ~= exp(x)*sigma_x.
+        ppl_stderr = ppl * nll_stderr
+        return ppl, ppl_stderr
+
+    if metric_key == "ppl_ratio":
+        if "nll_gap" not in metric:
+            raise KeyError("Missing 'nll_gap' for ppl_ratio conversion")
+        nll_gap = float(metric["nll_gap"])
+        ratio = math.exp(nll_gap)
+        nll_gap_stderr = metric_to_stderr(metric, "nll_gap", token_count)
+        ratio_stderr = ratio * nll_gap_stderr
+        return ratio, ratio_stderr
+
+    raise ValueError(f"Unsupported metric '{metric_key}'")
 
 
 def find_matching_budget_key(metrics_by_budget: dict, requested_budget: float):
@@ -160,12 +190,11 @@ def to_series(
                 continue
 
         metric = metrics_by_budget[budget_key]
-        if metric_key not in metric:
-            raise KeyError(f"Missing '{metric_key}' in {name} metrics for budget={budget}")
+        value, stderr = metric_value_and_stderr(metric, metric_key, token_count)
 
         xs.append(float(budget_key))
-        ys.append(float(metric[metric_key]))
-        es.append(metric_to_stderr(metric, metric_key, token_count))
+        ys.append(value)
+        es.append(stderr)
 
     if dropped_non_positive > 0:
         print(f"[WARN] {name}: dropped {dropped_non_positive} non-positive budgets for log-scale x-axis.")
@@ -313,6 +342,14 @@ def main():
     ax.set_xlabel("Budget (log scale)")
     if args.metric == "sanity_kl":
         ax.set_ylabel("KL divergence")
+    elif args.metric == "student_nll":
+        ax.set_ylabel("Student NLL")
+    elif args.metric == "student_ppl":
+        ax.set_ylabel("Student PPL")
+        ax.set_yscale("log")
+    elif args.metric == "ppl_ratio":
+        ax.set_ylabel("PPL ratio (student / teacher)")
+        ax.set_yscale("log")
     else:
         ax.set_ylabel("NLL gap (student - teacher)")
     ax.grid(True, linestyle="--", alpha=0.35)
@@ -321,7 +358,16 @@ def main():
     if args.title:
         ax.set_title(args.title)
     else:
-        title_name = "KL divergence" if args.metric == "sanity_kl" else "NLL gap"
+        if args.metric == "sanity_kl":
+            title_name = "KL divergence"
+        elif args.metric == "student_nll":
+            title_name = "Student NLL"
+        elif args.metric == "student_ppl":
+            title_name = "Student PPL"
+        elif args.metric == "ppl_ratio":
+            title_name = "PPL ratio (student / teacher)"
+        else:
+            title_name = "NLL gap"
         if args.strategy == "all":
             strategy_title = ", ".join(strategies)
         else:

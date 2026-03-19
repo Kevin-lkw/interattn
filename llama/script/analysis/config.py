@@ -93,7 +93,7 @@ def parse_args():
         "--budgets",
         type=float,
         nargs="+",
-        default=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+        default=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
         help="Budget list",
     )
     parser.add_argument(

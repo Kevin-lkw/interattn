@@ -1,4 +1,5 @@
 import math
+import time
 
 import torch
 from torch.nn import functional as F
@@ -230,36 +231,47 @@ def gen_mask(
             ctx, layer_idx, causal=True, dtype=ctx.dtype, device=device
         )
 
-        mask = torch.zeros(len(head_idx), len(pos_list), seq_len, device=device)
+        num_out_heads = len(head_idx)
+        num_pos = len(pos_list)
+
+        # final additive mask: 0 for visible, -inf for evicted/inaccessible
+        mask = torch.zeros(num_out_heads, num_pos, seq_len, device=device)
+
+        t1 = time.time()
+
         for out_h, head in enumerate(head_idx):
-            attention_score_head = attention_score[head]  # [seq_len, seq_len]
-            accumulated_attention = torch.zeros(seq_len, device=device)
+            attn = attention_score[head]  # [seq_len, seq_len]
+
+            # accumulated attention score for each token j
+            acc = torch.zeros(seq_len, device=device)
+
+            # current membership in cache S_i
+            in_cache = torch.zeros(seq_len, dtype=torch.bool, device=device)
 
             for i, pos in enumerate(pos_list):
                 total_available = pos + 1
 
-                if total_available <= visible:
-                    accumulated_attention += attention_score_head[pos]
-                    continue
+                acc[:total_available] += attn[pos, :total_available]
 
-                cur_recent_budget = min(recent_budget, total_available)
-                recent_start = total_available - cur_recent_budget
-                recent_idx = torch.arange(recent_start, total_available, device=device)
+                in_cache[pos] = True
 
-                hh_candidate_end = recent_start
-                cur_hh_budget = min(hh_budget, hh_candidate_end)
+                cur_cache_size = int(in_cache[:total_available].sum().item())
+                if cur_cache_size > visible:
+                    cache_idx = torch.nonzero(in_cache[:total_available], as_tuple=False).squeeze(-1)
+                    
+                    recent_start = max(0, total_available - recent_budget)
+                    hh_idx = cache_idx[cache_idx < recent_start]
+                    assert len(hh_idx) > 0, f"No tokens in hh_idx for head {head} at position {pos} with recent_start {recent_start}"
+                    victim_local = torch.argmin(acc[hh_idx])
+                    victim = hh_idx[victim_local]
 
-                keep = torch.zeros(total_available, dtype=torch.bool, device=device)
-                keep[recent_idx] = True
+                    in_cache[victim] = False
 
-                if cur_hh_budget > 0:
-                    hh_scores = accumulated_attention[:hh_candidate_end]
-                    topk_hh = torch.topk(hh_scores, k=cur_hh_budget, largest=True).indices
-                    keep[topk_hh] = True
+                invisible_now = ~in_cache[:total_available]
+                mask[out_h, i, :total_available][invisible_now] = float("-inf")
 
-                mask[out_h, i, :total_available][~keep] = float("-inf")
-                accumulated_attention += attention_score_head[pos]
-
+        t2 = time.time()
+        print(f"[h2o_paper] mask build time: {t2 - t1:.4f}s")
     elif strategy == "kvmerger":
         raise NotImplementedError("KVMerger strategy is not implemented yet.")
 

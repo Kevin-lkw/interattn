@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument(
         "--training-steps",
         type=int,
-        default=10000,
+        default=2000,
         help="Optimization steps",
     )
     parser.add_argument(
@@ -72,7 +72,7 @@ def parse_args():
     parser.add_argument(
         "--loss-type",
         type=str,
-        default="logits_kl",
+        default="v_l2",
         choices=["logits_kl", "v_l2", "v_kl"],
         help="Training loss: logits-space KL, V-space L2, or V-space KL",
     )

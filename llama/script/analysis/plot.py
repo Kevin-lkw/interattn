@@ -13,7 +13,19 @@ def parse_args():
         )
     )
     parser.add_argument("--dataset", type=str, default="wikitext")
-    parser.add_argument("--strategy", type=str, default="attention_topk")
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="attention_topk",
+        help="Strategy to plot. Use 'all' to plot multiple strategies in one figure.",
+    )
+    parser.add_argument(
+        "--all-strategies",
+        type=str,
+        nargs="+",
+        default=["attention_topk", "h2o", "sink"],
+        help="Strategies included when --strategy all.",
+    )
     parser.add_argument("--loss-type", type=str, default="v_l2")
     parser.add_argument(
         "--metric",
@@ -59,6 +71,13 @@ def parse_args():
     )
     parser.add_argument("--title", type=str, default=None)
     parser.add_argument("--dpi", type=int, default=200)
+    parser.add_argument(
+        "--budgets",
+        type=float,
+        nargs="+",
+        default=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+        help="Budgets to include in the plot. Defaults to a fixed preset.",
+    )
     parser.add_argument("--show", action="store_true")
     return parser.parse_args()
 
@@ -99,27 +118,60 @@ def metric_to_stderr(metric: dict, metric_key: str, token_count: int | None):
     return 0.0
 
 
-def to_series(metrics_by_budget: dict, metric_key: str, token_count: int | None, name: str):
+def find_matching_budget_key(metrics_by_budget: dict, requested_budget: float):
+    if requested_budget in metrics_by_budget:
+        return requested_budget
+
+    for budget in metrics_by_budget.keys():
+        if math.isclose(float(budget), requested_budget, rel_tol=1e-9, abs_tol=1e-12):
+            return budget
+    return None
+
+
+def to_series(
+    metrics_by_budget: dict,
+    metric_key: str,
+    token_count: int | None,
+    name: str,
+    requested_budgets: list[float] | None = None,
+):
     xs = []
     ys = []
     es = []
 
     dropped_non_positive = 0
-    for budget in sorted(metrics_by_budget.keys()):
+    missing_budgets = []
+
+    if requested_budgets is None:
+        budgets_to_iterate = sorted(metrics_by_budget.keys())
+    else:
+        budgets_to_iterate = requested_budgets
+
+    for budget in budgets_to_iterate:
         if budget <= 0:
             dropped_non_positive += 1
             continue
 
-        metric = metrics_by_budget[budget]
+        budget_key = budget
+        if requested_budgets is not None:
+            budget_key = find_matching_budget_key(metrics_by_budget, float(budget))
+            if budget_key is None:
+                missing_budgets.append(float(budget))
+                continue
+
+        metric = metrics_by_budget[budget_key]
         if metric_key not in metric:
             raise KeyError(f"Missing '{metric_key}' in {name} metrics for budget={budget}")
 
-        xs.append(float(budget))
+        xs.append(float(budget_key))
         ys.append(float(metric[metric_key]))
         es.append(metric_to_stderr(metric, metric_key, token_count))
 
     if dropped_non_positive > 0:
         print(f"[WARN] {name}: dropped {dropped_non_positive} non-positive budgets for log-scale x-axis.")
+    if len(missing_budgets) > 0:
+        formatted = ", ".join(f"{b:g}" for b in missing_budgets)
+        print(f"[WARN] {name}: {len(missing_budgets)} requested budgets not found: {formatted}")
     return xs, ys, es
 
 
@@ -141,59 +193,121 @@ def default_paths(dataset: str, strategy: str, loss_type: str, metric: str):
     return optimal, baseline, output
 
 
+def default_output_path_for_all(dataset: str, loss_type: str, metric: str):
+    return f"../result/{dataset}/all/{loss_type}/{metric}_vs_budget_compare.png"
+
+
+def strategy_list_from_args(args):
+    if args.strategy == "all":
+        deduped = []
+        seen = set()
+        for s in args.all_strategies:
+            if s not in seen:
+                seen.add(s)
+                deduped.append(s)
+        if len(deduped) == 0:
+            raise ValueError("When --strategy all, --all-strategies must contain at least one strategy.")
+        return deduped
+    return [args.strategy]
+
+
 def main():
     args = parse_args()
 
-    default_optimal, default_baseline, default_output = default_paths(
-        args.dataset,
-        args.strategy,
-        args.loss_type,
-        args.metric,
-    )
+    strategies = strategy_list_from_args(args)
 
-    optimal_path = args.optimal_path if args.optimal_path else default_optimal
-    baseline_path = args.baseline_path if args.baseline_path else default_baseline
+    if args.strategy == "all" and (args.optimal_path is not None or args.baseline_path is not None):
+        raise ValueError("--optimal-path/--baseline-path are only supported for single strategy mode.")
+
+    if args.strategy == "all":
+        default_output = default_output_path_for_all(args.dataset, args.loss_type, args.metric)
+    else:
+        _, _, default_output = default_paths(
+            args.dataset,
+            args.strategy,
+            args.loss_type,
+            args.metric,
+        )
     output_path = args.output if args.output else default_output
-
-    optimal_raw = load_torch_file(optimal_path)
-    baseline_raw = load_torch_file(baseline_path)
-
-    optimal_metrics = normalize_budget_metrics(optimal_raw)
-    baseline_metrics = normalize_budget_metrics(baseline_raw)
-
-    x_opt, y_opt, e_opt = to_series(optimal_metrics, args.metric, args.token_count, "optimal")
-    x_base, y_base, e_base = to_series(baseline_metrics, args.metric, args.token_count, "baseline")
-
-    print_metric_values(args.metric, x_opt, y_opt, x_base, y_base)
-
-    if len(x_opt) == 0 and len(x_base) == 0:
-        raise ValueError("No valid positive budgets found in either optimal or baseline results.")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(7.0, 4.8))
-    if len(x_opt) > 0:
-        ax.errorbar(
-            x_opt,
-            y_opt,
-            yerr=e_opt,
-            fmt="-o",
-            capsize=3,
-            linewidth=1.8,
-            markersize=4,
-            label="Optimal routing",
+    color_map = {}
+    any_points = False
+
+    for idx, strategy in enumerate(strategies):
+        default_optimal, default_baseline, _ = default_paths(
+            args.dataset,
+            strategy,
+            args.loss_type,
+            args.metric,
         )
-    if len(x_base) > 0:
-        ax.errorbar(
-            x_base,
-            y_base,
-            yerr=e_base,
-            fmt="-s",
-            capsize=3,
-            linewidth=1.8,
-            markersize=4,
-            label="Baseline routing",
+
+        optimal_path = default_optimal if args.optimal_path is None else args.optimal_path
+        baseline_path = default_baseline if args.baseline_path is None else args.baseline_path
+
+        optimal_raw = load_torch_file(optimal_path)
+        baseline_raw = load_torch_file(baseline_path)
+
+        optimal_metrics = normalize_budget_metrics(optimal_raw)
+        baseline_metrics = normalize_budget_metrics(baseline_raw)
+
+        x_opt, y_opt, e_opt = to_series(
+            optimal_metrics,
+            args.metric,
+            args.token_count,
+            f"optimal/{strategy}",
+            requested_budgets=args.budgets,
         )
+        x_base, y_base, e_base = to_series(
+            baseline_metrics,
+            args.metric,
+            args.token_count,
+            f"baseline/{strategy}",
+            requested_budgets=args.budgets,
+        )
+
+        print_metric_values(f"{args.metric} [{strategy}]", x_opt, y_opt, x_base, y_base)
+
+        if len(x_opt) == 0 and len(x_base) == 0:
+            print(f"[WARN] strategy={strategy}: no valid points, skip plotting.")
+            continue
+
+        any_points = True
+        color = color_map.get(strategy)
+        if color is None:
+            color = f"C{idx % 10}"
+            color_map[strategy] = color
+
+        if len(x_opt) > 0:
+            ax.errorbar(
+                x_opt,
+                y_opt,
+                yerr=e_opt,
+                fmt="--o",
+                capsize=3,
+                linewidth=1.8,
+                markersize=4,
+                color=color,
+                label=f"{strategy} optimal",
+            )
+
+        if len(x_base) > 0:
+            ax.errorbar(
+                x_base,
+                y_base,
+                yerr=e_base,
+                fmt="-s",
+                capsize=3,
+                linewidth=1.8,
+                markersize=4,
+                color=color,
+                label=f"{strategy} baseline",
+            )
+
+    if not any_points:
+        raise ValueError("No valid positive budgets found across selected strategies.")
 
     ax.set_xscale("log")
     ax.set_xlabel("Budget (log scale)")
@@ -208,7 +322,11 @@ def main():
         ax.set_title(args.title)
     else:
         title_name = "KL divergence" if args.metric == "sanity_kl" else "NLL gap"
-        ax.set_title(f"{title_name} vs Budget ({args.dataset}, {args.strategy})")
+        if args.strategy == "all":
+            strategy_title = ", ".join(strategies)
+        else:
+            strategy_title = args.strategy
+        ax.set_title(f"{title_name} vs Budget ({args.dataset}, {strategy_title})")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=args.dpi)

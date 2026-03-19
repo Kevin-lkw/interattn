@@ -42,9 +42,30 @@ def load_context(args, dtype, device):
     elif args.dataset == "pg19":
         dataset = load_dataset("emozilla/pg19-test", split="test")
         prompt = "\n".join([text for text in dataset["text"] if text.strip()])
+    elif args.dataset == "oasst2":
+        dataset = load_dataset("OpenAssistant/oasst2", split="train")
+
+        texts = dataset["text"]
+        langs = dataset["lang"] if "lang" in dataset.column_names else None
+
+        if langs is None:
+            filtered_texts = [text for text in texts if isinstance(text, str) and text.strip()]
+        else:
+            filtered_texts = [
+                text
+                for text, lang in zip(texts, langs)
+                if isinstance(text, str)
+                and text.strip()
+                and (lang is None or str(lang).startswith("en"))
+            ]
+
+        if len(filtered_texts) == 0:
+            raise ValueError("No valid text found in OASST2 after filtering.")
+
+        prompt = "\n".join(filtered_texts)
     else:
         raise ValueError(
-            f"Unsupported dataset '{args.dataset}'. Supported now: wikitext, pg19"
+            f"Unsupported dataset '{args.dataset}'. Supported now: wikitext, pg19, oasst2"
         )
 
     # Build one continuous context window and next-token labels directly from raw text.
@@ -108,8 +129,8 @@ def resolve_layers(layer_indices, all_layers, num_hidden_layers):
     return layers
 
 
-def get_result_path(layer_idx, dataset, strategy, loss_type):
-    return f"../result/{dataset}/{strategy}/{loss_type}/layer{layer_idx}/result.pt"
+def get_result_path(layer_idx, dataset, start , strategy, loss_type):
+    return f"../result/{dataset}_{start}/{strategy}/{loss_type}/layer{layer_idx}/result.pt"
 
 
 def normalize_budget_key(result_dict, target_budget, atol=1e-12):
@@ -122,7 +143,7 @@ def normalize_budget_key(result_dict, target_budget, atol=1e-12):
 def load_or_init_layer_results(layer_idx_list, args):
     layer_results = {}
     for layer_idx in layer_idx_list:
-        save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
+        save_path = get_result_path(layer_idx, args.dataset, args.start, args.strategy, args.loss_type)
         if os.path.exists(save_path):
             result = torch.load(save_path, weights_only=False)
             print(
@@ -138,10 +159,10 @@ def load_or_init_layer_results(layer_idx_list, args):
 
 def save_results(layer_idx_list, layer_results, budget_to_final_metrics, args):
     for layer_idx in layer_idx_list:
-        save_path = get_result_path(layer_idx, args.dataset, args.strategy, args.loss_type)
+        save_path = get_result_path(layer_idx, args.dataset, args.start, args.strategy, args.loss_type)
         torch.save(layer_results[layer_idx], save_path)
         print(f"Optimization completed and results saved to {save_path}")
-    save_path = f"../result/{args.dataset}/{args.strategy}/{args.loss_type}/layer_all/budget_to_final_metrics.pt"
+    save_path = f"../result/{args.dataset}_{args.start}/{args.strategy}/{args.loss_type}/layer_all/budget_to_final_metrics.pt"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(budget_to_final_metrics, save_path)
 

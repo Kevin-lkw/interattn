@@ -75,7 +75,7 @@ def parse_args():
         "--budgets",
         type=float,
         nargs="+",
-        default=[ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+        default=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
         help="Budgets to include in the plot. Defaults to a fixed preset.",
     )
     parser.add_argument("--show", action="store_true")
@@ -264,6 +264,7 @@ def main():
     fig, ax = plt.subplots(figsize=(7.0, 4.8))
     color_map = {}
     any_points = False
+    plotted_x_values = []
 
     for idx, strategy in enumerate(strategies):
         default_optimal, default_baseline, _ = default_paths(
@@ -310,6 +311,7 @@ def main():
             color_map[strategy] = color
 
         if len(x_opt) > 0:
+            plotted_x_values.extend(x_opt)
             ax.errorbar(
                 x_opt,
                 y_opt,
@@ -323,6 +325,7 @@ def main():
             )
 
         if len(x_base) > 0:
+            plotted_x_values.extend(x_base)
             ax.errorbar(
                 x_base,
                 y_base,
@@ -339,7 +342,11 @@ def main():
         raise ValueError("No valid positive budgets found across selected strategies.")
 
     ax.set_xscale("log")
-    ax.set_xlabel("Budget (log scale)")
+    if len(plotted_x_values) > 0:
+        x_ticks = sorted(set(float(x) for x in plotted_x_values))
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels([f"{x * 100:g}%" for x in x_ticks])
+    ax.set_xlabel("Budget (log scale, %)" )
     if args.metric == "sanity_kl":
         ax.set_ylabel("KL divergence")
     elif args.metric == "student_nll":

@@ -23,7 +23,7 @@ def run_multilayer_baseline_check(
     model_inputs,
     ref_tail_logits,
 ):
-    out_path  = Path(f"../result/{args.dataset}/{args.strategy}/qk_routing.pt")
+    out_path  = Path(f"../result/{args.dataset}_{args.start}/{args.strategy}/qk_routing.pt")
 
     if out_path.exists():
         print(f"Found existing baseline comparison result at {out_path}, loading...")
@@ -32,6 +32,7 @@ def run_multilayer_baseline_check(
         summary = {
             "layers": target_layers,
             "dataset": args.dataset,
+            "start": args.start,
             "strategy": args.strategy,
             "budgets": {},
         }

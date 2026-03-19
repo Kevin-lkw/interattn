@@ -29,7 +29,7 @@ def parse_args():
         "--dataset",
         type=str,
         default="wikitext",
-        help="Dataset name used in kv/result path",
+        help="Dataset name used in kv/result path: wikitext, pg19, oasst2",
     )
     parser.add_argument(
         "--strategy",

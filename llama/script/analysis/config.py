@@ -35,7 +35,7 @@ def parse_args():
         "--strategy",
         type=str,
         default="h2o",
-        choices=["recency", "random", "attention_topk", "h2o", "kvmerger"],
+        choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
         help="Mask generation strategy",
     )
     parser.add_argument(
@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument(
         "--training-steps",
         type=int,
-        default=2000,
+        default=1000,
         help="Optimization steps",
     )
     parser.add_argument(

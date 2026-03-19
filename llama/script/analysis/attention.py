@@ -272,6 +272,24 @@ def gen_mask(
 
         t2 = time.time()
         print(f"[h2o_paper] mask build time: {t2 - t1:.4f}s")
+    elif strategy == "sink":
+        sink_keep = 4
+        recent_keep = max(visible - sink_keep, 0)
+        mask = torch.zeros(len(head_idx), len(pos_list), seq_len, device=device)
+
+        for i, pos in enumerate(pos_list):
+            total_available = pos + 1
+            keep = torch.zeros(total_available, dtype=torch.bool, device=device)
+
+            # Always keep the first sink_keep tokens (or all available if shorter).
+            keep[: min(sink_keep, total_available)] = True
+
+            # Keep the most recent tokens for the remaining budget.
+            if recent_keep > 0:
+                recent_start = max(0, total_available - recent_keep)
+                keep[recent_start:total_available] = True
+
+            mask[:, i, :total_available][:, ~keep] = float("-inf")
     elif strategy == "kvmerger":
         raise NotImplementedError("KVMerger strategy is not implemented yet.")
 

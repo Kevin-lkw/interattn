@@ -12,7 +12,7 @@ def parse_args():
             "Plot NLL gap vs budget for optimal routing and baseline routing, with error bars."
         )
     )
-    parser.add_argument("--dataset", type=str, default="wikitext")
+    parser.add_argument("--dataset", type=str, default="wikitext_0")
     parser.add_argument(
         "--strategy",
         type=str,
@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument(
         "--metric",
         type=str,
-        default="nll_gap",
+        default="student_ppl",
         choices=["nll_gap", "sanity_kl", "student_nll", "student_ppl", "ppl_ratio"],
         help="Metric to plot on y-axis.",
     )

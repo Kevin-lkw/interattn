@@ -1,4 +1,5 @@
 import os
+from sqlite3 import adapt
 import time
 
 from numpy import save
@@ -116,7 +117,7 @@ def resolve_layers(layer_indices, all_layers, num_hidden_layers):
         return list(range(num_hidden_layers))
 
     if layer_indices is None:
-        layer_indices = [5, 10, 15, 20, 25, 30]
+        return list(range(num_hidden_layers))
 
     layers = []
     for layer_idx in layer_indices:
@@ -129,8 +130,9 @@ def resolve_layers(layer_indices, all_layers, num_hidden_layers):
     return layers
 
 
-def get_result_path(layer_idx, dataset, start , strategy, loss_type):
-    return f"../result/{dataset}_{start}/{strategy}/{loss_type}/layer{layer_idx}/result.pt"
+def get_result_path(layer_idx, dataset, start, adaptive_budget, strategy, loss_type):
+    adaptive_str = "adaptive" if adaptive_budget else "fixed"
+    return f"../result/{dataset}_{start}/{adaptive_str}/{strategy}/{loss_type}/layer{layer_idx}/result.pt"
 
 
 def normalize_budget_key(result_dict, target_budget, atol=1e-12):
@@ -143,7 +145,7 @@ def normalize_budget_key(result_dict, target_budget, atol=1e-12):
 def load_or_init_layer_results(layer_idx_list, args):
     layer_results = {}
     for layer_idx in layer_idx_list:
-        save_path = get_result_path(layer_idx, args.dataset, args.start, args.strategy, args.loss_type)
+        save_path = get_result_path(layer_idx, args.dataset, args.start, args.adaptive_budget, args.strategy, args.loss_type)
         if os.path.exists(save_path):
             result = torch.load(save_path, weights_only=False)
             print(
@@ -159,10 +161,11 @@ def load_or_init_layer_results(layer_idx_list, args):
 
 def save_results(layer_idx_list, layer_results, budget_to_final_metrics, args):
     for layer_idx in layer_idx_list:
-        save_path = get_result_path(layer_idx, args.dataset, args.start, args.strategy, args.loss_type)
+        save_path = get_result_path(layer_idx, args.dataset, args.start, args.adaptive_budget, args.strategy, args.loss_type)
         torch.save(layer_results[layer_idx], save_path)
         print(f"Optimization completed and results saved to {save_path}")
-    save_path = f"../result/{args.dataset}_{args.start}/{args.strategy}/{args.loss_type}/layer_all/budget_to_final_metrics.pt"
+    adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
+    save_path = f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/{args.loss_type}/layer_all/budget_to_final_metrics.pt"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(budget_to_final_metrics, save_path)
 
@@ -213,6 +216,7 @@ def run_budget_online(
                 strategy=args.strategy,
                 budget=budget,
                 seq_len=args.seq_len,
+                adaptive_budget=args.adaptive_budget,
             )
             print(f"Optimizing alpha_star for layer {layer_idx}, budget {budget}")
             alpha, p_alpha, p_teacher, loss = optimize_alpha_star(

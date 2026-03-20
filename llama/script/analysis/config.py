@@ -82,12 +82,12 @@ def parse_args():
         type=int,
         nargs="+",
         default=None,
-        help="Layer indices to process",
+        help="Layer indices to process (default is all layers if not set)",
     )
     layer_group.add_argument(
         "--all-layers",
         action="store_true",
-        help="Process all transformer layers",
+        help="Process all transformer layers (now the default behavior)",
     )
     parser.add_argument(
         "--budgets",
@@ -101,6 +101,11 @@ def parse_args():
         type=int,
         default=1024,
         help="Sequence length",
+    )
+    parser.add_argument(
+        "--adaptive-budget",
+        action="store_true",
+        help="Whether to use adaptive budget that does not compress the first 2 layers",
     )
     return parser.parse_args()
 

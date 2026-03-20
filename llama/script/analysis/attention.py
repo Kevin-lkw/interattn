@@ -178,7 +178,8 @@ def gen_mask(
     head_idx,
     strategy,
     budget,
-    seq_len=4096,
+    seq_len,
+    adaptive_budget,
 ):
     """
     Return mask for alpha_param, with shape [nh, n_pos, seq_len]
@@ -187,8 +188,12 @@ def gen_mask(
     mask = torch.zeros(len(pos_list), seq_len, device=device)
 
     visible = int(seq_len * budget)
-    print(f"layer {layer_idx}: visible {visible} tokens for strategy {strategy} with budget {budget}")
-
+    if adaptive_budget:
+        # do not compress frist 2 layers
+        if layer_idx ==0 or layer_idx == 1:
+            budget = 1.0
+            visible = seq_len
+    print(f"layer {layer_idx}: visible {visible} tokens for strategy {strategy} with budget {budget}")    
     if strategy == "recency":
         for i, pos in enumerate(pos_list):
             total_available = pos + 1

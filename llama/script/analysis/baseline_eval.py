@@ -1,4 +1,5 @@
 from pathlib import Path
+from sqlite3 import adapt
 
 import torch
 from torch.nn import functional as F
@@ -23,7 +24,8 @@ def run_multilayer_baseline_check(
     model_inputs,
     ref_tail_logits,
 ):
-    out_path  = Path(f"../result/{args.dataset}_{args.start}/{args.strategy}/qk_routing.pt")
+    adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
+    out_path  = Path(f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/qk_routing.pt")
 
     if out_path.exists():
         print(f"Found existing baseline comparison result at {out_path}, loading...")
@@ -76,6 +78,7 @@ def run_multilayer_baseline_check(
                     strategy=args.strategy,
                     budget=budget,
                     seq_len=args.seq_len,
+                    adaptive_budget=args.adaptive_budget,
                 )
                 alpha_baseline = build_qk_routing_alpha(
                     ctx=baseline_layer_ctx,

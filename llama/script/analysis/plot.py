@@ -12,7 +12,7 @@ def parse_args():
             "Plot NLL gap vs budget for optimal routing and baseline routing, with error bars."
         )
     )
-    parser.add_argument("--dataset", type=str, default="wikitext_0")
+    parser.add_argument("--dataset", type=str, default="wikitext_4096")
     parser.add_argument(
         "--strategy",
         type=str,
@@ -79,6 +79,11 @@ def parse_args():
         help="Budgets to include in the plot. Defaults to a fixed preset.",
     )
     parser.add_argument("--show", action="store_true")
+    parser.add_argument(
+        "--adaptive-budget",
+        action="store_true",
+        help="Whether to use adaptive budget that does not compress the first 2 layers",
+    )
     return parser.parse_args()
 
 
@@ -215,15 +220,17 @@ def print_metric_values(metric_name: str, x_opt, y_opt, x_base, y_base):
         print(f"  budget={budget:g}, value={value:.8f}, abs={abs(value):.8f}")
 
 
-def default_paths(dataset: str, strategy: str, loss_type: str, metric: str):
-    optimal = f"../result/{dataset}/{strategy}/{loss_type}/layer_all/budget_to_final_metrics.pt"
-    baseline = f"../result/{dataset}/{strategy}/qk_routing.pt"
-    output = f"../result/{dataset}/{strategy}/{loss_type}/layer_all/{metric}_vs_budget_compare.png"
+def default_paths(dataset: str, adaptive_budget: bool, strategy: str, loss_type: str, metric: str):
+    ada_str = "adaptive" if adaptive_budget else "fixed"
+    optimal = f"../result/{dataset}/{ada_str}/{strategy}/{loss_type}/layer_all/budget_to_final_metrics.pt"
+    baseline = f"../result/{dataset}/{ada_str}/{strategy}/qk_routing.pt"
+    output = f"../result/{dataset}/{ada_str}/{strategy}/{loss_type}/layer_all/{metric}_vs_budget_compare.png"
     return optimal, baseline, output
 
 
-def default_output_path_for_all(dataset: str, loss_type: str, metric: str):
-    return f"../result/{dataset}/all/{loss_type}/{metric}_vs_budget_compare.png"
+def default_output_path_for_all(dataset: str, adaptive_budget: bool, loss_type: str, metric: str):
+    ada_str = "adaptive" if adaptive_budget else "fixed"
+    return f"../result/{dataset}/{ada_str}/all/{loss_type}/{metric}_vs_budget_compare.png"
 
 
 def strategy_list_from_args(args):
@@ -249,10 +256,11 @@ def main():
         raise ValueError("--optimal-path/--baseline-path are only supported for single strategy mode.")
 
     if args.strategy == "all":
-        default_output = default_output_path_for_all(args.dataset, args.loss_type, args.metric)
+        default_output = default_output_path_for_all(args.dataset, args.adaptive_budget, args.loss_type, args.metric)
     else:
         _, _, default_output = default_paths(
             args.dataset,
+            args.adaptive_budget,
             args.strategy,
             args.loss_type,
             args.metric,
@@ -269,6 +277,7 @@ def main():
     for idx, strategy in enumerate(strategies):
         default_optimal, default_baseline, _ = default_paths(
             args.dataset,
+            args.adaptive_budget,
             strategy,
             args.loss_type,
             args.metric,

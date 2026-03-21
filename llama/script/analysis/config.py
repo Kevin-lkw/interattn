@@ -76,6 +76,13 @@ def parse_args():
         choices=["logits_kl", "v_l2", "v_kl"],
         help="Training loss: logits-space KL, V-space L2, or V-space KL",
     )
+    parser.add_argument(
+        "--kv-compress-mode",
+        type=str,
+        default="mask",
+        choices=["mask", "kept_kv"],
+        help="KV compression mode: legacy mask-based routing or compact kept-KV routing",
+    )
     layer_group = parser.add_mutually_exclusive_group()
     layer_group.add_argument(
         "--layers",
@@ -106,6 +113,11 @@ def parse_args():
         "--adaptive-budget",
         action="store_true",
         help="Whether to use adaptive budget that does not compress the first 2 layers",
+    )
+    parser.add_argument(
+        "--tmp",
+        action="store_true",
+        help="Debug mode: do not read or write any result files",
     )
     return parser.parse_args()
 

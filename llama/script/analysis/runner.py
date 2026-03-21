@@ -8,7 +8,13 @@ from datasets import load_dataset
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .attention import gen_mask, optimize_alpha_star
+from .attention import (
+    build_kept_kv_cache,
+    build_modified_attn_hidden_from_kept_v,
+    gen_mask,
+    optimize_alpha_star,
+    optimize_alpha_star_on_kept_v,
+)
 from .baseline_eval import run_multilayer_baseline_check
 from .config import parse_args, set_seed, str_to_torch_dtype
 from .context import RunContext
@@ -208,43 +214,93 @@ def run_budget_online(
                 print(f"Layer {layer_idx}, budget {budget} already exists, reuse patch_hidden.")
 
         if patch_hidden is None:
-            mask = gen_mask(
-                ctx=layer_ctx,
-                layer_idx=layer_idx,
-                pos_list=pos_list,
-                head_idx=head_idx,
-                strategy=args.strategy,
-                budget=budget,
-                seq_len=args.seq_len,
-                adaptive_budget=args.adaptive_budget,
-            )
             print(f"Optimizing alpha_star for layer {layer_idx}, budget {budget}")
-            alpha, p_alpha, p_teacher, loss = optimize_alpha_star(
-                ctx=layer_ctx,
-                layer_idx=layer_idx,
-                head_idx=head_idx,
-                pos_list=pos_list,
-                training_steps=args.training_steps,
-                lr=args.lr,
-                mask=mask,
-                loss_type=args.loss_type,
-                device=ctx.device,
-            )
+
+            if args.kv_compress_mode == "mask":
+                mask = gen_mask(
+                    ctx=layer_ctx,
+                    layer_idx=layer_idx,
+                    pos_list=pos_list,
+                    head_idx=head_idx,
+                    strategy=args.strategy,
+                    budget=budget,
+                    seq_len=args.seq_len,
+                    adaptive_budget=args.adaptive_budget,
+                )
+                alpha, p_alpha, p_teacher, loss = optimize_alpha_star(
+                    ctx=layer_ctx,
+                    layer_idx=layer_idx,
+                    head_idx=head_idx,
+                    pos_list=pos_list,
+                    training_steps=args.training_steps,
+                    lr=args.lr,
+                    mask=mask,
+                    loss_type=args.loss_type,
+                    device=ctx.device,
+                )
+                patch_hidden = build_modified_attn_hidden(
+                    ctx=layer_ctx,
+                    layer_idx=layer_idx,
+                    head_idx=head_idx,
+                    pos_list=pos_list,
+                    alpha=alpha,
+                    device=ctx.device,
+                )
+                layer_result[float(budget)] = {
+                    "patch_hidden": patch_hidden.detach().cpu(),
+                    "loss": loss,
+                    "loss_type": args.loss_type,
+                    "optimized_online": True,
+                    "compress_mode": "mask",
+                }
+            elif args.kv_compress_mode == "kept_kv":
+                kept_cache = build_kept_kv_cache(
+                    ctx=layer_ctx,
+                    layer_idx=layer_idx,
+                    pos_list=pos_list,
+                    head_idx=head_idx,
+                    strategy=args.strategy,
+                    budget=budget,
+                    seq_len=args.seq_len,
+                    adaptive_budget=args.adaptive_budget,
+                    device=ctx.device,
+                )
+                alpha, p_alpha, p_teacher, loss = optimize_alpha_star_on_kept_v(
+                    ctx=layer_ctx,
+                    layer_idx=layer_idx,
+                    head_idx=head_idx,
+                    pos_list=pos_list,
+                    training_steps=args.training_steps,
+                    lr=args.lr,
+                    kept_v=kept_cache["kept_v"],
+                    keep_valid=kept_cache["keep_valid"],
+                    loss_type=args.loss_type,
+                    device=ctx.device,
+                )
+                patch_hidden = build_modified_attn_hidden_from_kept_v(
+                    ctx=layer_ctx,
+                    layer_idx=layer_idx,
+                    head_idx=head_idx,
+                    pos_list=pos_list,
+                    alpha=alpha,
+                    kept_v=kept_cache["kept_v"],
+                    device=ctx.device,
+                )
+                layer_result[float(budget)] = {
+                    "patch_hidden": patch_hidden.detach().cpu(),
+                    "loss": loss,
+                    "loss_type": args.loss_type,
+                    "optimized_online": True,
+                    "compress_mode": "kept_kv",
+                    "kept_indices": kept_cache["kept_indices"].detach().cpu(),
+                    "keep_valid": kept_cache["keep_valid"].detach().cpu(),
+                    "kept_k": kept_cache["kept_k"].detach().cpu(),
+                    "kept_v": kept_cache["kept_v"].detach().cpu(),
+                }
+            else:
+                raise ValueError(f"Unknown kv_compress_mode: {args.kv_compress_mode}")
+
             print(f"final loss for layer {layer_idx} with budget {budget}: {loss[-1]}")
-            patch_hidden = build_modified_attn_hidden(
-                ctx=layer_ctx,
-                layer_idx=layer_idx,
-                head_idx=head_idx,
-                pos_list=pos_list,
-                alpha=alpha,
-                device=ctx.device,
-            )
-            layer_result[float(budget)] = {
-                "patch_hidden": patch_hidden.detach().cpu(),
-                "loss": loss,
-                "loss_type": args.loss_type,
-                "optimized_online": True,
-            }
 
         layer_to_patch[layer_idx] = patch_hidden
         t1 = time.time()
@@ -256,6 +312,10 @@ def run_budget_online(
 def main():
     set_seed(42)
     args = parse_args()
+    if args.kv_compress_mode == "kept_kv" and args.loss_type != "v_l2":
+        raise ValueError(
+            "kv_compress_mode='kept_kv' only supports --loss-type v_l2."
+        )
     dtype = str_to_torch_dtype(args.dtype)
     device = args.device
 
@@ -283,7 +343,11 @@ def main():
     print("Reference logits computed for check routines.")
     labels = get_tail_labels(ctx, pos_list, ctx.device)
 
-    layer_results = load_or_init_layer_results(layer_idx_list, args)
+    if args.tmp:
+        print("TMP mode enabled: skip reading result files.")
+        layer_results = {layer_idx: {} for layer_idx in layer_idx_list}
+    else:
+        layer_results = load_or_init_layer_results(layer_idx_list, args)
     budget_to_final_metrics = {}
 
     for budget in args.budgets:
@@ -314,15 +378,21 @@ def main():
             f"student NLL={final_metrics['student_nll']:.6f}, "
             f"NLL gap={final_metrics['nll_gap']:.6f}"
         )
-    save_results(layer_idx_list, layer_results, budget_to_final_metrics, args)
+    if args.tmp:
+        print("TMP mode enabled: skip writing result files.")
+    else:
+        save_results(layer_idx_list, layer_results, budget_to_final_metrics, args)
 
-    print("Running one-shot multi-layer baseline comparison...")
-    run_multilayer_baseline_check(
-        ctx=ctx,
-        args=args,
-        target_layers=layer_idx_list,
-        head_idx=head_idx,
-        pos_list=pos_list,
-        model_inputs=model_inputs,
-        ref_tail_logits=ref_tail_logits,
-    )
+    if args.tmp:
+        print("TMP mode enabled: skip baseline result read/write.")
+    else:
+        print("Running one-shot multi-layer baseline comparison...")
+        run_multilayer_baseline_check(
+            ctx=ctx,
+            args=args,
+            target_layers=layer_idx_list,
+            head_idx=head_idx,
+            pos_list=pos_list,
+            model_inputs=model_inputs,
+            ref_tail_logits=ref_tail_logits,
+        )

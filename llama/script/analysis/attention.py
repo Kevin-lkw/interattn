@@ -147,6 +147,187 @@ def optimize_alpha_star(
     return alpha, p_alpha, p_teacher, losses
 
 
+def build_kept_kv_cache(
+    ctx,
+    layer_idx,
+    pos_list,
+    head_idx,
+    strategy,
+    budget,
+    seq_len,
+    adaptive_budget,
+    device=None,
+):
+    """
+    Build compressed KV cache from retained token indices.
+
+    Returns a dict containing:
+      kept_indices: [nh, n_pos, max_keep] (Long, -1 for pad)
+      keep_valid:   [nh, n_pos, max_keep] (Bool)
+      kept_k:       [nh, n_pos, max_keep, hd]
+      kept_v:       [nh, n_pos, max_keep, hd]
+    """
+    if device is None:
+        device = ctx.device
+
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+
+    mask = gen_mask(
+        ctx=ctx,
+        layer_idx=layer_idx,
+        pos_list=pos_list,
+        head_idx=head_idx,
+        strategy=strategy,
+        budget=budget,
+        seq_len=seq_len,
+        adaptive_budget=adaptive_budget,
+    )
+
+    visible = torch.isfinite(mask)
+    nh, n_pos, _ = visible.shape
+    keep_counts = visible.sum(dim=-1)
+    max_keep = int(keep_counts.max().item())
+
+    kept_indices = torch.full(
+        (nh, n_pos, max_keep),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+    keep_valid = torch.zeros((nh, n_pos, max_keep), dtype=torch.bool, device=device)
+
+    for h in range(nh):
+        for i in range(n_pos):
+            idx = torch.nonzero(visible[h, i], as_tuple=False).squeeze(-1)
+            c = idx.numel()
+            if c > 0:
+                kept_indices[h, i, :c] = idx
+                keep_valid[h, i, :c] = True
+
+    k_full = ctx.rope_qkv[layer_idx]["k"].to(device)[0][head_idx].float()  # [nh, seq, hd]
+    v_full = ctx.rope_qkv[layer_idx]["v"].to(device)[0][head_idx].float()  # [nh, seq, hd]
+
+    gather_idx = kept_indices.clamp(min=0).unsqueeze(-1)  # [nh, n_pos, max_keep, 1]
+    gather_idx = gather_idx.expand(-1, -1, -1, k_full.shape[-1])
+
+    k_expand = k_full.unsqueeze(1).expand(-1, n_pos, -1, -1)
+    v_expand = v_full.unsqueeze(1).expand(-1, n_pos, -1, -1)
+
+    kept_k = torch.gather(k_expand, dim=2, index=gather_idx)
+    kept_v = torch.gather(v_expand, dim=2, index=gather_idx)
+
+    valid_4d = keep_valid.unsqueeze(-1)
+    kept_k = torch.where(valid_4d, kept_k, torch.zeros_like(kept_k))
+    kept_v = torch.where(valid_4d, kept_v, torch.zeros_like(kept_v))
+
+    return {
+        "kept_indices": kept_indices,
+        "keep_valid": keep_valid,
+        "kept_k": kept_k,
+        "kept_v": kept_v,
+    }
+
+
+def optimize_alpha_star_on_kept_v(
+    ctx,
+    layer_idx,
+    head_idx,
+    pos_list,
+    training_steps,
+    lr,
+    kept_v,
+    keep_valid,
+    loss_type="v_l2",
+    device=None,
+):
+    """Optimize routing weights directly on compressed V cache."""
+    if device is None:
+        device = ctx.device
+
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+
+    if loss_type != "v_l2":
+        raise ValueError(
+            f"optimize_alpha_star_on_kept_v only supports loss_type='v_l2', got {loss_type}."
+        )
+
+    n_heads = len(head_idx)
+    n_pos = len(pos_list)
+
+    if kept_v.shape[:3] != keep_valid.shape:
+        raise ValueError(
+            f"Shape mismatch: kept_v[:3]={kept_v.shape[:3]} vs keep_valid={keep_valid.shape}."
+        )
+    if kept_v.shape[0] != n_heads or kept_v.shape[1] != n_pos:
+        raise ValueError(
+            "kept_v shape is inconsistent with head_idx/pos_list. "
+            f"Expected ({n_heads}, {n_pos}, *), got {kept_v.shape[:3]}"
+        )
+
+    kept_v = kept_v.to(device).float()
+    keep_valid = keep_valid.to(device)
+
+    a_param = torch.nn.Parameter(torch.randn_like(keep_valid, dtype=torch.float32) * 0.1)
+    a_param.retain_grad()
+    opt = torch.optim.Adam([a_param], lr=lr)
+
+    original = ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(device)
+    gt_v = original[head_idx].detach().float()  # [nh, n_pos, hd]
+
+    losses = []
+    p_alpha = None
+    p_teacher = None
+
+    for step in range(training_steps):
+        logits = a_param.masked_fill(~keep_valid, float("-inf"))
+        alpha = F.softmax(logits, dim=-1)
+
+        V_new = (alpha.unsqueeze(-1) * kept_v).sum(dim=2)
+        loss = torch.norm(V_new - gt_v, p=2, dim=-1).mean()
+
+        if step % 100 == 0:
+            loss_v = loss.detach().float().cpu().item()
+            losses.append((step, loss_v))
+            print("step", step, "loss:", loss_v)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+    logits = a_param.masked_fill(~keep_valid, float("-inf"))
+    alpha = F.softmax(logits, dim=-1)
+    return alpha, p_alpha, p_teacher, losses
+
+
+def build_modified_attn_hidden_from_kept_v(
+    ctx,
+    layer_idx,
+    head_idx,
+    pos_list,
+    alpha,
+    kept_v,
+    device=None,
+):
+    """Build patched attention hidden states using compressed V and optimized alpha."""
+    if device is None:
+        device = ctx.device
+
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+
+    layer = ctx.model.model.layers[layer_idx]
+    original = ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(device)
+
+    V_new = (alpha.to(device).unsqueeze(-1) * kept_v.to(device).float()).sum(dim=2)
+    output = original.clone()
+    output[head_idx] = V_new.to(output.dtype)
+
+    attn_hidden = layer.self_attn.o_proj(output.permute(1, 0, 2).reshape(len(pos_list), -1))
+    return attn_hidden
+
+
 def build_qk_routing_alpha(ctx, layer_idx, head_idx, pos_list, mask, device=None):
     """Build baseline routing weights by applying original QK scores over the compressed KV mask."""
     if device is None:
@@ -169,6 +350,44 @@ def build_qk_routing_alpha(ctx, layer_idx, head_idx, pos_list, mask, device=None
         )
 
     return F.softmax(qk_logits + mask.to(torch.float32), dim=-1)
+
+
+def build_qk_routing_alpha_on_kept_kv(
+    ctx,
+    layer_idx,
+    head_idx,
+    pos_list,
+    kept_k,
+    keep_valid,
+    device=None,
+):
+    """Build baseline routing weights on compressed kept-K cache."""
+    if device is None:
+        device = ctx.device
+
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+
+    q_full = ctx.rope_qkv[layer_idx]["q"].to(device)[0][head_idx].float()  # [nh, seq, hd]
+    q = q_full[:, pos_list, :]  # [nh, n_pos, hd]
+
+    kept_k = kept_k.to(device).float()
+    keep_valid = keep_valid.to(device)
+
+    if kept_k.shape[:3] != keep_valid.shape:
+        raise ValueError(
+            f"Shape mismatch: kept_k[:3]={kept_k.shape[:3]} vs keep_valid={keep_valid.shape}."
+        )
+    if q.shape[0] != kept_k.shape[0] or q.shape[1] != kept_k.shape[1]:
+        raise ValueError(
+            "Q shape is inconsistent with kept_k. "
+            f"Q={q.shape[:2]}, kept_k={kept_k.shape[:2]}"
+        )
+
+    hd = q.shape[-1]
+    qk_logits = (q.unsqueeze(2) * kept_k).sum(dim=-1) / math.sqrt(hd)
+    qk_logits = qk_logits.masked_fill(~keep_valid, float("-inf"))
+    return F.softmax(qk_logits, dim=-1)
 
 
 def gen_mask(

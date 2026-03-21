@@ -4,7 +4,13 @@ from sqlite3 import adapt
 import torch
 from torch.nn import functional as F
 
-from .attention import build_qk_routing_alpha, gen_mask
+from .attention import (
+    build_kept_kv_cache,
+    build_modified_attn_hidden_from_kept_v,
+    build_qk_routing_alpha,
+    build_qk_routing_alpha_on_kept_kv,
+    gen_mask,
+)
 from .online_routing import (
     build_runtime_layer_ctx,
     capture_layer_artifacts,
@@ -25,7 +31,12 @@ def run_multilayer_baseline_check(
     ref_tail_logits,
 ):
     adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
-    out_path  = Path(f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/qk_routing.pt")
+    if args.kv_compress_mode == "mask":
+        out_path = Path(f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/qk_routing.pt")
+    elif args.kv_compress_mode == "kept_kv":
+        out_path = Path(f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/qk_routing_kept_kv.pt")
+    else:
+        raise ValueError(f"Unknown kv_compress_mode: {args.kv_compress_mode}")
 
     if out_path.exists():
         print(f"Found existing baseline comparison result at {out_path}, loading...")
@@ -36,6 +47,7 @@ def run_multilayer_baseline_check(
             "dataset": args.dataset,
             "start": args.start,
             "strategy": args.strategy,
+            "compress_mode": args.kv_compress_mode,
             "budgets": {},
         }
 
@@ -70,32 +82,65 @@ def run_multilayer_baseline_check(
                     layer_to_patch=baseline_layer_patch,
                 )
                 baseline_layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, baseline_artifacts)
-                mask = gen_mask(
-                    ctx=baseline_layer_ctx,
-                    layer_idx=layer_idx,
-                    pos_list=pos_list,
-                    head_idx=head_idx,
-                    strategy=args.strategy,
-                    budget=budget,
-                    seq_len=args.seq_len,
-                    adaptive_budget=args.adaptive_budget,
-                )
-                alpha_baseline = build_qk_routing_alpha(
-                    ctx=baseline_layer_ctx,
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    pos_list=pos_list,
-                    mask=mask,
-                    device=ctx.device,
-                )
-                baseline_layer_patch[layer_idx] = build_modified_attn_hidden(
-                    ctx=baseline_layer_ctx,
-                    layer_idx=layer_idx,
-                    head_idx=head_idx,
-                    pos_list=pos_list,
-                    alpha=alpha_baseline,
-                    device=ctx.device,
-                )
+                if args.kv_compress_mode == "mask":
+                    mask = gen_mask(
+                        ctx=baseline_layer_ctx,
+                        layer_idx=layer_idx,
+                        pos_list=pos_list,
+                        head_idx=head_idx,
+                        strategy=args.strategy,
+                        budget=budget,
+                        seq_len=args.seq_len,
+                        adaptive_budget=args.adaptive_budget,
+                    )
+                    alpha_baseline = build_qk_routing_alpha(
+                        ctx=baseline_layer_ctx,
+                        layer_idx=layer_idx,
+                        head_idx=head_idx,
+                        pos_list=pos_list,
+                        mask=mask,
+                        device=ctx.device,
+                    )
+                    baseline_layer_patch[layer_idx] = build_modified_attn_hidden(
+                        ctx=baseline_layer_ctx,
+                        layer_idx=layer_idx,
+                        head_idx=head_idx,
+                        pos_list=pos_list,
+                        alpha=alpha_baseline,
+                        device=ctx.device,
+                    )
+                elif args.kv_compress_mode == "kept_kv":
+                    kept_cache = build_kept_kv_cache(
+                        ctx=baseline_layer_ctx,
+                        layer_idx=layer_idx,
+                        pos_list=pos_list,
+                        head_idx=head_idx,
+                        strategy=args.strategy,
+                        budget=budget,
+                        seq_len=args.seq_len,
+                        adaptive_budget=args.adaptive_budget,
+                        device=ctx.device,
+                    )
+                    alpha_baseline = build_qk_routing_alpha_on_kept_kv(
+                        ctx=baseline_layer_ctx,
+                        layer_idx=layer_idx,
+                        head_idx=head_idx,
+                        pos_list=pos_list,
+                        kept_k=kept_cache["kept_k"],
+                        keep_valid=kept_cache["keep_valid"],
+                        device=ctx.device,
+                    )
+                    baseline_layer_patch[layer_idx] = build_modified_attn_hidden_from_kept_v(
+                        ctx=baseline_layer_ctx,
+                        layer_idx=layer_idx,
+                        head_idx=head_idx,
+                        pos_list=pos_list,
+                        alpha=alpha_baseline,
+                        kept_v=kept_cache["kept_v"],
+                        device=ctx.device,
+                    )
+                else:
+                    raise ValueError(f"Unknown kv_compress_mode: {args.kv_compress_mode}")
         except ValueError as exc:
             print(f"[WARN] Skip budget {budget}: {exc}")
             continue

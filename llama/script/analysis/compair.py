@@ -7,6 +7,7 @@ import torch
 from .attention import (
     build_qk_routing_alpha,
     gen_mask,
+    get_attention_map_after_rope,
     optimize_alpha_star,
 )
 from .config import set_seed, str_to_torch_dtype
@@ -111,6 +112,20 @@ def parse_args():
         help="Scale in signed-log diff map: sign(x)*log10(1 + |x|/eps).",
     )
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--sparsity-thresholds",
+        type=float,
+        nargs="+",
+        default=[1e-2, 1e-3, 1e-4],
+        help="Thresholds for density check: report fraction of weights above each threshold.",
+    )
+    parser.add_argument(
+        "--sparsity-mass-levels",
+        type=float,
+        nargs="+",
+        default=[0.9, 0.95],
+        help="Mass levels for top-k coverage ratio, e.g. 0.9 means minimal k covering 90% mass.",
+    )
     return parser.parse_args()
 
 
@@ -351,6 +366,98 @@ def signed_log_map(x: torch.Tensor, eps: float):
     return torch.sign(x) * torch.log10(1.0 + x.abs() / eps)
 
 
+def summarize_sparsity_per_head(weights, pos_list, thresholds, mass_levels):
+    """Summarize sparsity for [n_heads, n_pos, seq_len] weights on valid causal prefixes."""
+    eps = 1e-12
+    n_heads = weights.shape[0]
+    out = {}
+
+    thresholds = [float(x) for x in thresholds]
+    mass_levels = sorted(float(x) for x in mass_levels)
+
+    for h in range(n_heads):
+        density_acc = {thr: [] for thr in thresholds}
+        k_ratio_acc = {lvl: [] for lvl in mass_levels}
+        entropy_acc = []
+
+        for row_i, pos in enumerate(pos_list):
+            total_available = int(pos) + 1
+            if total_available <= 0:
+                continue
+
+            row = weights[h, row_i, :total_available].detach().float()
+
+            for thr in thresholds:
+                density_acc[thr].append((row > thr).float().mean().item())
+
+            sorted_row = torch.sort(row, descending=True).values
+            cumsum = torch.cumsum(sorted_row, dim=0)
+            for lvl in mass_levels:
+                idx = int(torch.searchsorted(cumsum, torch.tensor(lvl, device=row.device)).item())
+                k = min(idx + 1, total_available)
+                k_ratio_acc[lvl].append(k / float(total_available))
+
+            entropy = -(row * torch.log(row.clamp_min(eps))).sum().item()
+            entropy_norm = entropy / max(torch.log(torch.tensor(float(total_available))).item(), eps)
+            entropy_acc.append(entropy_norm)
+
+        head_stat = {
+            "num_positions": len(entropy_acc),
+            "entropy_norm_mean": float(torch.tensor(entropy_acc).mean().item()),
+        }
+        for thr in thresholds:
+            key = f"density_gt_{thr:g}"
+            head_stat[key] = float(torch.tensor(density_acc[thr]).mean().item())
+        for lvl in mass_levels:
+            key = f"k_ratio_for_mass_{lvl:g}"
+            head_stat[key] = float(torch.tensor(k_ratio_acc[lvl]).mean().item())
+
+        out[h] = head_stat
+
+    return out
+
+
+def summarize_sparsity_global(per_head_stats):
+    keys = list(next(iter(per_head_stats.values())).keys())
+    numeric_keys = [k for k in keys if k != "num_positions"]
+    out = {"num_heads": len(per_head_stats)}
+    for k in numeric_keys:
+        vals = torch.tensor([float(v[k]) for v in per_head_stats.values()], dtype=torch.float32)
+        out[f"{k}_mean"] = float(vals.mean().item())
+        out[f"{k}_std"] = float(vals.std(unbiased=False).item())
+    out["num_positions_mean"] = float(
+        torch.tensor([float(v["num_positions"]) for v in per_head_stats.values()]).mean().item()
+    )
+    return out
+
+
+def print_sparsity_report(head_labels, qk_raw_stats, qk_routing_stats, optimal_stats, mass_levels):
+    first_lvl = float(sorted(mass_levels)[0])
+    first_density_key = "density_gt_0.001"
+    first_k_key = f"k_ratio_for_mass_{first_lvl:g}"
+
+    print("===== Sparsity Check (Per Head) =====")
+    print(
+        "Columns: head | qk_raw dens>1e-3 | qk_route dens>1e-3 | opt dens>1e-3 | "
+        f"qk_raw k@{first_lvl:g} | qk_route k@{first_lvl:g} | opt k@{first_lvl:g}"
+    )
+
+    for i, h in enumerate(head_labels):
+        s_raw = qk_raw_stats[i]
+        s_route = qk_routing_stats[i]
+        s_opt = optimal_stats[i]
+        print(
+            f"head {h:>2d} | "
+            f"{s_raw[first_density_key]:.4f} | "
+            f"{s_route[first_density_key]:.4f} | "
+            f"{s_opt[first_density_key]:.4f} | "
+            f"{s_raw[first_k_key]:.4f} | "
+            f"{s_route[first_k_key]:.4f} | "
+            f"{s_opt[first_k_key]:.4f} |"
+            f"{s_opt[first_k_key]-s_route[first_k_key]:.4f}"
+        )
+
+
 def plot_routing_grid(alpha_base, alpha_opt, head_labels, out_path, dpi, alpha_viz, diff_log_eps):
     # alpha_*: [n_heads, n_pos, seq_len]
     n_heads = alpha_base.shape[0]
@@ -408,30 +515,39 @@ def plot_routing_grid(alpha_base, alpha_opt, head_labels, out_path, dpi, alpha_v
     plt.close(fig)
 
 
-def plot_overlap_curve(per_pos, out_path, dpi):
-    positions = [x["pos"] for x in per_pos]
-    overlap = [x["overlap_ratio"] for x in per_pos]
-    jaccard = [x["jaccard"] for x in per_pos]
-    mass1 = [x["opt_mass_on_base_topk"] for x in per_pos]
-    mass2 = [x["base_mass_on_opt_topk"] for x in per_pos]
+def plot_overlap_grid(per_head, head_labels, out_path, dpi):
+    n_heads = len(head_labels)
+    fig_h = max(2.8 * n_heads, 6.0)
+    fig, axes = plt.subplots(n_heads, 2, figsize=(14.0, fig_h), constrained_layout=True)
 
-    fig, axes = plt.subplots(2, 1, figsize=(12.0, 8.0), constrained_layout=True)
+    if n_heads == 1:
+        axes = axes.reshape(1, 2)
 
-    axes[0].plot(positions, overlap, label="top-k overlap ratio", linewidth=1.4)
-    axes[0].plot(positions, jaccard, label="jaccard", linewidth=1.2)
-    axes[0].set_ylim(0.0, 1.0)
-    axes[0].set_xlabel("Position")
-    axes[0].set_ylabel("Set overlap")
-    axes[0].grid(True, linestyle="--", alpha=0.35)
-    axes[0].legend()
+    for i, head_label in enumerate(head_labels):
+        per_pos = per_head[i]
+        positions = [x["pos"] for x in per_pos]
+        overlap = [x["overlap_ratio"] for x in per_pos]
+        jaccard = [x["jaccard"] for x in per_pos]
+        mass1 = [x["opt_mass_on_base_topk"] for x in per_pos]
+        mass2 = [x["base_mass_on_opt_topk"] for x in per_pos]
 
-    axes[1].plot(positions, mass1, label="opt mass on base top-k", linewidth=1.4)
-    axes[1].plot(positions, mass2, label="base mass on opt top-k", linewidth=1.4)
-    axes[1].set_ylim(0.0, 1.0)
-    axes[1].set_xlabel("Position")
-    axes[1].set_ylabel("Cross mass")
-    axes[1].grid(True, linestyle="--", alpha=0.35)
-    axes[1].legend()
+        axes[i, 0].plot(positions, overlap, label="top-k overlap ratio", linewidth=1.4)
+        axes[i, 0].plot(positions, jaccard, label="jaccard", linewidth=1.2)
+        axes[i, 0].set_ylim(0.0, 1.0)
+        axes[i, 0].set_xlabel("Position")
+        axes[i, 0].set_ylabel("Set overlap")
+        axes[i, 0].set_title(f"Head {head_label}: overlap")
+        axes[i, 0].grid(True, linestyle="--", alpha=0.35)
+        axes[i, 0].legend()
+
+        axes[i, 1].plot(positions, mass1, label="opt mass on base top-k", linewidth=1.4)
+        axes[i, 1].plot(positions, mass2, label="base mass on opt top-k", linewidth=1.4)
+        axes[i, 1].set_ylim(0.0, 1.0)
+        axes[i, 1].set_xlabel("Position")
+        axes[i, 1].set_ylabel("Cross mass")
+        axes[i, 1].set_title(f"Head {head_label}: cross-mass")
+        axes[i, 1].grid(True, linestyle="--", alpha=0.35)
+        axes[i, 1].legend()
 
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
@@ -517,6 +633,15 @@ def main():
         device=ctx.device,
     )
 
+    qk_scores_all, qk_probs_all = get_attention_map_after_rope(
+        ctx=layer_ctx,
+        layer_idx=args.layer,
+        causal=True,
+        dtype=torch.float32,
+        device=ctx.device,
+    )
+    qk_probs_selected = qk_probs_all[head_idx][:, pos_list, :]
+
     visible = int(args.seq_len * args.budget)
     topk = visible if args.topk is None else args.topk
     if topk <= 0:
@@ -530,6 +655,29 @@ def main():
         pos_list=pos_list,
         topk=topk,
     )
+
+    qk_raw_sparsity_per_head = summarize_sparsity_per_head(
+        weights=qk_probs_selected,
+        pos_list=pos_list,
+        thresholds=args.sparsity_thresholds,
+        mass_levels=args.sparsity_mass_levels,
+    )
+    qk_routing_sparsity_per_head = summarize_sparsity_per_head(
+        weights=alpha_baseline,
+        pos_list=pos_list,
+        thresholds=args.sparsity_thresholds,
+        mass_levels=args.sparsity_mass_levels,
+    )
+    optimal_sparsity_per_head = summarize_sparsity_per_head(
+        weights=alpha_opt,
+        pos_list=pos_list,
+        thresholds=args.sparsity_thresholds,
+        mass_levels=args.sparsity_mass_levels,
+    )
+
+    qk_raw_sparsity_global = summarize_sparsity_global(qk_raw_sparsity_per_head)
+    qk_routing_sparsity_global = summarize_sparsity_global(qk_routing_sparsity_per_head)
+    optimal_sparsity_global = summarize_sparsity_global(optimal_sparsity_per_head)
 
     mat_path = os.path.join(output_dir, "routing_grid.png")
     overlap_curve_path = os.path.join(output_dir, "topk_overlap_curve.png")
@@ -545,10 +693,9 @@ def main():
         diff_log_eps=args.diff_log_eps,
     )
 
-    # Keep overlap curve for the first selected head to avoid overly dense plots.
-    first_head_local = 0
-    plot_overlap_curve(
-        per_pos=per_head[first_head_local],
+    plot_overlap_grid(
+        per_head=per_head,
+        head_labels=head_idx,
         out_path=overlap_curve_path,
         dpi=args.dpi,
     )
@@ -564,6 +711,16 @@ def main():
             "topk": int(topk),
             "prefix_mode": args.prefix_mode,
             "loss": losses,
+            "sparsity": {
+                "thresholds": args.sparsity_thresholds,
+                "mass_levels": args.sparsity_mass_levels,
+                "qk_raw_per_head": qk_raw_sparsity_per_head,
+                "qk_routing_per_head": qk_routing_sparsity_per_head,
+                "optimal_per_head": optimal_sparsity_per_head,
+                "qk_raw_global": qk_raw_sparsity_global,
+                "qk_routing_global": qk_routing_sparsity_global,
+                "optimal_global": optimal_sparsity_global,
+            },
         },
         stats_path,
     )
@@ -584,6 +741,25 @@ def main():
     print(
         "max row-sum error: "
         f"baseline_alpha={base_row_sum_err:.3e}, optimal_alpha={opt_row_sum_err:.3e}"
+    )
+    print(
+        "global density_gt_1e-3: "
+        f"qk_raw={qk_raw_sparsity_global.get('density_gt_0.001_mean', float('nan')):.6f}, "
+        f"qk_routing={qk_routing_sparsity_global.get('density_gt_0.001_mean', float('nan')):.6f}, "
+        f"optimal={optimal_sparsity_global.get('density_gt_0.001_mean', float('nan')):.6f}"
+    )
+    print(
+        f"global k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}: "
+        f"qk_raw={qk_raw_sparsity_global.get(f'k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}_mean', float('nan')):.6f}, "
+        f"qk_routing={qk_routing_sparsity_global.get(f'k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}_mean', float('nan')):.6f}, "
+        f"optimal={optimal_sparsity_global.get(f'k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}_mean', float('nan')):.6f}"
+    )
+    print_sparsity_report(
+        head_labels=head_idx,
+        qk_raw_stats=qk_raw_sparsity_per_head,
+        qk_routing_stats=qk_routing_sparsity_per_head,
+        optimal_stats=optimal_sparsity_per_head,
+        mass_levels=args.sparsity_mass_levels,
     )
     print(f"saved matrix plot: {mat_path}")
     print(f"saved overlap curve: {overlap_curve_path}")

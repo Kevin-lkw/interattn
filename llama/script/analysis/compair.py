@@ -108,7 +108,7 @@ def parse_args():
     parser.add_argument(
         "--diff-log-eps",
         type=float,
-        default=1e-3,
+        default=1e-2,
         help="Scale in signed-log diff map: sign(x)*log10(1 + |x|/eps).",
     )
     parser.add_argument("--output-dir", type=str, default=None)
@@ -469,6 +469,28 @@ def signed_log_map(x: torch.Tensor, eps: float):
     return torch.sign(x) * torch.log10(1.0 + x.abs() / eps)
 
 
+def build_diff_v_map(alpha_opt: torch.Tensor, alpha_base: torch.Tensor, v_abs: torch.Tensor):
+    """Build delta-alpha weighted by |V| for visualization.
+
+    alpha_*: [n_heads, n_pos, seq_len]
+    v_abs:   [n_heads, seq_len]
+    """
+    if alpha_opt.shape != alpha_base.shape:
+        raise ValueError(
+            f"Shape mismatch: alpha_opt={tuple(alpha_opt.shape)} vs alpha_base={tuple(alpha_base.shape)}"
+        )
+    if v_abs.ndim != 2:
+        raise ValueError(f"v_abs must have shape [n_heads, seq_len], got {tuple(v_abs.shape)}")
+    if alpha_opt.shape[0] != v_abs.shape[0] or alpha_opt.shape[2] != v_abs.shape[1]:
+        raise ValueError(
+            "Shape mismatch for diff_v: "
+            f"alpha shape={tuple(alpha_opt.shape)}, v_abs shape={tuple(v_abs.shape)}"
+        )
+
+    delta_alpha = alpha_opt - alpha_base
+    return delta_alpha * v_abs.unsqueeze(1)
+
+
 def summarize_sparsity_per_head(weights, pos_list, thresholds, mass_levels):
     """Summarize sparsity for [n_heads, n_pos, seq_len] weights on valid causal prefixes."""
     eps = 1e-12
@@ -644,14 +666,23 @@ def plot_sparsity_curves_grid(
     plt.close(fig)
 
 
-def plot_routing_grid(alpha_base, alpha_opt, head_labels, out_path, dpi, alpha_viz, diff_log_eps):
+def plot_routing_grid(
+    alpha_base,
+    alpha_opt,
+    diff_v,
+    head_labels,
+    out_path,
+    dpi,
+    alpha_viz,
+    diff_log_eps,
+):
     # alpha_*: [n_heads, n_pos, seq_len]
     n_heads = alpha_base.shape[0]
     fig_h = max(2.8 * n_heads, 6.0)
-    fig, axes = plt.subplots(n_heads, 3, figsize=(15.0, fig_h), constrained_layout=True)
+    fig, axes = plt.subplots(n_heads, 4, figsize=(20.0, fig_h), constrained_layout=True)
 
     if n_heads == 1:
-        axes = axes.reshape(1, 3)
+        axes = axes.reshape(1, 4)
 
     for h in range(n_heads):
         base_map, alpha_mode_name, alpha_cmap, alpha_vmin = build_prob_viz_map(
@@ -664,6 +695,8 @@ def plot_routing_grid(alpha_base, alpha_opt, head_labels, out_path, dpi, alpha_v
 
         diff_map = signed_log_map(alpha_opt[h] - alpha_base[h], diff_log_eps)
         diff_lim = max(diff_map.abs().max().item(), 1e-8)
+        diff_v_map = signed_log_map(diff_v[h], diff_log_eps)
+        diff_v_lim = max(diff_v_map.abs().max().item(), 1e-8)
 
         im0 = axes[h, 0].imshow(
             _to_plot_array(base_map),
@@ -693,7 +726,17 @@ def plot_routing_grid(alpha_base, alpha_opt, head_labels, out_path, dpi, alpha_v
         axes[h, 2].set_title(f"Head {head_label}: diff signed-log (eps={diff_log_eps:g})")
         fig.colorbar(im2, ax=axes[h, 2], fraction=0.046)
 
-        for col in range(3):
+        im3 = axes[h, 3].imshow(
+            _to_plot_array(diff_v_map),
+            aspect="auto",
+            cmap="coolwarm",
+            vmin=-diff_v_lim,
+            vmax=diff_v_lim,
+        )
+        axes[h, 3].set_title(f"Head {head_label}: diff_v=delta alpha*|V| signed-log (eps={diff_log_eps:g})")
+        fig.colorbar(im3, ax=axes[h, 3], fraction=0.046)
+
+        for col in range(4):
             axes[h, col].set_xlabel("Key position")
             axes[h, col].set_ylabel("Query position")
 
@@ -827,6 +870,8 @@ def main():
         device=ctx.device,
     )
     qk_probs_selected = qk_probs_all[head_idx][:, pos_list, :]
+    v_selected = layer_ctx.rope_qkv[args.layer]["v"].to(ctx.device)[0][head_idx].float()
+    v_abs = torch.norm(v_selected, p=2, dim=-1)
 
     visible = int(args.seq_len * args.budget)
     topk = visible if args.topk is None else args.topk
@@ -847,6 +892,11 @@ def main():
         alpha_base=alpha_baseline,
         pos_list=pos_list,
         topk=10,
+    )
+    diff_v = build_diff_v_map(
+        alpha_opt=alpha_opt,
+        alpha_base=alpha_baseline,
+        v_abs=v_abs,
     )
 
     qk_raw_sparsity_per_head = summarize_sparsity_per_head(
@@ -897,6 +947,7 @@ def main():
     plot_routing_grid(
         alpha_base=alpha_baseline,
         alpha_opt=alpha_opt,
+        diff_v=diff_v,
         head_labels=head_idx,
         out_path=mat_path,
         dpi=args.dpi,

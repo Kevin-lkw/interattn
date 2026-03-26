@@ -139,7 +139,14 @@ def _build_rank_orders_for_one_row(delta_row, v_abs_row):
     return order_abs, order_abs_v
 
 
-def _build_inter_curve_for_one_head(alpha_base_h, alpha_opt_h, v_h, v_abs_h, valid_indices_per_row):
+def _build_inter_curve_for_one_head(
+    alpha_base_h,
+    alpha_opt_h,
+    v_h,
+    v_abs_h,
+    v_gt_h,
+    valid_indices_per_row,
+):
     """
     alpha_*_h: [n_pos, seq_len]
     v_h: [seq_len, head_dim]
@@ -148,23 +155,30 @@ def _build_inter_curve_for_one_head(alpha_base_h, alpha_opt_h, v_h, v_abs_h, val
 
         Return:
             n_steps: int (max number of replacement operations)
-      curve_abs: list[float]       sorted by |delta alpha|
-      curve_abs_v: list[float]     sorted by |delta alpha|*|V|
+            curve_abs_to_opt: list[float]     sorted by |delta alpha|, value is ||V - V*||
+            curve_abs_to_gt: list[float]      sorted by |delta alpha|, value is ||V - Vgt||
+            curve_abs_v_to_opt: list[float]   sorted by |delta alpha|*|V|, value is ||V - V*||
+            curve_abs_v_to_gt: list[float]    sorted by |delta alpha|*|V|, value is ||V - Vgt||
     """
     n_pos = alpha_base_h.shape[0]
     n_steps = int(max(int(idx.numel()) for idx in valid_indices_per_row))
     if n_steps <= 0:
         raise ValueError("No valid routing entries for interpolation.")
 
-    per_pos_abs = []
-    per_pos_abs_v = []
+    per_pos_abs_to_opt = []
+    per_pos_abs_to_gt = []
+    per_pos_abs_v_to_opt = []
+    per_pos_abs_v_to_gt = []
 
     for row_i in range(n_pos):
         valid_idx = valid_indices_per_row[row_i]
         k_valid = int(valid_idx.numel())
         if k_valid <= 0:
-            per_pos_abs.append([0.0] * n_steps)
-            per_pos_abs_v.append([0.0] * n_steps)
+            zeros = [0.0] * (n_steps + 1)
+            per_pos_abs_to_opt.append(zeros)
+            per_pos_abs_to_gt.append(zeros)
+            per_pos_abs_v_to_opt.append(zeros)
+            per_pos_abs_v_to_gt.append(zeros)
             continue
 
         base_row = alpha_base_h[row_i, valid_idx].detach().float()
@@ -177,9 +191,12 @@ def _build_inter_curve_for_one_head(alpha_base_h, alpha_opt_h, v_h, v_abs_h, val
         order_abs, order_abs_v = _build_rank_orders_for_one_row(delta_row, v_abs_valid)
 
         v_star = opt_row @ v_valid
+        v_gt_row = v_gt_h[row_i].detach().float()
 
-        row_curve_abs = []
-        row_curve_abs_v = []
+        row_curve_abs_to_opt = []
+        row_curve_abs_to_gt = []
+        row_curve_abs_v_to_opt = []
+        row_curve_abs_v_to_gt = []
 
         mix_abs = base_row.clone()
         mix_abs_v = base_row.clone()
@@ -187,8 +204,10 @@ def _build_inter_curve_for_one_head(alpha_base_h, alpha_opt_h, v_h, v_abs_h, val
         # t=0: replace nothing.
         v_now_abs0 = mix_abs @ v_valid
         v_now_abs_v0 = mix_abs_v @ v_valid
-        row_curve_abs.append(float(torch.norm(v_now_abs0 - v_star, p=2).item()))
-        row_curve_abs_v.append(float(torch.norm(v_now_abs_v0 - v_star, p=2).item()))
+        row_curve_abs_to_opt.append(float(torch.norm(v_now_abs0 - v_star, p=2).item()))
+        row_curve_abs_to_gt.append(float(torch.norm(v_now_abs0 - v_gt_row, p=2).item()))
+        row_curve_abs_v_to_opt.append(float(torch.norm(v_now_abs_v0 - v_star, p=2).item()))
+        row_curve_abs_v_to_gt.append(float(torch.norm(v_now_abs_v0 - v_gt_row, p=2).item()))
 
         for t in range(1, n_steps + 1):
             if t <= k_valid:
@@ -200,25 +219,35 @@ def _build_inter_curve_for_one_head(alpha_base_h, alpha_opt_h, v_h, v_abs_h, val
                 v_now_abs = mix_abs @ v_valid
                 v_now_abs_v = mix_abs_v @ v_valid
 
-                err_abs = torch.norm(v_now_abs - v_star, p=2).item()
-                err_abs_v = torch.norm(v_now_abs_v - v_star, p=2).item()
+                err_abs_to_opt = torch.norm(v_now_abs - v_star, p=2).item()
+                err_abs_to_gt = torch.norm(v_now_abs - v_gt_row, p=2).item()
+                err_abs_v_to_opt = torch.norm(v_now_abs_v - v_star, p=2).item()
+                err_abs_v_to_gt = torch.norm(v_now_abs_v - v_gt_row, p=2).item()
             else:
                 # All valid entries are already replaced.
-                err_abs = 0.0
-                err_abs_v = 0.0
+                err_abs_to_opt = 0.0
+                err_abs_to_gt = 0.0
+                err_abs_v_to_opt = 0.0
+                err_abs_v_to_gt = 0.0
 
-            row_curve_abs.append(float(err_abs))
-            row_curve_abs_v.append(float(err_abs_v))
+            row_curve_abs_to_opt.append(float(err_abs_to_opt))
+            row_curve_abs_to_gt.append(float(err_abs_to_gt))
+            row_curve_abs_v_to_opt.append(float(err_abs_v_to_opt))
+            row_curve_abs_v_to_gt.append(float(err_abs_v_to_gt))
 
-        per_pos_abs.append(row_curve_abs)
-        per_pos_abs_v.append(row_curve_abs_v)
+        per_pos_abs_to_opt.append(row_curve_abs_to_opt)
+        per_pos_abs_to_gt.append(row_curve_abs_to_gt)
+        per_pos_abs_v_to_opt.append(row_curve_abs_v_to_opt)
+        per_pos_abs_v_to_gt.append(row_curve_abs_v_to_gt)
 
-    curve_abs = torch.tensor(per_pos_abs, dtype=torch.float32).mean(dim=0).tolist()
-    curve_abs_v = torch.tensor(per_pos_abs_v, dtype=torch.float32).mean(dim=0).tolist()
-    return n_steps, curve_abs, curve_abs_v
+    curve_abs_to_opt = torch.tensor(per_pos_abs_to_opt, dtype=torch.float32).mean(dim=0).tolist()
+    curve_abs_to_gt = torch.tensor(per_pos_abs_to_gt, dtype=torch.float32).mean(dim=0).tolist()
+    curve_abs_v_to_opt = torch.tensor(per_pos_abs_v_to_opt, dtype=torch.float32).mean(dim=0).tolist()
+    curve_abs_v_to_gt = torch.tensor(per_pos_abs_v_to_gt, dtype=torch.float32).mean(dim=0).tolist()
+    return n_steps, curve_abs_to_opt, curve_abs_to_gt, curve_abs_v_to_opt, curve_abs_v_to_gt
 
 
-def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, pos_list, mask):
+def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, v_gt_selected, pos_list, mask):
     """
     alpha_*: [n_heads, n_pos, seq_len]
     v_selected: [n_heads, seq_len, head_dim]
@@ -232,12 +261,21 @@ def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, pos_list, m
         )
     if v_selected.ndim != 3:
         raise ValueError(f"v_selected must be [n_heads, seq_len, head_dim], got {tuple(v_selected.shape)}")
+    if v_gt_selected.ndim != 3:
+        raise ValueError(
+            f"v_gt_selected must be [n_heads, n_pos, head_dim], got {tuple(v_gt_selected.shape)}"
+        )
     if mask.shape != alpha_base.shape:
         raise ValueError(f"mask shape {tuple(mask.shape)} must match alpha shape {tuple(alpha_base.shape)}")
 
     n_heads, n_pos, seq_len = alpha_base.shape
     if len(pos_list) != n_pos:
         raise ValueError(f"len(pos_list)={len(pos_list)} does not match n_pos={n_pos}")
+    if v_gt_selected.shape[0] != n_heads or v_gt_selected.shape[1] != n_pos:
+        raise ValueError(
+            "v_gt_selected shape must match [n_heads, n_pos, head_dim]. "
+            f"got {tuple(v_gt_selected.shape)} vs expected heads={n_heads}, n_pos={n_pos}"
+        )
 
     v_abs = torch.norm(v_selected.detach().float(), p=2, dim=-1)  # [n_heads, seq_len]
     out = {}
@@ -250,18 +288,24 @@ def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, pos_list, m
             valid_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
             valid_indices_per_row.append(valid_idx)
 
-        n_steps, curve_abs, curve_abs_v = _build_inter_curve_for_one_head(
+        n_steps, curve_abs_to_opt, curve_abs_to_gt, curve_abs_v_to_opt, curve_abs_v_to_gt = _build_inter_curve_for_one_head(
             alpha_base_h=alpha_base[h],
             alpha_opt_h=alpha_opt[h],
             v_h=v_selected[h],
             v_abs_h=v_abs[h],
+            v_gt_h=v_gt_selected[h],
             valid_indices_per_row=valid_indices_per_row,
         )
 
         out[h] = {
             "x": list(range(0, n_steps + 1)),
-            "curve_abs_diff": curve_abs,
-            "curve_abs_diff_mul_v": curve_abs_v,
+            "curve_abs_to_opt": curve_abs_to_opt,
+            "curve_abs_to_gt": curve_abs_to_gt,
+            "curve_abs_v_to_opt": curve_abs_v_to_opt,
+            "curve_abs_v_to_gt": curve_abs_v_to_gt,
+            # Backward-compatible aliases (kept as Vgt curves).
+            "curve_abs_diff": curve_abs_to_gt,
+            "curve_abs_diff_mul_v": curve_abs_v_to_gt,
             "n_steps": n_steps,
             "n_pos": n_pos,
         }
@@ -280,15 +324,33 @@ def plot_stacked_head_curves(curves_per_head, head_labels, layer_idx, out_path, 
     for i, head_label in enumerate(head_labels):
         curve_info = curves_per_head[i]
         xs = curve_info["x"]
-        ys_abs = curve_info["curve_abs_diff"]
-        ys_abs_v = curve_info["curve_abs_diff_mul_v"]
+        ys_abs_to_opt = curve_info["curve_abs_to_opt"]
+        ys_abs_to_gt = curve_info["curve_abs_to_gt"]
+        ys_abs_v_to_opt = curve_info["curve_abs_v_to_opt"]
+        ys_abs_v_to_gt = curve_info["curve_abs_v_to_gt"]
 
         ax = axes[i]
-        ax.plot(xs, ys_abs, label="replace by |delta alpha|", linewidth=1.8)
-        ax.plot(xs, ys_abs_v, label="replace by |delta alpha|*|V|", linewidth=1.8)
+        ax.plot(xs, ys_abs_to_opt, color="C0", linestyle="-", label="|delta alpha| : |V-V*|", linewidth=1.8)
+        ax.plot(xs, ys_abs_to_gt, color="C0", linestyle="--", label="|delta alpha| : |V-Vgt|", linewidth=1.8)
+        ax.plot(
+            xs,
+            ys_abs_v_to_opt,
+            color="C1",
+            linestyle="-",
+            label="|delta alpha|*|V| : |V-V*|",
+            linewidth=1.8,
+        )
+        ax.plot(
+            xs,
+            ys_abs_v_to_gt,
+            color="C1",
+            linestyle="--",
+            label="|delta alpha|*|V| : |V-Vgt|",
+            linewidth=1.8,
+        )
         ax.set_xlim(left=0)
         ax.set_xlabel("# replaced routing entries")
-        ax.set_ylabel("||V - V*||_2")
+        ax.set_ylabel("L2 error")
         ax.set_title(f"Layer {layer_idx} Head {head_label}")
         ax.grid(True, linestyle="--", alpha=0.35)
         ax.legend()
@@ -391,11 +453,16 @@ def main():
     )
 
     v_selected = layer_ctx.rope_qkv[layer_idx]["v"].to(ctx.device)[0][head_idx].float()
+    # Full-QK routing target V (same training target used by optimize_alpha_star in v-space losses).
+    v_gt_selected = (
+        layer_ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(ctx.device)[head_idx].float()
+    )
 
     curves_per_head = compute_inter_curves_per_head(
         alpha_base=alpha_baseline,
         alpha_opt=alpha_opt,
         v_selected=v_selected,
+        v_gt_selected=v_gt_selected,
         pos_list=pos_list,
         mask=mask,
     )
@@ -409,10 +476,14 @@ def main():
         curve_info = curves_per_head[i]
         print(
             f"layer={layer_idx}, head={head_label}, points={curve_info['n_steps']}, "
-            f"start(abs)={curve_info['curve_abs_diff'][0]:.6e}, "
-            f"start(abs*|V|)={curve_info['curve_abs_diff_mul_v'][0]:.6e}, "
-            f"final(abs)={curve_info['curve_abs_diff'][-1]:.6e}, "
-            f"final(abs*|V|)={curve_info['curve_abs_diff_mul_v'][-1]:.6e}"
+            f"start(|V-V*|, abs)={curve_info['curve_abs_to_opt'][0]:.6e}, "
+            f"start(|V-Vgt|, abs)={curve_info['curve_abs_to_gt'][0]:.6e}, "
+            f"start(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][0]:.6e}, "
+            f"start(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][0]:.6e}, "
+            f"final(|V-V*|, abs)={curve_info['curve_abs_to_opt'][-1]:.6e}, "
+            f"final(|V-Vgt|, abs)={curve_info['curve_abs_to_gt'][-1]:.6e}, "
+            f"final(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][-1]:.6e}, "
+            f"final(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][-1]:.6e}"
         )
 
         layer_store["curves_per_head"][head_label] = curve_info

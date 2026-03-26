@@ -457,7 +457,7 @@ def _to_plot_array(x: torch.Tensor):
 
 
 def build_prob_viz_map(probs_tensor: torch.Tensor, mode: str, eps: float = 1e-8):
-    probs = probs_tensor.detach().float()[:256, :256]
+    probs = probs_tensor.detach().float()[:128, :128]
     if mode == "linear":
         return probs, "linear", "Reds", 0.0
     if mode == "log":
@@ -471,7 +471,7 @@ def build_prob_viz_map(probs_tensor: torch.Tensor, mode: str, eps: float = 1e-8)
 
 
 def signed_log_map(x: torch.Tensor, eps: float):
-    x = x[:256, :256]
+    x = x[:128, :128]
     return torch.sign(x) * torch.log10(1.0 + x.abs() / eps)
 
 

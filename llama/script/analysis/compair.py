@@ -332,23 +332,38 @@ def compute_overlap_stats(alpha_opt, alpha_base, pos_list, topk):
     return global_summary, per_head_summaries, per_head
 
 
-def summarize_signed_diff_topk_per_head(alpha_opt, alpha_base, pos_list, topk=10):
-    """Per-head signed diff extremes on valid causal prefixes."""
+def summarize_diff_v_topk_per_head(alpha_opt, alpha_base, v_abs, pos_list, topk=10):
+    """Per-head signed top-k for diff_v, with decomposed terms.
+
+    diff_v = (alpha_opt - alpha_base) * |V|
+    alpha_*: [n_heads, n_pos, seq_len]
+    v_abs:   [n_heads, seq_len]
+    """
     if alpha_opt.shape != alpha_base.shape:
         raise ValueError(
             f"Shape mismatch: alpha_opt={tuple(alpha_opt.shape)} vs alpha_base={tuple(alpha_base.shape)}"
         )
+    if v_abs.ndim != 2:
+        raise ValueError(f"v_abs must have shape [n_heads, seq_len], got {tuple(v_abs.shape)}")
+    if alpha_opt.shape[0] != v_abs.shape[0] or alpha_opt.shape[2] != v_abs.shape[1]:
+        raise ValueError(
+            "Shape mismatch for diff_v top-k: "
+            f"alpha shape={tuple(alpha_opt.shape)}, v_abs shape={tuple(v_abs.shape)}"
+        )
     if topk <= 0:
         raise ValueError("topk must be > 0")
 
-    diff = (alpha_opt - alpha_base).detach().float()
-    n_heads = diff.shape[0]
-    n_pos = diff.shape[1]
-    seq_len = diff.shape[2]
+    delta_alpha = (alpha_opt - alpha_base).detach().float()
+    v_abs = v_abs.detach().float()
+    diff_v = delta_alpha * v_abs.unsqueeze(1)
+
+    n_heads = diff_v.shape[0]
+    n_pos = diff_v.shape[1]
+    seq_len = diff_v.shape[2]
     out = {}
 
     for h in range(n_heads):
-        valid_mask = torch.zeros((n_pos, seq_len), dtype=torch.bool, device=diff.device)
+        valid_mask = torch.zeros((n_pos, seq_len), dtype=torch.bool, device=diff_v.device)
         for row_i, pos in enumerate(pos_list):
             total_available = int(pos) + 1
             if total_available <= 0:
@@ -358,7 +373,7 @@ def summarize_signed_diff_topk_per_head(alpha_opt, alpha_base, pos_list, topk=10
         if not valid_mask.any():
             raise ValueError("No valid entries for abs diff statistics.")
 
-        signed_vals = diff[h][valid_mask]
+        signed_vals = diff_v[h][valid_mask]
         abs_vals = signed_vals.abs()
         coords = valid_mask.nonzero(as_tuple=False)
 
@@ -372,14 +387,17 @@ def summarize_signed_diff_topk_per_head(alpha_opt, alpha_base, pos_list, topk=10
             coord = coords[pos_idx[rank]]
             row_i = int(coord[0].item())
             key_pos = int(coord[1].item())
-            v = float(pos_vals[rank].item())
+            score_v = float(pos_vals[rank].item())
+            attn_v = float(delta_alpha[h, row_i, key_pos].item())
+            v_norm = float(v_abs[h, key_pos].item())
             top_pos.append(
                 {
                     "rank": rank + 1,
                     "query_pos": int(pos_list[row_i]),
                     "key_pos": key_pos,
-                    "signed_diff": v,
-                    "abs_diff": float(abs(v)),
+                    "diff_v_score": score_v,
+                    "attention_score": attn_v,
+                    "v_abs": v_norm,
                 }
             )
 
@@ -388,14 +406,17 @@ def summarize_signed_diff_topk_per_head(alpha_opt, alpha_base, pos_list, topk=10
             coord = coords[neg_idx[rank]]
             row_i = int(coord[0].item())
             key_pos = int(coord[1].item())
-            v = float(neg_vals[rank].item())
+            score_v = float(neg_vals[rank].item())
+            attn_v = float(delta_alpha[h, row_i, key_pos].item())
+            v_norm = float(v_abs[h, key_pos].item())
             top_neg.append(
                 {
                     "rank": rank + 1,
                     "query_pos": int(pos_list[row_i]),
                     "key_pos": key_pos,
-                    "signed_diff": v,
-                    "abs_diff": float(abs(v)),
+                    "diff_v_score": score_v,
+                    "attention_score": attn_v,
+                    "v_abs": v_norm,
                 }
             )
 
@@ -407,29 +428,31 @@ def summarize_signed_diff_topk_per_head(alpha_opt, alpha_base, pos_list, topk=10
     return out
 
 
-def print_signed_diff_topk_report(head_labels, signed_diff_topk):
-    print("===== (optimal routing - attention routing) top positive/negative (Per Head) =====")
-    print("Columns: head | rank | query_pos | key_pos | signed_diff | abs_diff")
+def print_signed_topk_report(head_labels, signed_topk, score_name):
+    print(f"===== {score_name} top positive/negative (Per Head) =====")
+    print("Columns: head | rank | query_pos | key_pos | diff_v_score | attention_score | |V|")
     for i, h in enumerate(head_labels):
         print(f"-- head {h:>2d} positive top-k --")
-        for item in signed_diff_topk[i]["top_positive"]:
+        for item in signed_topk[i]["top_positive"]:
             print(
                 f"head {h:>2d} | "
                 f"{item['rank']:>1d} | "
                 f"{item['query_pos']:>4d} | "
                 f"{item['key_pos']:>4d} | "
-                f"{item['signed_diff']:+.6e} | "
-                f"{item['abs_diff']:.6e}"
+                f"{item['diff_v_score']:+.6e} | "
+                f"{item['attention_score']:+.6e} | "
+                f"{item['v_abs']:.6e}"
             )
         print(f"-- head {h:>2d} negative top-k --")
-        for item in signed_diff_topk[i]["top_negative"]:
+        for item in signed_topk[i]["top_negative"]:
             print(
                 f"head {h:>2d} | "
                 f"{item['rank']:>1d} | "
                 f"{item['query_pos']:>4d} | "
                 f"{item['key_pos']:>4d} | "
-                f"{item['signed_diff']:+.6e} | "
-                f"{item['abs_diff']:.6e}"
+                f"{item['diff_v_score']:+.6e} | "
+                f"{item['attention_score']:+.6e} | "
+                f"{item['v_abs']:.6e}"
             )
 
 
@@ -446,7 +469,7 @@ def _to_plot_array(x: torch.Tensor):
 
 def build_prob_viz_map(probs_tensor: torch.Tensor, mode: str, eps: float = 1e-8):
     probs = probs_tensor.detach().float()
-    probs = probs[:256,:256]
+    probs = probs[:128,:128]
     if mode == "linear":
         return probs, "linear", "Reds", 0.0
 
@@ -465,7 +488,7 @@ def build_prob_viz_map(probs_tensor: torch.Tensor, mode: str, eps: float = 1e-8)
 
 
 def signed_log_map(x: torch.Tensor, eps: float):
-    x = x[:256,:256]
+    x = x[:128,:128]
     return torch.sign(x) * torch.log10(1.0 + x.abs() / eps)
 
 
@@ -887,16 +910,17 @@ def main():
         topk=topk,
     )
 
-    signed_diff_top10_per_head = summarize_signed_diff_topk_per_head(
-        alpha_opt=alpha_opt,
-        alpha_base=alpha_baseline,
-        pos_list=pos_list,
-        topk=10,
-    )
     diff_v = build_diff_v_map(
         alpha_opt=alpha_opt,
         alpha_base=alpha_baseline,
         v_abs=v_abs,
+    )
+    diff_v_top10_per_head = summarize_diff_v_topk_per_head(
+        alpha_opt=alpha_opt,
+        alpha_base=alpha_baseline,
+        v_abs=v_abs,
+        pos_list=pos_list,
+        topk=10,
     )
 
     qk_raw_sparsity_per_head = summarize_sparsity_per_head(
@@ -944,34 +968,34 @@ def main():
     sparsity_curve_path = os.path.join(output_dir, "sparsity_curves_per_pos.png")
     stats_path = os.path.join(output_dir, "overlap_stats.pt")
 
-    plot_routing_grid(
-        alpha_base=alpha_baseline,
-        alpha_opt=alpha_opt,
-        diff_v=diff_v,
-        head_labels=head_idx,
-        out_path=mat_path,
-        dpi=args.dpi,
-        alpha_viz=args.alpha_viz,
-        diff_log_eps=args.diff_log_eps,
-    )
+    # plot_routing_grid(
+    #     alpha_base=alpha_baseline,
+    #     alpha_opt=alpha_opt,
+    #     diff_v=diff_v,
+    #     head_labels=head_idx,
+    #     out_path=mat_path,
+    #     dpi=args.dpi,
+    #     alpha_viz=args.alpha_viz,
+    #     diff_log_eps=args.diff_log_eps,
+    # )
 
-    plot_overlap_grid(
-        per_head=per_head,
-        head_labels=head_idx,
-        out_path=overlap_curve_path,
-        dpi=args.dpi,
-    )
+    # plot_overlap_grid(
+    #     per_head=per_head,
+    #     head_labels=head_idx,
+    #     out_path=overlap_curve_path,
+    #     dpi=args.dpi,
+    # )
 
-    plot_sparsity_curves_grid(
-        head_labels=head_idx,
-        pos_list=pos_list,
-        qk_raw_curves=qk_raw_per_pos_curves,
-        qk_routing_curves=qk_routing_per_pos_curves,
-        optimal_curves=optimal_per_pos_curves,
-        out_path=sparsity_curve_path,
-        dpi=args.dpi,
-        mass_level=per_pos_mass_level,
-    )
+    # plot_sparsity_curves_grid(
+    #     head_labels=head_idx,
+    #     pos_list=pos_list,
+    #     qk_raw_curves=qk_raw_per_pos_curves,
+    #     qk_routing_curves=qk_routing_per_pos_curves,
+    #     optimal_curves=optimal_per_pos_curves,
+    #     out_path=sparsity_curve_path,
+    #     dpi=args.dpi,
+    #     mass_level=per_pos_mass_level,
+    # )
 
     torch.save(
         {
@@ -984,7 +1008,7 @@ def main():
             "topk": int(topk),
             "prefix_mode": args.prefix_mode,
             "loss": losses,
-            "signed_diff_top10_per_head": signed_diff_top10_per_head,
+            "diff_v_top10_per_head": diff_v_top10_per_head,
             "sparsity": {
                 "thresholds": args.sparsity_thresholds,
                 "mass_levels": args.sparsity_mass_levels,
@@ -1039,9 +1063,10 @@ def main():
         optimal_stats=optimal_sparsity_per_head,
         mass_levels=args.sparsity_mass_levels,
     )
-    print_signed_diff_topk_report(
+    print_signed_topk_report(
         head_labels=head_idx,
-        signed_diff_topk=signed_diff_top10_per_head,
+        signed_topk=diff_v_top10_per_head,
+        score_name="(optimal routing - attention routing) * |V|",
     )
     print(f"saved matrix plot: {mat_path}")
     print(f"saved overlap curve: {overlap_curve_path}")

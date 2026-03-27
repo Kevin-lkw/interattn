@@ -85,6 +85,17 @@ def parse_args():
     parser.add_argument("--pos-start", type=int, default=0)
     parser.add_argument("--pos-end", type=int, default=None)
     parser.add_argument("--dpi", type=int, default=180)
+    parser.add_argument(
+        "--curve-mode",
+        type=str,
+        default="abs_v_only",
+        choices=["abs_v_only", "all"],
+        help=(
+            "Which curves to show/print. "
+            "abs_v_only: only |delta alpha|*|V| curves; "
+            "all: include both |delta alpha| and |delta alpha|*|V| curves."
+        ),
+    )
     parser.add_argument("--output-dir", type=str, default=None)
     return parser.parse_args()
 
@@ -139,6 +150,13 @@ def _build_rank_orders_for_one_row(delta_row, v_abs_row):
     return order_abs, order_abs_v
 
 
+def _cos_similarity(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> float:
+    denom = x.norm(p=2) * y.norm(p=2)
+    if denom.item() <= eps:
+        return 0.0
+    return float((x @ y).item() / float(denom.item()))
+
+
 def _build_inter_curve_for_one_head(
     alpha_base_h,
     alpha_opt_h,
@@ -159,6 +177,8 @@ def _build_inter_curve_for_one_head(
             curve_abs_to_gt: list[float]      sorted by |delta alpha|, value is ||V - Vgt||
             curve_abs_v_to_opt: list[float]   sorted by |delta alpha|*|V|, value is ||V - V*||
             curve_abs_v_to_gt: list[float]    sorted by |delta alpha|*|V|, value is ||V - Vgt||
+            curve_abs_v_cos_to_opt: list[float] sorted by |delta alpha|*|V|, value is cos(V, V*)
+            curve_abs_v_cos_to_gt: list[float]  sorted by |delta alpha|*|V|, value is cos(V, Vgt)
     """
     n_pos = alpha_base_h.shape[0]
     n_steps = int(max(int(idx.numel()) for idx in valid_indices_per_row))
@@ -169,6 +189,8 @@ def _build_inter_curve_for_one_head(
     per_pos_abs_to_gt = []
     per_pos_abs_v_to_opt = []
     per_pos_abs_v_to_gt = []
+    per_pos_abs_v_cos_to_opt = []
+    per_pos_abs_v_cos_to_gt = []
 
     for row_i in range(n_pos):
         valid_idx = valid_indices_per_row[row_i]
@@ -179,6 +201,8 @@ def _build_inter_curve_for_one_head(
             per_pos_abs_to_gt.append(zeros)
             per_pos_abs_v_to_opt.append(zeros)
             per_pos_abs_v_to_gt.append(zeros)
+            per_pos_abs_v_cos_to_opt.append(zeros)
+            per_pos_abs_v_cos_to_gt.append(zeros)
             continue
 
         base_row = alpha_base_h[row_i, valid_idx].detach().float()
@@ -197,6 +221,8 @@ def _build_inter_curve_for_one_head(
         row_curve_abs_to_gt = []
         row_curve_abs_v_to_opt = []
         row_curve_abs_v_to_gt = []
+        row_curve_abs_v_cos_to_opt = []
+        row_curve_abs_v_cos_to_gt = []
 
         mix_abs = base_row.clone()
         mix_abs_v = base_row.clone()
@@ -208,6 +234,8 @@ def _build_inter_curve_for_one_head(
         row_curve_abs_to_gt.append(float(torch.norm(v_now_abs0 - v_gt_row, p=2).item()))
         row_curve_abs_v_to_opt.append(float(torch.norm(v_now_abs_v0 - v_star, p=2).item()))
         row_curve_abs_v_to_gt.append(float(torch.norm(v_now_abs_v0 - v_gt_row, p=2).item()))
+        row_curve_abs_v_cos_to_opt.append(_cos_similarity(v_now_abs_v0, v_star))
+        row_curve_abs_v_cos_to_gt.append(_cos_similarity(v_now_abs_v0, v_gt_row))
 
         for t in range(1, n_steps + 1):
             if t <= k_valid:
@@ -223,28 +251,46 @@ def _build_inter_curve_for_one_head(
                 err_abs_to_gt = torch.norm(v_now_abs - v_gt_row, p=2).item()
                 err_abs_v_to_opt = torch.norm(v_now_abs_v - v_star, p=2).item()
                 err_abs_v_to_gt = torch.norm(v_now_abs_v - v_gt_row, p=2).item()
+                cos_abs_v_to_opt = _cos_similarity(v_now_abs_v, v_star)
+                cos_abs_v_to_gt = _cos_similarity(v_now_abs_v, v_gt_row)
             else:
                 # All valid entries are already replaced.
                 err_abs_to_opt = 0.0
                 err_abs_to_gt = 0.0
                 err_abs_v_to_opt = 0.0
                 err_abs_v_to_gt = 0.0
+                cos_abs_v_to_opt = 1.0
+                cos_abs_v_to_gt = _cos_similarity(v_gt_row, v_star)
 
             row_curve_abs_to_opt.append(float(err_abs_to_opt))
             row_curve_abs_to_gt.append(float(err_abs_to_gt))
             row_curve_abs_v_to_opt.append(float(err_abs_v_to_opt))
             row_curve_abs_v_to_gt.append(float(err_abs_v_to_gt))
+            row_curve_abs_v_cos_to_opt.append(float(cos_abs_v_to_opt))
+            row_curve_abs_v_cos_to_gt.append(float(cos_abs_v_to_gt))
 
         per_pos_abs_to_opt.append(row_curve_abs_to_opt)
         per_pos_abs_to_gt.append(row_curve_abs_to_gt)
         per_pos_abs_v_to_opt.append(row_curve_abs_v_to_opt)
         per_pos_abs_v_to_gt.append(row_curve_abs_v_to_gt)
+        per_pos_abs_v_cos_to_opt.append(row_curve_abs_v_cos_to_opt)
+        per_pos_abs_v_cos_to_gt.append(row_curve_abs_v_cos_to_gt)
 
     curve_abs_to_opt = torch.tensor(per_pos_abs_to_opt, dtype=torch.float32).mean(dim=0).tolist()
     curve_abs_to_gt = torch.tensor(per_pos_abs_to_gt, dtype=torch.float32).mean(dim=0).tolist()
     curve_abs_v_to_opt = torch.tensor(per_pos_abs_v_to_opt, dtype=torch.float32).mean(dim=0).tolist()
     curve_abs_v_to_gt = torch.tensor(per_pos_abs_v_to_gt, dtype=torch.float32).mean(dim=0).tolist()
-    return n_steps, curve_abs_to_opt, curve_abs_to_gt, curve_abs_v_to_opt, curve_abs_v_to_gt
+    curve_abs_v_cos_to_opt = torch.tensor(per_pos_abs_v_cos_to_opt, dtype=torch.float32).mean(dim=0).tolist()
+    curve_abs_v_cos_to_gt = torch.tensor(per_pos_abs_v_cos_to_gt, dtype=torch.float32).mean(dim=0).tolist()
+    return (
+        n_steps,
+        curve_abs_to_opt,
+        curve_abs_to_gt,
+        curve_abs_v_to_opt,
+        curve_abs_v_to_gt,
+        curve_abs_v_cos_to_opt,
+        curve_abs_v_cos_to_gt,
+    )
 
 
 def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, v_gt_selected, pos_list, mask):
@@ -288,7 +334,15 @@ def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, v_gt_select
             valid_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
             valid_indices_per_row.append(valid_idx)
 
-        n_steps, curve_abs_to_opt, curve_abs_to_gt, curve_abs_v_to_opt, curve_abs_v_to_gt = _build_inter_curve_for_one_head(
+        (
+            n_steps,
+            curve_abs_to_opt,
+            curve_abs_to_gt,
+            curve_abs_v_to_opt,
+            curve_abs_v_to_gt,
+            curve_abs_v_cos_to_opt,
+            curve_abs_v_cos_to_gt,
+        ) = _build_inter_curve_for_one_head(
             alpha_base_h=alpha_base[h],
             alpha_opt_h=alpha_opt[h],
             v_h=v_selected[h],
@@ -303,6 +357,8 @@ def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, v_gt_select
             "curve_abs_to_gt": curve_abs_to_gt,
             "curve_abs_v_to_opt": curve_abs_v_to_opt,
             "curve_abs_v_to_gt": curve_abs_v_to_gt,
+            "curve_abs_v_cos_to_opt": curve_abs_v_cos_to_opt,
+            "curve_abs_v_cos_to_gt": curve_abs_v_cos_to_gt,
             # Backward-compatible aliases (kept as Vgt curves).
             "curve_abs_diff": curve_abs_to_gt,
             "curve_abs_diff_mul_v": curve_abs_v_to_gt,
@@ -313,7 +369,7 @@ def compute_inter_curves_per_head(alpha_base, alpha_opt, v_selected, v_gt_select
     return out
 
 
-def plot_stacked_head_curves(curves_per_head, head_labels, layer_idx, out_path, dpi):
+def plot_stacked_head_curves(curves_per_head, head_labels, layer_idx, out_path, dpi, curve_mode):
     n_heads = len(head_labels)
     fig_h = max(2.7 * n_heads, 5.0)
     fig, axes = plt.subplots(n_heads, 1, figsize=(9.5, fig_h), constrained_layout=True)
@@ -328,32 +384,64 @@ def plot_stacked_head_curves(curves_per_head, head_labels, layer_idx, out_path, 
         ys_abs_to_gt = curve_info["curve_abs_to_gt"]
         ys_abs_v_to_opt = curve_info["curve_abs_v_to_opt"]
         ys_abs_v_to_gt = curve_info["curve_abs_v_to_gt"]
+        ys_abs_v_cos_to_opt = curve_info["curve_abs_v_cos_to_opt"]
+        ys_abs_v_cos_to_gt = curve_info["curve_abs_v_cos_to_gt"]
 
         ax = axes[i]
-        ax.plot(xs, ys_abs_to_opt, color="C0", linestyle="-", label="|delta alpha| : |V-V*|", linewidth=1.8)
-        ax.plot(xs, ys_abs_to_gt, color="C0", linestyle="--", label="|delta alpha| : |V-Vgt|", linewidth=1.8)
-        ax.plot(
+        handles = []
+        labels = []
+        if curve_mode == "all":
+            h0 = ax.plot(xs, ys_abs_to_opt, color="C0", linestyle="-", label="|delta alpha| : |V-V*|", linewidth=1.8)[0]
+            h1 = ax.plot(xs, ys_abs_to_gt, color="C0", linestyle="--", label="|delta alpha| : |V-Vgt|", linewidth=1.8)[0]
+            handles.extend([h0, h1])
+            labels.extend([h0.get_label(), h1.get_label()])
+        h2 = ax.plot(
             xs,
             ys_abs_v_to_opt,
             color="C1",
             linestyle="-",
             label="|delta alpha|*|V| : |V-V*|",
             linewidth=1.8,
-        )
-        ax.plot(
+        )[0]
+        h3 = ax.plot(
             xs,
             ys_abs_v_to_gt,
             color="C1",
             linestyle="--",
             label="|delta alpha|*|V| : |V-Vgt|",
             linewidth=1.8,
-        )
+        )[0]
+        handles.extend([h2, h3])
+        labels.extend([h2.get_label(), h3.get_label()])
+
+        ax_cos = ax.twinx()
+        h4 = ax_cos.plot(
+            xs,
+            ys_abs_v_cos_to_opt,
+            color="C2",
+            linestyle="-",
+            label="|delta alpha|*|V| : cos(V,V*)",
+            linewidth=1.6,
+        )[0]
+        h5 = ax_cos.plot(
+            xs,
+            ys_abs_v_cos_to_gt,
+            color="C2",
+            linestyle="--",
+            label="|delta alpha|*|V| : cos(V,Vgt)",
+            linewidth=1.6,
+        )[0]
+        ax_cos.set_ylabel("Cos similarity")
+        ax_cos.set_ylim(-1.0, 1.0)
+        handles.extend([h4, h5])
+        labels.extend([h4.get_label(), h5.get_label()])
+
         ax.set_xlim(left=0)
         ax.set_xlabel("# replaced routing entries")
         ax.set_ylabel("L2 error")
         ax.set_title(f"Layer {layer_idx} Head {head_label}")
         ax.grid(True, linestyle="--", alpha=0.35)
-        ax.legend()
+        ax.legend(handles, labels, loc="best")
 
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
@@ -474,17 +562,34 @@ def main():
 
     for i, head_label in enumerate(head_idx):
         curve_info = curves_per_head[i]
-        print(
-            f"layer={layer_idx}, head={head_label}, points={curve_info['n_steps']}, "
-            f"start(|V-V*|, abs)={curve_info['curve_abs_to_opt'][0]:.6e}, "
-            f"start(|V-Vgt|, abs)={curve_info['curve_abs_to_gt'][0]:.6e}, "
-            f"start(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][0]:.6e}, "
-            f"start(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][0]:.6e}, "
-            f"final(|V-V*|, abs)={curve_info['curve_abs_to_opt'][-1]:.6e}, "
-            f"final(|V-Vgt|, abs)={curve_info['curve_abs_to_gt'][-1]:.6e}, "
-            f"final(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][-1]:.6e}, "
-            f"final(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][-1]:.6e}"
-        )
+        if args.curve_mode == "all":
+            print(
+                f"layer={layer_idx}, head={head_label}, points={curve_info['n_steps']}, "
+                f"start(|V-V*|, abs)={curve_info['curve_abs_to_opt'][0]:.6e}, "
+                f"start(|V-Vgt|, abs)={curve_info['curve_abs_to_gt'][0]:.6e}, "
+                f"start(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][0]:.6e}, "
+                f"start(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][0]:.6e}, "
+                f"final(|V-V*|, abs)={curve_info['curve_abs_to_opt'][-1]:.6e}, "
+                f"final(|V-Vgt|, abs)={curve_info['curve_abs_to_gt'][-1]:.6e}, "
+                f"final(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][-1]:.6e}, "
+                f"final(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][-1]:.6e}, "
+                f"start(cos,V*)={curve_info['curve_abs_v_cos_to_opt'][0]:.6e}, "
+                f"start(cos,Vgt)={curve_info['curve_abs_v_cos_to_gt'][0]:.6e}, "
+                f"final(cos,V*)={curve_info['curve_abs_v_cos_to_opt'][-1]:.6e}, "
+                f"final(cos,Vgt)={curve_info['curve_abs_v_cos_to_gt'][-1]:.6e}"
+            )
+        else:
+            print(
+                f"layer={layer_idx}, head={head_label}, points={curve_info['n_steps']}, "
+                f"start(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][0]:.6e}, "
+                f"start(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][0]:.6e}, "
+                f"final(|V-V*|, abs*|V|)={curve_info['curve_abs_v_to_opt'][-1]:.6e}, "
+                f"final(|V-Vgt|, abs*|V|)={curve_info['curve_abs_v_to_gt'][-1]:.6e}, "
+                f"start(cos,V*)={curve_info['curve_abs_v_cos_to_opt'][0]:.6e}, "
+                f"start(cos,Vgt)={curve_info['curve_abs_v_cos_to_gt'][0]:.6e}, "
+                f"final(cos,V*)={curve_info['curve_abs_v_cos_to_opt'][-1]:.6e}, "
+                f"final(cos,Vgt)={curve_info['curve_abs_v_cos_to_gt'][-1]:.6e}"
+            )
 
         layer_store["curves_per_head"][head_label] = curve_info
 
@@ -495,6 +600,7 @@ def main():
         layer_idx=layer_idx,
         out_path=stacked_fig_path,
         dpi=args.dpi,
+        curve_mode=args.curve_mode,
     )
     print(f"saved plot: {stacked_fig_path}")
 

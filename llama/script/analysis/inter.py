@@ -157,6 +157,80 @@ def _cos_similarity(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> flo
     return float((x @ y).item() / float(denom.item()))
 
 
+def write_modified_topk_report_txt(
+    out_path,
+    alpha_base,
+    alpha_opt,
+    v_selected,
+    mask,
+    pos_list,
+    head_labels,
+    topk=5,
+):
+    """Write top-k modified routing entries for each (head, query position).
+
+    Ranking score: |diff| * |V|, where diff = alpha_opt - alpha_base.
+    """
+    if alpha_base.shape != alpha_opt.shape:
+        raise ValueError(
+            f"Shape mismatch: alpha_base={tuple(alpha_base.shape)} vs alpha_opt={tuple(alpha_opt.shape)}"
+        )
+    if mask.shape != alpha_base.shape:
+        raise ValueError(f"mask shape {tuple(mask.shape)} must match alpha shape {tuple(alpha_base.shape)}")
+    if v_selected.ndim != 3:
+        raise ValueError(f"v_selected must be [n_heads, seq_len, head_dim], got {tuple(v_selected.shape)}")
+    if topk <= 0:
+        raise ValueError("topk must be > 0")
+
+    n_heads, n_pos, _seq_len = alpha_base.shape
+    if len(pos_list) != n_pos:
+        raise ValueError(f"len(pos_list)={len(pos_list)} does not match n_pos={n_pos}")
+    if len(head_labels) != n_heads:
+        raise ValueError(f"len(head_labels)={len(head_labels)} does not match n_heads={n_heads}")
+
+    v_abs = torch.norm(v_selected.detach().float(), p=2, dim=-1)  # [n_heads, seq_len]
+    diff = (alpha_opt - alpha_base).detach().float()
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# Top modified routing entries per head and query position\n")
+        f.write("# Ranking score = |diff| * |V|, diff = alpha_opt - alpha_base\n\n")
+
+        for h in range(n_heads):
+            head_label = int(head_labels[h])
+            f.write(f"===== head {head_label} =====\n")
+            for row_i, q_pos in enumerate(pos_list):
+                total_available = int(q_pos) + 1
+                valid_mask = torch.isfinite(mask[h, row_i, :total_available])
+                valid_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+                k_valid = int(valid_idx.numel())
+
+                if k_valid <= 0:
+                    f.write(f"query_pos={int(q_pos)}: no valid routing entries\n")
+                    continue
+
+                row_diff = diff[h, row_i, valid_idx]
+                row_v_abs = v_abs[h, valid_idx]
+                row_score = row_diff.abs() * row_v_abs
+
+                k = min(int(topk), k_valid)
+                top_local = torch.topk(row_score, k=k, largest=True).indices
+
+                f.write(f"query_pos={int(q_pos)}\n")
+                f.write("rank\tkey_pos\tdiff\tabs_diff\tv_abs\tscore_abs_diff_mul_v\n")
+                for rank in range(k):
+                    local_idx = int(top_local[rank].item())
+                    key_pos = int(valid_idx[local_idx].item())
+                    diff_val = float(row_diff[local_idx].item())
+                    abs_diff_val = abs(diff_val)
+                    v_abs_val = float(row_v_abs[local_idx].item())
+                    score_val = float(row_score[local_idx].item())
+                    f.write(
+                        f"{rank + 1}\t{key_pos}\t{diff_val:+.6e}\t{abs_diff_val:.6e}\t"
+                        f"{v_abs_val:.6e}\t{score_val:.6e}\n"
+                    )
+                f.write("\n")
+
+
 def _build_inter_curve_for_one_head(
     alpha_base_h,
     alpha_opt_h,
@@ -555,6 +629,18 @@ def main():
         mask=mask,
     )
 
+    modified_topk_txt_path = os.path.join(output_dir, "modified_top5_routing.txt")
+    write_modified_topk_report_txt(
+        out_path=modified_topk_txt_path,
+        alpha_base=alpha_baseline,
+        alpha_opt=alpha_opt,
+        v_selected=v_selected,
+        mask=mask,
+        pos_list=pos_list,
+        head_labels=head_idx,
+        topk=5,
+    )
+
     layer_store = {
         "loss": losses,
         "curves_per_head": {},
@@ -608,6 +694,7 @@ def main():
 
     stats_path = os.path.join(output_dir, "interpolation_stats.pt")
     torch.save(summary, stats_path)
+    print(f"saved modified top5 report: {modified_topk_txt_path}")
     print(f"saved stats: {stats_path}")
 
 

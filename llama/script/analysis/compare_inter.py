@@ -1,3 +1,8 @@
+"""
+Plot interpolation curves between baseline routing and optimal routing for a specific layer.
+For each head, we rank the routing entries by |delta alpha|*|V|, 
+prefix layer 0 ~ L-1 with optimal routing, then training on layer L.
+"""
 import argparse
 import os
 

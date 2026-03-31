@@ -1,3 +1,6 @@
+"""
+Double-opt experiment: compare two optimal routings from different alpha initializations.
+"""
 import argparse
 import os
 

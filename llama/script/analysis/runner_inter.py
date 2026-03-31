@@ -1,3 +1,9 @@
+"""
+run baseline and optimal routing online and compare PPL.
+Inter routing replaces top-K% entries ranked by |alpha_opt-alpha_base|*|V|
+Result:
+- align top 20 routings make up the routing gap.
+"""
 import argparse
 import os
 

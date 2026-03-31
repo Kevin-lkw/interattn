@@ -1,3 +1,13 @@
+"""
+Visualize and compare optimal routing vs baseline routing for a specific layer.
+print per-head image.
+- attnetion map
+- sparisity stats
+- overlap grid
+
+prefix layer 0 ~ L-1 with optimal routing, then training on layer L.
+can prefill with baseline routing
+"""
 import argparse
 import os
 

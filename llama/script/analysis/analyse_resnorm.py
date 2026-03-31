@@ -1,3 +1,11 @@
+"""
+A script to analyse hidden state residual norms:
+Findings:
+- sink tokens have large attention score, but relative small |V|~0.1 (normal ~ 8).
+- sink tokens have several very large residual norms. 
+
+"""
+
 import argparse
 import os
 

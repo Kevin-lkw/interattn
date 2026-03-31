@@ -1,3 +1,7 @@
+"""
+This module contains utility functions
+comput NLL and KL
+"""
 import torch
 from torch.nn import functional as F
 

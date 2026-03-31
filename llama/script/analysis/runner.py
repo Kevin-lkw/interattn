@@ -1,3 +1,11 @@
+"""
+This is the main runner for the online routing experiment. It includes:
+1. Loading the model, tokenizer, and dataset context.
+2. Running the online optimization for each specified budget and layer.
+3. Saving the results after each budget optimization.
+4. Running a one-shot multi-layer baseline comparison at the end.
+"""
+
 import os
 from sqlite3 import adapt
 import time

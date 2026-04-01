@@ -354,15 +354,6 @@ def main():
         loss_type=args.loss_type,
         device=ctx.device,
     )
-
-    qk_scores_all, qk_probs_all = get_attention_map_after_rope(
-        ctx=layer_ctx,
-        layer_idx=args.layer,
-        causal=True,
-        dtype=torch.float32,
-        device=ctx.device,
-    )
-    qk_probs_selected = qk_probs_all[head_idx][:, pos_list, :]
     v_selected = layer_ctx.rope_qkv[args.layer]["v"].to(ctx.device)[0][head_idx].float()
     v_abs = torch.norm(v_selected, p=2, dim=-1)
 
@@ -372,72 +363,13 @@ def main():
         raise ValueError(
             f"topk={topk} is invalid. Increase --budget or provide a positive --topk."
         )
-
-    # summary, per_head_summaries, per_head = compute_overlap_stats(
-    #     alpha_opt=alpha_opt,
-    #     alpha_base=alpha_baseline,
-    #     pos_list=pos_list,
-    #     topk=topk,
-    # )
-
     diff_v = build_diff_v_map(
         alpha_opt=alpha_opt,
         alpha_base=alpha_baseline,
         v_abs=v_abs,
     )
-    # diff_v_top10_per_head = summarize_diff_v_topk_per_head(
-    #     alpha_opt=alpha_opt,
-    #     alpha_base=alpha_baseline,
-    #     v_abs=v_abs,
-    #     pos_list=pos_list,
-    #     topk=10,
-    # )
-
-    # qk_raw_sparsity_per_head = summarize_sparsity_per_head(
-    #     weights=qk_probs_selected,
-    #     pos_list=pos_list,
-    #     thresholds=args.sparsity_thresholds,
-    #     mass_levels=args.sparsity_mass_levels,
-    # )
-    # qk_routing_sparsity_per_head = summarize_sparsity_per_head(
-    #     weights=alpha_baseline,
-    #     pos_list=pos_list,
-    #     thresholds=args.sparsity_thresholds,
-    #     mass_levels=args.sparsity_mass_levels,
-    # )
-    # optimal_sparsity_per_head = summarize_sparsity_per_head(
-    #     weights=alpha_opt,
-    #     pos_list=pos_list,
-    #     thresholds=args.sparsity_thresholds,
-    #     mass_levels=args.sparsity_mass_levels,
-    # )
-
-    # qk_raw_sparsity_global = summarize_sparsity_global(qk_raw_sparsity_per_head)
-    # qk_routing_sparsity_global = summarize_sparsity_global(qk_routing_sparsity_per_head)
-    # optimal_sparsity_global = summarize_sparsity_global(optimal_sparsity_per_head)
-
-    # per_pos_mass_level = 0.9
-    # qk_raw_per_pos_curves = compute_per_pos_sparsity_curves(
-    #     weights=qk_probs_selected,
-    #     pos_list=pos_list,
-    #     mass_level=per_pos_mass_level,
-    # )
-    # qk_routing_per_pos_curves = compute_per_pos_sparsity_curves(
-    #     weights=alpha_baseline,
-    #     pos_list=pos_list,
-    #     mass_level=per_pos_mass_level,
-    # )
-    # optimal_per_pos_curves = compute_per_pos_sparsity_curves(
-    #     weights=alpha_opt,
-    #     pos_list=pos_list,
-    #     mass_level=per_pos_mass_level,
-    # )
 
     mat_path = os.path.join(output_dir, "routing_grid.png")
-    overlap_curve_path = os.path.join(output_dir, "topk_overlap_curve.png")
-    sparsity_curve_path = os.path.join(output_dir, "sparsity_curves_per_pos.png")
-    stats_path = os.path.join(output_dir, "overlap_stats.pt")
-
     plot_routing_grid(
         alpha_base=alpha_baseline,
         alpha_opt=alpha_opt,
@@ -449,100 +381,11 @@ def main():
         diff_log_eps=args.diff_log_eps,
     )
 
-    # plot_overlap_grid(
-    #     per_head=per_head,
-    #     head_labels=head_idx,
-    #     out_path=overlap_curve_path,
-    #     dpi=args.dpi,
-    # )
-
-    # plot_sparsity_curves_grid(
-    #     head_labels=head_idx,
-    #     pos_list=pos_list,
-    #     qk_raw_curves=qk_raw_per_pos_curves,
-    #     qk_routing_curves=qk_routing_per_pos_curves,
-    #     optimal_curves=optimal_per_pos_curves,
-    #     out_path=sparsity_curve_path,
-    #     dpi=args.dpi,
-    #     mass_level=per_pos_mass_level,
-    # )
-
-    # torch.save(
-    #     {
-    #         "summary": summary,
-    #         "per_head_summary": per_head_summaries,
-    #         "per_head": per_head,
-    #         "layer": args.layer,
-    #         "heads": head_idx,
-    #         "budget": float(args.budget),
-    #         "topk": int(topk),
-    #         "prefix_mode": args.prefix_mode,
-    #         "loss": losses,
-    #         "diff_v_top10_per_head": diff_v_top10_per_head,
-    #         "sparsity": {
-    #             "thresholds": args.sparsity_thresholds,
-    #             "mass_levels": args.sparsity_mass_levels,
-    #             "per_pos_mass_level": per_pos_mass_level,
-    #             "qk_raw_per_head": qk_raw_sparsity_per_head,
-    #             "qk_routing_per_head": qk_routing_sparsity_per_head,
-    #             "optimal_per_head": optimal_sparsity_per_head,
-    #             "qk_raw_global": qk_raw_sparsity_global,
-    #             "qk_routing_global": qk_routing_sparsity_global,
-    #             "optimal_global": optimal_sparsity_global,
-    #             "qk_raw_per_pos_curves": qk_raw_per_pos_curves,
-    #             "qk_routing_per_pos_curves": qk_routing_per_pos_curves,
-    #             "optimal_per_pos_curves": optimal_per_pos_curves,
-    #         },
-    #     },
-    #     stats_path,
-    # )
-
-    base_row_sum_err = (alpha_baseline.sum(dim=-1) - 1.0).abs().max().item()
-    opt_row_sum_err = (alpha_opt.sum(dim=-1) - 1.0).abs().max().item()
-
     print("===== Compare Summary =====")
     print(
         f"layer={args.layer}, heads={head_idx}, budget={args.budget:g}, "
         f"topk={topk}, prefix_mode={args.prefix_mode}"
     )
-    # print(
-    #     f"mean overlap ratio={summary['mean_overlap_ratio']:.6f} +- {summary['std_overlap_ratio']:.6f}"
-    # )
-    # print(f"mean jaccard={summary['mean_jaccard']:.6f} +- {summary['std_jaccard']:.6f}")
-    # print(f"num_heads={summary['num_heads']}")
-    # print(
-    #     "max row-sum error: "
-    #     f"baseline_alpha={base_row_sum_err:.3e}, optimal_alpha={opt_row_sum_err:.3e}"
-    # )
-    # print(
-    #     "global density_gt_1e-3: "
-    #     f"qk_raw={qk_raw_sparsity_global.get('density_gt_0.001_mean', float('nan')):.6f}, "
-    #     f"qk_routing={qk_routing_sparsity_global.get('density_gt_0.001_mean', float('nan')):.6f}, "
-    #     f"optimal={optimal_sparsity_global.get('density_gt_0.001_mean', float('nan')):.6f}"
-    # )
-    # print(
-    #     f"global k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}: "
-    #     f"qk_raw={qk_raw_sparsity_global.get(f'k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}_mean', float('nan')):.6f}, "
-    #     f"qk_routing={qk_routing_sparsity_global.get(f'k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}_mean', float('nan')):.6f}, "
-    #     f"optimal={optimal_sparsity_global.get(f'k_ratio_for_mass_{args.sparsity_mass_levels[0]:g}_mean', float('nan')):.6f}"
-    # )
-    # print_sparsity_report(
-    #     head_labels=head_idx,
-    #     qk_raw_stats=qk_raw_sparsity_per_head,
-    #     qk_routing_stats=qk_routing_sparsity_per_head,
-    #     optimal_stats=optimal_sparsity_per_head,
-    #     mass_levels=args.sparsity_mass_levels,
-    # )
-    # print_signed_topk_report(
-    #     head_labels=head_idx,
-    #     signed_topk=diff_v_top10_per_head,
-    #     score_name="(optimal routing - attention routing) * |V|",
-    # )
-    # print(f"saved matrix plot: {mat_path}")
-    # print(f"saved overlap curve: {overlap_curve_path}")
-    # print(f"saved sparsity curve: {sparsity_curve_path}")
-    # print(f"saved stats: {stats_path}")
-
 
 if __name__ == "__main__":
     main()

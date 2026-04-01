@@ -44,7 +44,7 @@ def optimize_alpha_star(
     training_steps,
     lr,
     mask,
-    loss_type="logits_kl",
+    loss_type="v_l2",
     device=None,
 ):
     """

@@ -79,6 +79,17 @@ def parse_args():
     parser.add_argument("--tau-min", type=float, default=1e-3)
     parser.add_argument("--tau-max", type=float, default=1e3)
     parser.add_argument(
+        "--tau-granularity",
+        type=str,
+        default="head",
+        choices=["head", "head_query"],
+        help=(
+            "Granularity of tau. "
+            "head: one tau per head; "
+            "head_query: one tau per (head, query position)."
+        ),
+    )
+    parser.add_argument(
         "--tau-target",
         type=str,
         default="optimal_ce",
@@ -248,13 +259,23 @@ def get_qk_logits(ctx, layer_idx, head_idx, pos_list, device):
 
 def build_temp_scaled_alpha(qk_logits, mask, tau):
     if torch.is_tensor(tau):
-        if tau.ndim != 1 or tau.shape[0] != qk_logits.shape[0]:
-            raise ValueError(
-                f"tau tensor shape must be [n_heads], got {tuple(tau.shape)} for n_heads={qk_logits.shape[0]}"
-            )
+        if tau.ndim == 1:
+            if tau.shape[0] != qk_logits.shape[0]:
+                raise ValueError(
+                    f"tau tensor shape must be [n_heads], got {tuple(tau.shape)} for n_heads={qk_logits.shape[0]}"
+                )
+            tau_view = tau.to(device=qk_logits.device, dtype=torch.float32).view(-1, 1, 1)
+        elif tau.ndim == 2:
+            expected = (qk_logits.shape[0], qk_logits.shape[1])
+            if tuple(tau.shape) != expected:
+                raise ValueError(
+                    f"tau tensor shape must be [n_heads, n_pos], got {tuple(tau.shape)}; expected {expected}"
+                )
+            tau_view = tau.to(device=qk_logits.device, dtype=torch.float32).unsqueeze(-1)
+        else:
+            raise ValueError(f"Unsupported tau ndim={tau.ndim}; expected 1 or 2")
         if not torch.all(tau > 0):
             raise ValueError("All tau values must be > 0")
-        tau_view = tau.to(device=qk_logits.device, dtype=torch.float32).view(-1, 1, 1)
     else:
         tau_val = float(tau)
         if tau_val <= 0:
@@ -264,10 +285,26 @@ def build_temp_scaled_alpha(qk_logits, mask, tau):
     return F.softmax(qk_logits / tau_view + mask.to(torch.float32), dim=-1)
 
 
-def optimize_tau_ce(alpha_target, qk_logits, mask, tau_init, tau_steps, tau_lr, tau_min, tau_max):
+def optimize_tau_ce(
+    alpha_target,
+    qk_logits,
+    mask,
+    tau_init,
+    tau_steps,
+    tau_lr,
+    tau_min,
+    tau_max,
+    tau_granularity="head",
+):
     n_heads = qk_logits.shape[0]
+    n_pos = qk_logits.shape[1]
+    if tau_granularity == "head_query":
+        tau_shape = (n_heads, n_pos)
+    else:
+        tau_shape = (n_heads,)
+
     log_tau = torch.nn.Parameter(
-        torch.full((n_heads,), math.log(tau_init), dtype=torch.float32, device=qk_logits.device)
+        torch.full(tau_shape, math.log(tau_init), dtype=torch.float32, device=qk_logits.device)
     )
     opt = torch.optim.Adam([log_tau], lr=tau_lr)
 
@@ -285,7 +322,11 @@ def optimize_tau_ce(alpha_target, qk_logits, mask, tau_init, tau_steps, tau_lr, 
             torch.full_like(safe_mask, -1e9),
             safe_mask,
         )
-        logits = qk_safe / tau.view(-1, 1, 1) + safe_mask
+        if tau_granularity == "head_query":
+            tau_view = tau.unsqueeze(-1)
+        else:
+            tau_view = tau.view(-1, 1, 1)
+        logits = qk_safe / tau_view + safe_mask
         ce = -(alpha_target * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
         opt.zero_grad(set_to_none=True)
         ce.backward()
@@ -304,10 +345,27 @@ def optimize_tau_ce(alpha_target, qk_logits, mask, tau_init, tau_steps, tau_lr, 
     return final_tau.cpu(), alpha_scaled, history
 
 
-def optimize_tau_v_l2(v_head, v_gt, qk_logits, mask, tau_init, tau_steps, tau_lr, tau_min, tau_max):
+def optimize_tau_v_l2(
+    v_head,
+    v_gt,
+    qk_logits,
+    mask,
+    tau_init,
+    tau_steps,
+    tau_lr,
+    tau_min,
+    tau_max,
+    tau_granularity="head",
+):
     n_heads = qk_logits.shape[0]
+    n_pos = qk_logits.shape[1]
+    if tau_granularity == "head_query":
+        tau_shape = (n_heads, n_pos)
+    else:
+        tau_shape = (n_heads,)
+
     log_tau = torch.nn.Parameter(
-        torch.full((n_heads,), math.log(tau_init), dtype=torch.float32, device=qk_logits.device)
+        torch.full(tau_shape, math.log(tau_init), dtype=torch.float32, device=qk_logits.device)
     )
     opt = torch.optim.Adam([log_tau], lr=tau_lr)
 
@@ -325,7 +383,11 @@ def optimize_tau_v_l2(v_head, v_gt, qk_logits, mask, tau_init, tau_steps, tau_lr
             safe_mask,
         )
 
-        alpha_tau = F.softmax(qk_safe / tau.view(-1, 1, 1) + safe_mask, dim=-1)
+        if tau_granularity == "head_query":
+            tau_view = tau.unsqueeze(-1)
+        else:
+            tau_view = tau.view(-1, 1, 1)
+        alpha_tau = F.softmax(qk_safe / tau_view + safe_mask, dim=-1)
         v_new = alpha_tau @ v_head.float()
         loss = torch.norm(v_new - v_gt.float(), p=2, dim=-1).mean()
 
@@ -376,6 +438,14 @@ def save_tau_per_head_tsv(out_path, tau_per_head, head_idx):
         f.write("head\ttau\n")
         for i, h in enumerate(head_idx):
             f.write(f"{h}\t{float(tau_per_head[i].item()):.8e}\n")
+
+
+def save_tau_per_head_query_tsv(out_path, tau_per_hq, head_idx, pos_list):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("head\tpos\ttau\n")
+        for i, h in enumerate(head_idx):
+            for j, pos in enumerate(pos_list):
+                f.write(f"{h}\t{pos}\t{float(tau_per_hq[i, j].item()):.8e}\n")
 
 
 def plot_tau_per_head_points(out_path, tau_per_head, head_idx, dpi=180):
@@ -488,7 +558,7 @@ def main():
             device=ctx.device,
         )
 
-        tau_per_head, alpha_scaled, tau_history = optimize_tau_ce(
+        tau_param, alpha_scaled, tau_history = optimize_tau_ce(
             alpha_target=alpha_opt.detach().to(torch.float32),
             qk_logits=qk_logits,
             mask=mask,
@@ -497,6 +567,7 @@ def main():
             tau_lr=args.tau_lr,
             tau_min=args.tau_min,
             tau_max=args.tau_max,
+            tau_granularity=args.tau_granularity,
         )
 
         base_metric = kl_per_pos(alpha_opt.detach().to(torch.float32), alpha_base.detach().to(torch.float32))
@@ -510,7 +581,7 @@ def main():
             .float()
         )
 
-        tau_per_head, alpha_scaled, tau_history = optimize_tau_v_l2(
+        tau_param, alpha_scaled, tau_history = optimize_tau_v_l2(
             v_head=v_head,
             v_gt=v_gt,
             qk_logits=qk_logits,
@@ -520,6 +591,7 @@ def main():
             tau_lr=args.tau_lr,
             tau_min=args.tau_min,
             tau_max=args.tau_max,
+            tau_granularity=args.tau_granularity,
         )
 
         metric_name = "v_l2"
@@ -527,12 +599,15 @@ def main():
         scaled_metric = v_l2_per_pos(alpha_scaled.detach().to(torch.float32), v_head, v_gt)
 
     print("===== Compare-Q Summary =====")
-    tau_pairs = ", ".join(
-        f"h{h}:{float(tau_per_head[i].item()):.6f}" for i, h in enumerate(head_idx)
-    )
+    if tau_param.ndim == 1:
+        tau_per_head = tau_param
+    else:
+        tau_per_head = tau_param.mean(dim=1)
+    tau_pairs = ", ".join(f"h{h}:{float(tau_per_head[i].item()):.6f}" for i, h in enumerate(head_idx))
     print(
         f"layer={args.layer}, heads={head_idx}, budget={args.budget:g}, "
-        f"prefix_mode={args.prefix_mode}, tau_target={args.tau_target}, tau_per_head=[{tau_pairs}]"
+        f"prefix_mode={args.prefix_mode}, tau_target={args.tau_target}, "
+        f"tau_granularity={args.tau_granularity}, tau_per_head=[{tau_pairs}]"
     )
     print(
         f"mean base {metric_name}={float(base_metric.mean().item()):.8e}, "
@@ -546,6 +621,11 @@ def main():
 
     tau_points_tsv_path = os.path.join(output_dir, "tau_per_head.tsv")
     save_tau_per_head_tsv(tau_points_tsv_path, tau_per_head, head_idx)
+
+    tau_hq_tsv_path = None
+    if tau_param.ndim == 2:
+        tau_hq_tsv_path = os.path.join(output_dir, "tau_per_head_query.tsv")
+        save_tau_per_head_query_tsv(tau_hq_tsv_path, tau_param, head_idx, pos_list)
 
     tau_points_png_path = os.path.join(output_dir, "tau_per_head.png")
     plot_tau_per_head_points(
@@ -561,8 +641,10 @@ def main():
         "heads": head_idx,
         "pos_list": pos_list,
         "tau_target": args.tau_target,
+        "tau_granularity": args.tau_granularity,
         "metric_name": metric_name,
         "tau_per_head": {h: float(tau_per_head[i].item()) for i, h in enumerate(head_idx)},
+        "tau_param": tau_param,
         "tau_history": tau_history,
         "mean_base_metric": float(base_metric.mean().item()),
         "mean_scaled_metric": float(scaled_metric.mean().item()),
@@ -573,8 +655,10 @@ def main():
     stats_path = os.path.join(output_dir, "compare_q_stats.pt")
     torch.save(stats, stats_path)
 
-    print(f"Saved per-pos KL table to: {per_pos_path}")
+    print(f"Saved per-pos {metric_name} table to: {per_pos_path}")
     print(f"Saved tau-per-head table to: {tau_points_tsv_path}")
+    if tau_hq_tsv_path is not None:
+        print(f"Saved tau-per-head-query table to: {tau_hq_tsv_path}")
     print(f"Saved tau-per-head figure to: {tau_points_png_path}")
     print(f"Saved stats to: {stats_path}")
 

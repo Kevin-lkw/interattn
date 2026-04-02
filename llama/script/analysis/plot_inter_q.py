@@ -45,7 +45,7 @@ def resolve_default_summary_path(args):
     adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
     return (
         f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/"
-        f"{args.loss_type}/runner_inter_q/runner_inter_q_summary.pt"
+        f"{args.loss_type}/runner_inter_q_temp/runner_inter_q_summary.pt"
     )
 
 

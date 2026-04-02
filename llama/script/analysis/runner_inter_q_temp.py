@@ -90,13 +90,24 @@ def parse_args():
 
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--adaptive-budget", action="store_true")
-    parser.add_argument("--budgets", type=float, nargs="+", default=[0.01, 0.025, 0.05, 0.1])
+    parser.add_argument("--budgets", type=float, nargs="+", default=[0.01, 0.025, 0.05])
 
-    parser.add_argument("--tau-steps", type=int, default=200)
+    parser.add_argument("--tau-steps", type=int, default=300)
     parser.add_argument("--tau-lr", type=float, default=5e-2)
     parser.add_argument("--tau-init", type=float, default=1.0)
     parser.add_argument("--tau-min", type=float, default=1e-3)
     parser.add_argument("--tau-max", type=float, default=1e3)
+    parser.add_argument(
+        "--tau-granularity",
+        type=str,
+        default="head",
+        choices=["head", "head_query"],
+        help=(
+            "Granularity of tau. "
+            "head: one tau per head; "
+            "head_query: one tau per (head, query position)."
+        ),
+    )
     parser.add_argument(
         "--tau-target",
         type=str,
@@ -282,6 +293,7 @@ def build_layer_patches_inter_q(ctx, args, budget, layer_idx_list, head_idx, pos
                 tau_lr=args.tau_lr,
                 tau_min=args.tau_min,
                 tau_max=args.tau_max,
+                tau_granularity=args.tau_granularity,
             )
         else:
             v_head = layer_ctx.rope_qkv[layer_idx]["v"].to(ctx.device)[0][head_idx].float()
@@ -301,8 +313,14 @@ def build_layer_patches_inter_q(ctx, args, budget, layer_idx_list, head_idx, pos
                 tau_lr=args.tau_lr,
                 tau_min=args.tau_min,
                 tau_max=args.tau_max,
+                tau_granularity=args.tau_granularity,
             )
             losses = "skipped_optimal_routing"
+
+        if tau_per_head.ndim == 1:
+            tau_per_head_summary = tau_per_head
+        else:
+            tau_per_head_summary = tau_per_head.mean(dim=1)
 
         patches[layer_idx] = build_modified_attn_hidden(
             ctx=layer_ctx,
@@ -314,7 +332,8 @@ def build_layer_patches_inter_q(ctx, args, budget, layer_idx_list, head_idx, pos
         )
 
         tau_by_layer[layer_idx] = {
-            "tau_per_head": {h: float(tau_per_head[i].item()) for i, h in enumerate(head_idx)},
+            "tau_per_head": {h: float(tau_per_head_summary[i].item()) for i, h in enumerate(head_idx)},
+            "tau_param": tau_per_head,
             "tau_history": tau_history,
         }
         losses_by_layer[layer_idx] = losses
@@ -359,6 +378,7 @@ def main():
         "strategy": args.strategy,
         "loss_type": args.loss_type,
         "tau_target": args.tau_target,
+        "tau_granularity": args.tau_granularity,
         "tau": {
             "tau_steps": int(args.tau_steps),
             "tau_lr": float(args.tau_lr),
@@ -385,6 +405,7 @@ def main():
                 "strategy",
                 "loss_type",
                 "tau_target",
+                "tau_granularity",
                 "tau",
                 "layers",
                 "reference",
@@ -457,7 +478,8 @@ def main():
 
         print(
             f"[ppl] ref={ref_ppl:.6f}, baseline={baseline_ppl:.6f}, "
-            f"inter_q(tau-scaling:{args.tau_target})={inter_q_ppl:.6f}, optimal={optimal_ppl:.6f}"
+            f"inter_q(tau-scaling:{args.tau_target},{args.tau_granularity})={inter_q_ppl:.6f}, "
+            f"optimal={optimal_ppl:.6f}"
         )
 
     torch.save(summary, save_path)

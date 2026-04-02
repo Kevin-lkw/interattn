@@ -72,6 +72,17 @@ def parse_args():
     parser.add_argument("--bias-steps", type=int, default=200)
     parser.add_argument("--bias-lr", type=float, default=5e-2)
     parser.add_argument(
+        "--tau-target",
+        type=str,
+        default="optimal_ce",
+        choices=["optimal_ce", "v_l2_gt"],
+        help=(
+            "Target for bias optimization. "
+            "optimal_ce: CE(alpha_opt, alpha_bias); "
+            "v_l2_gt: directly minimize ||V_bias - V_gt||_2 (skip optimal routing)."
+        ),
+    )
+    parser.add_argument(
         "--bias-l2",
         type=float,
         default=0.0,
@@ -252,7 +263,6 @@ def optimize_bias_ce(alpha_target, qk_logits, mask, bias_steps, bias_lr, bias_l2
     history = []
 
     for step in range(int(bias_steps)):
-        # Remove per-head global shift ambiguity in softmax logits.
         bias_centered = bias_param - bias_param.mean(dim=-1, keepdim=True)
         logits = qk_logits + bias_centered.unsqueeze(1) + mask_f
         logp = F.log_softmax(logits, dim=-1)
@@ -288,6 +298,47 @@ def optimize_bias_ce(alpha_target, qk_logits, mask, bias_steps, bias_lr, bias_l2
     return final_bias, alpha_bias, history
 
 
+def optimize_bias_v_l2(v_head, v_gt, qk_logits, mask, bias_steps, bias_lr, bias_l2):
+    n_heads = qk_logits.shape[0]
+    seq_len = qk_logits.shape[-1]
+    bias_param = torch.nn.Parameter(
+        torch.zeros(n_heads, seq_len, dtype=torch.float32, device=qk_logits.device)
+    )
+    opt = torch.optim.Adam([bias_param], lr=bias_lr)
+
+    mask_f = mask.to(torch.float32)
+    history = []
+
+    for step in range(int(bias_steps)):
+        bias_centered = bias_param - bias_param.mean(dim=-1, keepdim=True)
+        logits = qk_logits + bias_centered.unsqueeze(1) + mask_f
+        alpha_bias = F.softmax(logits, dim=-1)
+        v_new = alpha_bias @ v_head.float()
+        loss = torch.norm(v_new - v_gt.float(), p=2, dim=-1).mean()
+
+        if float(bias_l2) > 0.0:
+            loss = loss + float(bias_l2) * (bias_centered.pow(2).mean())
+
+        if not torch.isfinite(loss):
+            raise ValueError("Bias optimization loss became non-finite.")
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([bias_param], max_norm=1.0)
+        opt.step()
+
+        if step % 20 == 0 or step == int(bias_steps) - 1:
+            lv = float(loss.detach().cpu().item())
+            history.append((int(step), lv))
+            print(f"[bias-opt-v] step={step:4d} loss={lv:.8f}")
+
+    with torch.no_grad():
+        final_bias = (bias_param - bias_param.mean(dim=-1, keepdim=True)).detach().cpu()
+        alpha_bias = build_bias_routing_alpha(qk_logits, mask, final_bias)
+
+    return final_bias, alpha_bias, history
+
+
 def kl_per_pos(alpha_target, alpha_pred):
     eps = 1e-12
     kl = (
@@ -297,13 +348,19 @@ def kl_per_pos(alpha_target, alpha_pred):
     return kl.mean(dim=0)
 
 
-def save_per_pos_kl_tsv(out_path, pos_list, kl_base, kl_bias):
+def v_l2_per_pos(alpha, v_head, v_gt):
+    v_new = alpha.float() @ v_head.float()
+    l2 = torch.norm(v_new - v_gt.float(), p=2, dim=-1)
+    return l2.mean(dim=0)
+
+
+def save_per_pos_metric_tsv(out_path, pos_list, base_metric, bias_metric, metric_name):
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("pos\tbase_kl\tbias_kl\tdelta_base_minus_bias\n")
+        f.write(f"pos\tbase_{metric_name}\tbias_{metric_name}\tdelta_base_minus_bias\n")
         for i, pos in enumerate(pos_list):
-            kb = float(kl_base[i].item())
-            km = float(kl_bias[i].item())
-            f.write(f"{pos}\t{kb:.8e}\t{km:.8e}\t{(kb - km):.8e}\n")
+            mb = float(base_metric[i].item())
+            mm = float(bias_metric[i].item())
+            f.write(f"{pos}\t{mb:.8e}\t{mm:.8e}\t{(mb - mm):.8e}\n")
 
 
 def save_bias_per_key_tsv(out_path, bias):
@@ -400,18 +457,6 @@ def main():
         device=ctx.device,
     )
 
-    alpha_opt, _p_alpha, _p_teacher, _losses = optimize_alpha_star(
-        ctx=layer_ctx,
-        layer_idx=args.layer,
-        head_idx=head_idx,
-        pos_list=pos_list,
-        training_steps=args.training_steps,
-        lr=args.lr,
-        mask=mask,
-        loss_type=args.loss_type,
-        device=ctx.device,
-    )
-
     qk_logits = get_qk_logits(
         ctx=layer_ctx,
         layer_idx=args.layer,
@@ -419,39 +464,76 @@ def main():
         pos_list=pos_list,
         device=ctx.device,
     )
+    metric_name = "kl"
+    alpha_opt = None
 
-    bias, alpha_bias, bias_history = optimize_bias_ce(
-        alpha_target=alpha_opt.detach().to(torch.float32),
-        qk_logits=qk_logits,
-        mask=mask,
-        bias_steps=args.bias_steps,
-        bias_lr=args.bias_lr,
-        bias_l2=args.bias_l2,
-    )
+    if args.tau_target == "optimal_ce":
+        alpha_opt, _p_alpha, _p_teacher, _losses = optimize_alpha_star(
+            ctx=layer_ctx,
+            layer_idx=args.layer,
+            head_idx=head_idx,
+            pos_list=pos_list,
+            training_steps=args.training_steps,
+            lr=args.lr,
+            mask=mask,
+            loss_type=args.loss_type,
+            device=ctx.device,
+        )
 
-    kl_base = kl_per_pos(alpha_opt.detach().to(torch.float32), alpha_base.detach().to(torch.float32))
-    kl_bias = kl_per_pos(alpha_opt.detach().to(torch.float32), alpha_bias.detach().to(torch.float32))
+        bias, alpha_bias, bias_history = optimize_bias_ce(
+            alpha_target=alpha_opt.detach().to(torch.float32),
+            qk_logits=qk_logits,
+            mask=mask,
+            bias_steps=args.bias_steps,
+            bias_lr=args.bias_lr,
+            bias_l2=args.bias_l2,
+        )
+
+        base_metric = kl_per_pos(alpha_opt.detach().to(torch.float32), alpha_base.detach().to(torch.float32))
+        bias_metric = kl_per_pos(alpha_opt.detach().to(torch.float32), alpha_bias.detach().to(torch.float32))
+    else:
+        v_head = layer_ctx.rope_qkv[args.layer]["v"].to(ctx.device)[0][head_idx].float()
+        v_gt = (
+            layer_ctx.attn_output[args.layer]["output"][0, pos_list]
+            .permute(1, 0, 2)
+            .to(ctx.device)[head_idx]
+            .float()
+        )
+
+        bias, alpha_bias, bias_history = optimize_bias_v_l2(
+            v_head=v_head,
+            v_gt=v_gt,
+            qk_logits=qk_logits,
+            mask=mask,
+            bias_steps=args.bias_steps,
+            bias_lr=args.bias_lr,
+            bias_l2=args.bias_l2,
+        )
+
+        metric_name = "v_l2"
+        base_metric = v_l2_per_pos(alpha_base.detach().to(torch.float32), v_head, v_gt)
+        bias_metric = v_l2_per_pos(alpha_bias.detach().to(torch.float32), v_head, v_gt)
 
     print("===== Compare-Q-Bias Summary =====")
     print(
         f"layer={args.layer}, heads={head_idx}, budget={args.budget:g}, "
-        f"prefix_mode={args.prefix_mode}, bias_l2={args.bias_l2:g}"
+        f"prefix_mode={args.prefix_mode}, tau_target={args.tau_target}, bias_l2={args.bias_l2:g}"
     )
     print(
-        f"mean base KL={float(kl_base.mean().item()):.8e}, "
-        f"mean bias KL={float(kl_bias.mean().item()):.8e}, "
-        f"mean improvement={float((kl_base - kl_bias).mean().item()):.8e}"
+        f"mean base {metric_name}={float(base_metric.mean().item()):.8e}, "
+        f"mean bias {metric_name}={float(bias_metric.mean().item()):.8e}, "
+        f"mean improvement={float((base_metric - bias_metric).mean().item()):.8e}"
     )
 
-    print("===== Per-Position KL (target: optimal alpha) =====")
-    print("pos\tbase_kl\tbias_kl\tdelta(base-bias)")
-    for i, pos in enumerate(pos_list):
-        kb = float(kl_base[i].item())
-        km = float(kl_bias[i].item())
-        print(f"{pos}\t{kb:.8e}\t{km:.8e}\t{(kb - km):.8e}")
+    # print(f"===== Per-Position {metric_name} =====")
+    # print(f"pos\tbase_{metric_name}\tbias_{metric_name}\tdelta(base-bias)")
+    # for i, pos in enumerate(pos_list):
+    #     mb = float(base_metric[i].item())
+    #     mm = float(bias_metric[i].item())
+    #     print(f"{pos}\t{mb:.8e}\t{mm:.8e}\t{(mb - mm):.8e}")
 
-    per_pos_path = os.path.join(output_dir, "per_pos_kl.tsv")
-    save_per_pos_kl_tsv(per_pos_path, pos_list, kl_base, kl_bias)
+    per_pos_path = os.path.join(output_dir, f"per_pos_{metric_name}.tsv")
+    save_per_pos_metric_tsv(per_pos_path, pos_list, base_metric, bias_metric, metric_name)
 
     bias_tsv_path = os.path.join(output_dir, "bias_per_key.tsv")
     save_bias_per_key_tsv(bias_tsv_path, bias)
@@ -464,18 +546,20 @@ def main():
         "layer": int(args.layer),
         "heads": head_idx,
         "pos_list": pos_list,
+        "tau_target": args.tau_target,
+        "metric_name": metric_name,
         "bias": bias,
         "bias_history": bias_history,
-        "mean_base_kl": float(kl_base.mean().item()),
-        "mean_bias_kl": float(kl_bias.mean().item()),
-        "mean_improvement": float((kl_base - kl_bias).mean().item()),
-        "kl_base_per_pos": kl_base.detach().cpu(),
-        "kl_bias_per_pos": kl_bias.detach().cpu(),
+        "mean_base_metric": float(base_metric.mean().item()),
+        "mean_bias_metric": float(bias_metric.mean().item()),
+        "mean_improvement": float((base_metric - bias_metric).mean().item()),
+        "base_metric_per_pos": base_metric.detach().cpu(),
+        "bias_metric_per_pos": bias_metric.detach().cpu(),
     }
     stats_path = os.path.join(output_dir, "comprare_q_bias_stats.pt")
     torch.save(stats, stats_path)
 
-    print(f"Saved per-pos KL table to: {per_pos_path}")
+    print(f"Saved per-pos {metric_name} table to: {per_pos_path}")
     print(f"Saved bias table to: {bias_tsv_path}")
     print(f"Saved bias figure to: {bias_png_path}")
     print(f"Saved stats to: {stats_path}")

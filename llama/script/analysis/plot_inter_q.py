@@ -45,7 +45,7 @@ def resolve_default_summary_path(args):
     adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
     return (
         f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/"
-        f"{args.loss_type}/runner_inter_q_temp/runner_inter_q_summary.pt"
+        f"{args.loss_type}/runner_inter_q_linear/runner_inter_q_linear_summary.pt"
     )
 
 
@@ -90,12 +90,12 @@ def main():
 
     budgets = [x[0] for x in budget_items]
     baseline_ppl = [float(x[1]["baseline"]["ppl"]) for x in budget_items]
-    inter_q_ppl = [float(x[1]["inter_q"]["ppl"]) for x in budget_items]
+    inter_q_ppl = [float(x[1]["inter_q_linear"]["ppl"]) for x in budget_items]
     optimal_ppl = [float(x[1]["optimal"]["ppl"]) for x in budget_items]
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
     ax.plot(budgets, baseline_ppl, marker="o", linewidth=1.8, label="baseline qk routing")
-    ax.plot(budgets, inter_q_ppl, marker="o", linewidth=1.8, linestyle="--", label="q temp scaling")
+    ax.plot(budgets, inter_q_ppl, marker="o", linewidth=1.8, linestyle="--", label="q bias scaling")
     ax.plot(budgets, optimal_ppl, marker="o", linewidth=1.8, label="optimal routing")
 
     ax.set_xlabel("budget")
@@ -112,7 +112,7 @@ def main():
     print(f"Saved plot: {output_path}")
     print("Budgets:", budgets)
     print("baseline qk routing:", baseline_ppl)
-    print("q temp scaling:", inter_q_ppl)
+    print("q bias scaling:", inter_q_ppl)
     print("optimal routing:", optimal_ppl)
 
 

@@ -15,14 +15,14 @@ import argparse
 import os
 
 import torch
+from datasets import load_dataset
 from torch.nn import functional as F
 
 from .attention import (
-    build_qk_routing_alpha,
     gen_mask,
-    get_attention_map_after_rope,
-    optimize_alpha_star,
 )
+from .compare_q_linear import build_q_linear_alpha, optimize_w_v_l2
+from .context import RunContext
 
 from .online_routing import (
     build_runtime_layer_ctx,
@@ -36,8 +36,6 @@ from .runner import (
     validate_args_with_cache,
 )
 from .sanity import build_modified_attn_hidden, get_tail_labels, move_model_inputs_to_device
-
-from .compare_q_linear import optimize_w_v_l2
 
 
 def set_seed(seed: int):
@@ -71,6 +69,15 @@ def parse_args():
         choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
     )
     parser.add_argument("--start", type=int, default=0)
+    parser.add_argument(
+        "--eval-start",
+        type=int,
+        default=None,
+        help=(
+            "Start index for evaluation sample. If not set, use --start. "
+            "Use a different value to test W generalization across samples."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
         "--dtype",
@@ -123,8 +130,9 @@ def resolve_output_dir(args):
         out_dir = args.output_dir
     else:
         adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
+        sample_tag = f"fit{args.start}" if args.eval_start == args.start else f"fit{args.start}_eval{args.eval_start}"
         out_dir = (
-            f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/"
+            f"../result/{args.dataset}_{sample_tag}/{adaptive_str}/{args.strategy}/"
             f"{args.loss_type}/runner_inter_q_linear"
         )
     os.makedirs(out_dir, exist_ok=True)
@@ -140,8 +148,9 @@ def _nll_to_ppl(nll):
 
 
 def load_existing_baseline_metrics(args, budget):
+    metric_start = args.eval_start
     path = (
-        f"../result/{args.dataset}_{args.start}/"
+        f"../result/{args.dataset}_{metric_start}/"
         f"{_adaptive_str(args.adaptive_budget)}/{args.strategy}/qk_routing.pt"
     )
     if not os.path.exists(path):
@@ -165,8 +174,9 @@ def load_existing_baseline_metrics(args, budget):
 
 
 def load_existing_optimal_metrics(args, budget):
+    metric_start = args.eval_start
     path = (
-        f"../result/{args.dataset}_{args.start}/"
+        f"../result/{args.dataset}_{metric_start}/"
         f"{_adaptive_str(args.adaptive_budget)}/{args.strategy}/{args.loss_type}/"
         "layer_all/budget_to_final_metrics.pt"
     )
@@ -203,8 +213,74 @@ def _resolve_head_indices(num_heads):
     return list(range(num_heads))
 
 
-def build_layer_patches_inter_q_linear(ctx, args, budget, layer_idx_list, head_idx, pos_list, model_inputs):
-    patches = {}
+def _build_prompt(dataset_name):
+    if dataset_name == "wikitext":
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        return "\n".join([text for text in dataset["text"] if text.strip()])
+    if dataset_name == "pg19":
+        dataset = load_dataset("emozilla/pg19-test", split="test")
+        return "\n".join([text for text in dataset["text"] if text.strip()])
+    if dataset_name == "oasst2":
+        dataset = load_dataset("OpenAssistant/oasst2", split="train")
+        texts = dataset["text"]
+        langs = dataset["lang"] if "lang" in dataset.column_names else None
+        if langs is None:
+            filtered_texts = [text for text in texts if isinstance(text, str) and text.strip()]
+        else:
+            filtered_texts = [
+                text
+                for text, lang in zip(texts, langs)
+                if isinstance(text, str)
+                and text.strip()
+                and (lang is None or str(lang).startswith("en"))
+            ]
+        if len(filtered_texts) == 0:
+            raise ValueError("No valid text found in OASST2 after filtering.")
+        return "\n".join(filtered_texts)
+    raise ValueError(
+        f"Unsupported dataset '{dataset_name}'. Supported now: wikitext, pg19, oasst2"
+    )
+
+
+def build_context_with_new_start(base_ctx, dataset_name, start, seq_len):
+    prompt = _build_prompt(dataset_name)
+    encoded = base_ctx.tokenizer(
+        prompt,
+        max_length=start + seq_len + 1,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    total_len = encoded["input_ids"].shape[1]
+    required_len = start + seq_len + 1
+    if total_len < required_len:
+        raise ValueError(
+            f"Tokenized prompt length ({total_len}) is shorter than required ({required_len})."
+        )
+
+    inputs = {
+        key: value[:, start : start + seq_len]
+        for key, value in encoded.items()
+    }
+    gt_label = encoded["input_ids"][:, start + 1 : start + seq_len + 1]
+
+    return RunContext(
+        model=base_ctx.model,
+        tokenizer=base_ctx.tokenizer,
+        rope_qkv=None,
+        inputs=inputs,
+        outputs=None,
+        attn_output=None,
+        layer_input=None,
+        gt_label=gt_label,
+        model_config=base_ctx.model_config,
+        dtype=base_ctx.dtype,
+        device=base_ctx.device,
+    )
+
+
+def fit_w_by_layer(ctx, args, budget, layer_idx_list, head_idx, pos_list, model_inputs):
+    patches_fit = {}
     w_by_layer = {}
     losses_by_layer = {}
 
@@ -214,7 +290,7 @@ def build_layer_patches_inter_q_linear(ctx, args, budget, layer_idx_list, head_i
             layer_idx=layer_idx,
             pos_list=pos_list,
             model_inputs=model_inputs,
-            layer_to_patch=patches,
+            layer_to_patch=patches_fit,
         )
         layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, artifacts)
 
@@ -241,7 +317,8 @@ def build_layer_patches_inter_q_linear(ctx, args, budget, layer_idx_list, head_i
             device=ctx.device,
         )
 
-        patches[layer_idx] = build_modified_attn_hidden(
+        # Keep fit-time online behavior: previous fitted layers are patched when fitting later layers.
+        patches_fit[layer_idx] = build_modified_attn_hidden(
             ctx=layer_ctx,
             layer_idx=layer_idx,
             head_idx=head_idx,
@@ -260,41 +337,104 @@ def build_layer_patches_inter_q_linear(ctx, args, budget, layer_idx_list, head_i
         d = w.shape[-1]
         eye = torch.eye(d, dtype=w.dtype).unsqueeze(0).expand(h, -1, -1)
         w_delta_norm = float(torch.norm((w - eye).reshape(h, -1), dim=-1).mean().item())
-        print(f"[inter_q_linear] layer={layer_idx} mean(||W-I||)={w_delta_norm:.6f}")
+        print(f"[fit W] layer={layer_idx} mean(||W-I||)={w_delta_norm:.6f}")
 
-    return patches, losses_by_layer, w_by_layer
+    return w_by_layer, losses_by_layer
+
+
+def build_layer_patches_from_w(ctx, args, budget, layer_idx_list, head_idx, pos_list, model_inputs, w_by_layer):
+    patches_eval = {}
+    for layer_idx in layer_idx_list:
+        if layer_idx not in w_by_layer:
+            raise KeyError(f"Missing fitted W for layer={layer_idx}")
+
+        artifacts = capture_layer_artifacts(
+            ctx=ctx,
+            layer_idx=layer_idx,
+            pos_list=pos_list,
+            model_inputs=model_inputs,
+            layer_to_patch=patches_eval,
+        )
+        layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, artifacts)
+
+        route_mask = gen_mask(
+            ctx=layer_ctx,
+            layer_idx=layer_idx,
+            pos_list=pos_list,
+            head_idx=head_idx,
+            strategy=args.strategy,
+            budget=budget,
+            seq_len=args.seq_len,
+            adaptive_budget=args.adaptive_budget,
+        )
+
+        w = w_by_layer[layer_idx]["w"]
+        alpha_linear = build_q_linear_alpha(
+            layer_ctx=layer_ctx,
+            layer_idx=layer_idx,
+            head_idx=head_idx,
+            pos_list=pos_list,
+            w=w,
+            route_mask=route_mask,
+            device=ctx.device,
+        )
+
+        patches_eval[layer_idx] = build_modified_attn_hidden(
+            ctx=layer_ctx,
+            layer_idx=layer_idx,
+            head_idx=head_idx,
+            pos_list=pos_list,
+            alpha=alpha_linear,
+            device=ctx.device,
+        )
+
+    return patches_eval
 
 
 def main():
     set_seed(42)
     args = parse_args()
+    if args.eval_start is None:
+        args.eval_start = args.start
     dtype = str_to_torch_dtype(args.dtype)
 
-    ctx = load_context(args, dtype=dtype, device=args.device)
-    validate_args_with_cache(ctx, args)
-    ctx.model.eval()
+    fit_ctx = load_context(args, dtype=dtype, device=args.device)
+    validate_args_with_cache(fit_ctx, args)
+    fit_ctx.model.eval()
 
-    head_idx = _resolve_head_indices(ctx.model_config.num_attention_heads)
+    eval_ctx = fit_ctx
+    if args.eval_start != args.start:
+        eval_ctx = build_context_with_new_start(
+            base_ctx=fit_ctx,
+            dataset_name=args.dataset,
+            start=args.eval_start,
+            seq_len=args.seq_len,
+        )
+        validate_args_with_cache(eval_ctx, args)
+
+    head_idx = _resolve_head_indices(fit_ctx.model_config.num_attention_heads)
     pos_list = list(range(args.seq_len))
     layer_idx_list = resolve_layers(
         args.layers,
         args.all_layers,
-        ctx.model_config.num_hidden_layers,
+        fit_ctx.model_config.num_hidden_layers,
     )
 
-    model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
-    labels = get_tail_labels(ctx, pos_list, ctx.device)
+    fit_model_inputs = move_model_inputs_to_device(fit_ctx.inputs, fit_ctx.device)
+    eval_model_inputs = move_model_inputs_to_device(eval_ctx.inputs, eval_ctx.device)
+    eval_labels = get_tail_labels(eval_ctx, pos_list, eval_ctx.device)
 
     with torch.no_grad():
-        ref_logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
-    ref_nll, ref_ppl = mean_nll_and_ppl(ref_logits, labels)
+        ref_logits = eval_ctx.model(**eval_model_inputs, use_cache=False).logits[:, pos_list, :].float()
+    ref_nll, ref_ppl = mean_nll_and_ppl(ref_logits, eval_labels)
 
     out_dir = resolve_output_dir(args)
     save_path = os.path.join(out_dir, "runner_inter_q_linear_summary.pt")
 
     summary = {
         "dataset": args.dataset,
-        "start": args.start,
+        "fit_start": args.start,
+        "eval_start": args.eval_start,
         "seq_len": args.seq_len,
         "strategy": args.strategy,
         "loss_type": args.loss_type,
@@ -318,7 +458,8 @@ def main():
                 summary["results"].update(old_results)
             for key in [
                 "dataset",
-                "start",
+                "fit_start",
+                "eval_start",
                 "seq_len",
                 "strategy",
                 "loss_type",
@@ -346,57 +487,88 @@ def main():
     for budget in pending_budgets:
         print(f"\n[runner_inter_q_linear] budget={budget}")
 
-        baseline_loaded = load_existing_baseline_metrics(args=args, budget=budget)
-        optimal_loaded = load_existing_optimal_metrics(args=args, budget=budget)
-        baseline_nll, baseline_ppl = baseline_loaded["nll"], baseline_loaded["ppl"]
-        optimal_nll, optimal_ppl = optimal_loaded["nll"], optimal_loaded["ppl"]
-        print(
-            f"[loaded metrics] baseline_nll={baseline_nll:.6f}, baseline_ppl={baseline_ppl:.6f}, "
-            f"optimal_nll={optimal_nll:.6f}, optimal_ppl={optimal_ppl:.6f}"
-        )
+        baseline_loaded = None
+        optimal_loaded = None
+        baseline_nll = baseline_ppl = None
+        optimal_nll = optimal_ppl = None
+        try:
+            baseline_loaded = load_existing_baseline_metrics(args=args, budget=budget)
+            optimal_loaded = load_existing_optimal_metrics(args=args, budget=budget)
+            baseline_nll, baseline_ppl = baseline_loaded["nll"], baseline_loaded["ppl"]
+            optimal_nll, optimal_ppl = optimal_loaded["nll"], optimal_loaded["ppl"]
+            print(
+                f"[loaded metrics@eval_start={args.eval_start}] "
+                f"baseline_nll={baseline_nll:.6f}, baseline_ppl={baseline_ppl:.6f}, "
+                f"optimal_nll={optimal_nll:.6f}, optimal_ppl={optimal_ppl:.6f}"
+            )
+        except (FileNotFoundError, KeyError) as exc:
+            print(
+                "[loaded metrics] skipped baseline/optimal loading for eval sample "
+                f"(eval_start={args.eval_start}): {exc}"
+            )
 
-        inter_q_linear_patches, inter_q_linear_losses, inter_q_linear_meta = build_layer_patches_inter_q_linear(
-            ctx=ctx,
+        inter_q_linear_meta, inter_q_linear_losses = fit_w_by_layer(
+            ctx=fit_ctx,
             args=args,
             budget=budget,
             layer_idx_list=layer_idx_list,
             head_idx=head_idx,
             pos_list=pos_list,
-            model_inputs=model_inputs,
+            model_inputs=fit_model_inputs,
+        )
+
+        inter_q_linear_patches = build_layer_patches_from_w(
+            ctx=eval_ctx,
+            args=args,
+            budget=budget,
+            layer_idx_list=layer_idx_list,
+            head_idx=head_idx,
+            pos_list=pos_list,
+            model_inputs=eval_model_inputs,
+            w_by_layer=inter_q_linear_meta,
         )
 
         inter_q_linear_logits = run_with_multilayer_patches(
-            ctx=ctx,
+            ctx=eval_ctx,
             layer_to_patch=inter_q_linear_patches,
             pos_list=pos_list,
-            model_inputs=model_inputs,
+            model_inputs=eval_model_inputs,
         )
-        inter_q_linear_nll, inter_q_linear_ppl = mean_nll_and_ppl(inter_q_linear_logits, labels)
+        inter_q_linear_nll, inter_q_linear_ppl = mean_nll_and_ppl(inter_q_linear_logits, eval_labels)
+
+        delta_vs_ref = {
+            "inter_q_linear_nll_gap": inter_q_linear_nll - ref_nll,
+        }
+        if baseline_nll is not None:
+            delta_vs_ref["baseline_nll_gap"] = baseline_nll - ref_nll
+        if optimal_nll is not None:
+            delta_vs_ref["optimal_nll_gap"] = optimal_nll - ref_nll
+
+        loaded_metrics = {}
+        if baseline_loaded is not None:
+            loaded_metrics["baseline"] = baseline_loaded["raw"]
+        if optimal_loaded is not None:
+            loaded_metrics["optimal"] = optimal_loaded["raw"]
 
         summary["results"][float(budget)] = {
-            "baseline": {"nll": baseline_nll, "ppl": baseline_ppl},
-            "optimal": {"nll": optimal_nll, "ppl": optimal_ppl},
+            "baseline": None if baseline_nll is None else {"nll": baseline_nll, "ppl": baseline_ppl},
+            "optimal": None if optimal_nll is None else {"nll": optimal_nll, "ppl": optimal_ppl},
             "inter_q_linear": {"nll": inter_q_linear_nll, "ppl": inter_q_linear_ppl},
-            "delta_vs_ref": {
-                "baseline_nll_gap": baseline_nll - ref_nll,
-                "optimal_nll_gap": optimal_nll - ref_nll,
-                "inter_q_linear_nll_gap": inter_q_linear_nll - ref_nll,
-            },
+            "delta_vs_ref": delta_vs_ref,
             "losses": {
-                "optimal": "loaded_from_existing_summary",
+                "optimal": "loaded_from_existing_summary" if optimal_loaded is not None else "not_available",
                 "inter_q_linear": inter_q_linear_losses,
             },
             "w": inter_q_linear_meta,
-            "loaded_metrics": {
-                "baseline": baseline_loaded["raw"],
-                "optimal": optimal_loaded["raw"],
-            },
+            "loaded_metrics": loaded_metrics,
         }
 
-        print(
-            f"[ppl] ref={ref_ppl:.6f}, baseline={baseline_ppl:.6f}, "
-            f"inter_q_linear(v_l2_gt)={inter_q_linear_ppl:.6f}, optimal={optimal_ppl:.6f}"
-        )
+        msg = f"[ppl@eval_start={args.eval_start}] ref={ref_ppl:.6f}, inter_q_linear(v_l2_gt)={inter_q_linear_ppl:.6f}"
+        if baseline_ppl is not None:
+            msg += f", baseline={baseline_ppl:.6f}"
+        if optimal_ppl is not None:
+            msg += f", optimal={optimal_ppl:.6f}"
+        print(msg)
 
     torch.save(summary, save_path)
     print(f"Saved summary to: {save_path}")

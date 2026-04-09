@@ -106,6 +106,13 @@ def parse_args():
     parser.add_argument("--w-steps", type=int, default=600)
     parser.add_argument("--w-lr", type=float, default=1e-3)
     parser.add_argument("--w-l2", type=float, default=0.0)
+    parser.add_argument(
+        "--w-structure",
+        type=str,
+        default="full",
+        choices=["full", "diag"],
+        help="Constraint for per-head W in qWk. full: unconstrained matrix; diag: diagonal-only.",
+    )
 
     parser.add_argument(
         "--tau-target",
@@ -315,6 +322,7 @@ def fit_w_by_layer(ctx, args, budget, layer_idx_list, head_idx, pos_list, model_
             w_lr=args.w_lr,
             w_l2=args.w_l2,
             device=ctx.device,
+            w_structure=args.w_structure,
         )
 
         # Keep fit-time online behavior: previous fitted layers are patched when fitting later layers.
@@ -401,7 +409,7 @@ def main():
     fit_ctx = load_context(args, dtype=dtype, device=args.device)
     validate_args_with_cache(fit_ctx, args)
     fit_ctx.model.eval()
-
+    import ipdb; ipdb.set_trace()
     eval_ctx = fit_ctx
     if args.eval_start != args.start:
         eval_ctx = build_context_with_new_start(
@@ -443,6 +451,7 @@ def main():
             "w_steps": int(args.w_steps),
             "w_lr": float(args.w_lr),
             "w_l2": float(args.w_l2),
+            "w_structure": args.w_structure,
         },
         "budgets": [float(x) for x in args.budgets],
         "layers": layer_idx_list,

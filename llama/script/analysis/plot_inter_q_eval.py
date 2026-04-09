@@ -9,7 +9,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Plot eval PPL vs budget from runner_inter_q_linear summary: "
-            "baseline routing / qWk routing / optimal routing."
+            "baseline routing / inter-q routing / optimal routing."
         )
     )
     parser.add_argument("--dataset", type=str, default="wikitext")
@@ -32,13 +32,20 @@ def parse_args():
         default="v_l2",
         choices=["logits_kl", "v_l2", "v_kl"],
     )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default="linear",
+        choices=["linear", "bias"],
+        help="Select which inter-q runner result to plot.",
+    )
     parser.add_argument("--adaptive-budget", action="store_true")
 
     parser.add_argument(
         "--summary-path",
         type=str,
         default=None,
-        help="Optional explicit path to runner_inter_q_linear_summary.pt",
+        help="Optional explicit path to runner_inter_q_{linear|bias}_summary.pt",
     )
     parser.add_argument(
         "--output-path",
@@ -58,9 +65,10 @@ def resolve_default_summary_path(args):
         if eval_start == args.fit_start
         else f"fit{args.fit_start}_eval{eval_start}"
     )
+    runner_name = "runner_inter_q_linear" if args.variant == "linear" else "runner_inter_q_bias"
     return (
         f"../result/{args.dataset}_{sample_tag}/{adaptive_str}/{args.strategy}/"
-        f"{args.loss_type}/runner_inter_q_linear/runner_inter_q_linear_summary.pt"
+        f"{args.loss_type}/{runner_name}/{runner_name}_summary.pt"
     )
 
 
@@ -73,7 +81,16 @@ def resolve_output_path(args, summary_path):
 
     out_dir = os.path.dirname(summary_path)
     os.makedirs(out_dir, exist_ok=True)
-    return os.path.join(out_dir, "eval_ppl_vs_budget.png")
+    suffix = "qwk" if args.variant == "linear" else "qbias"
+    return os.path.join(out_dir, f"eval_ppl_vs_budget_{suffix}.png")
+
+
+def resolve_inter_key_and_label(variant):
+    if variant == "linear":
+        return "inter_q_linear", "eval qWk routing"
+    if variant == "bias":
+        return "inter_q_bias", "eval q+bias routing"
+    raise ValueError(f"Unknown variant: {variant}")
 
 
 def sorted_budget_items(results_dict):
@@ -128,20 +145,22 @@ def main():
     if len(budget_items) == 0:
         raise ValueError(f"No valid budget entries found in summary['results']: {summary_path}")
 
+    inter_key, inter_label = resolve_inter_key_and_label(args.variant)
+
     b_base, y_base = collect_series(budget_items, "baseline")
-    b_qwk, y_qwk = collect_series(budget_items, "inter_q_linear")
+    b_qwk, y_qwk = collect_series(budget_items, inter_key)
     b_opt, y_opt = collect_series(budget_items, "optimal")
 
     if len(y_qwk) == 0:
-        raise ValueError("No qWk routing ppl found in summary['results']")
+        raise ValueError(f"No {inter_key} routing ppl found in summary['results']")
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
 
     if len(y_base) > 0:
         ax.plot(b_base, y_base, marker="o", linewidth=1.8, label="eval baseline routing")
-    ax.plot(b_qwk, y_qwk, marker="o", linewidth=1.8, linestyle="--", label="eval qWk routing")
+    ax.plot(b_qwk, y_qwk, marker="o", linewidth=1.8, linestyle="--", label=inter_label)
     if len(y_opt) > 0:
-            ax.plot(b_opt, y_opt, marker="o", linewidth=1.8, label="eval optimal routing")
+        ax.plot(b_opt, y_opt, marker="o", linewidth=1.8, label="eval optimal routing")
     ax.set_xlabel("budget")
     ax.set_ylabel("PPL")
     ax.set_title("Eval PPL vs budget")
@@ -156,7 +175,7 @@ def main():
     print(f"Saved plot: {output_path}")
     print("eval budgets(qWk):", b_qwk)
     print("eval baseline routing:", y_base)
-    print("eval qWk routing:", y_qwk)
+    print(f"{inter_label}:", y_qwk)
     print("eval optimal routing:", y_opt)
 
 

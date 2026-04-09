@@ -53,6 +53,13 @@ def parse_args():
     parser.add_argument("--w-steps", type=int, default=600)
     parser.add_argument("--w-lr", type=float, default=1e-3)
     parser.add_argument("--w-l2", type=float, default=0.0)
+    parser.add_argument(
+        "--w-structure",
+        type=str,
+        default="full",
+        choices=["full", "diag"],
+        help="Constraint for per-head W in qWk. full: unconstrained matrix; diag: diagonal-only.",
+    )
 
     parser.add_argument(
         "--tau-target",
@@ -244,7 +251,27 @@ def build_q_linear_alpha(layer_ctx, layer_idx, head_idx, pos_list, w, route_mask
     return F.softmax(logits + safe_route_mask + safe_causal, dim=-1)
 
 
-def optimize_w_v_l2(layer_ctx, layer_idx, head_idx, pos_list, route_mask, w_steps, w_lr, w_l2, device):
+def _project_w_structure_(w_param, w_structure):
+    if w_structure == "diag":
+        with torch.no_grad():
+            diag = torch.diagonal(w_param.data, dim1=-2, dim2=-1)
+            w_param.data = torch.diag_embed(diag)
+    elif w_structure != "full":
+        raise ValueError(f"Unknown w_structure: {w_structure}")
+
+
+def optimize_w_v_l2(
+    layer_ctx,
+    layer_idx,
+    head_idx,
+    pos_list,
+    route_mask,
+    w_steps,
+    w_lr,
+    w_l2,
+    device,
+    w_structure="full",
+):
     v_head = layer_ctx.rope_qkv[layer_idx]["v"].to(device)[0][head_idx].float()  # [h, seq, d]
     v_gt = (
         layer_ctx.attn_output[layer_idx]["output"][0, pos_list]
@@ -257,6 +284,7 @@ def optimize_w_v_l2(layer_ctx, layer_idx, head_idx, pos_list, route_mask, w_step
     d = v_head.shape[-1]
     eye = torch.eye(d, device=device, dtype=torch.float32).unsqueeze(0).expand(h, -1, -1)
     w_param = torch.nn.Parameter(eye.clone())
+    _project_w_structure_(w_param, w_structure)
     opt = torch.optim.Adam([w_param], lr=w_lr)
 
     history = []
@@ -279,6 +307,7 @@ def optimize_w_v_l2(layer_ctx, layer_idx, head_idx, pos_list, route_mask, w_step
         loss.backward()
         torch.nn.utils.clip_grad_norm_([w_param], max_norm=1.0)
         opt.step()
+        _project_w_structure_(w_param, w_structure)
 
         if step % 20 == 0 or step == int(w_steps) - 1:
             lv = float(loss.detach().cpu().item())
@@ -423,6 +452,7 @@ def main():
         w_lr=args.w_lr,
         w_l2=args.w_l2,
         device=ctx.device,
+        w_structure=args.w_structure,
     )
 
     base_metric = v_l2_per_pos(alpha_base.detach().to(torch.float32), v_head, v_gt)

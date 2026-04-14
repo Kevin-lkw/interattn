@@ -243,11 +243,11 @@ def build_context_with_new_start(base_ctx, dataset_name, start, seq_len):
     prompt = _build_prompt(dataset_name)
     encoded = base_ctx.tokenizer(
         prompt,
-        max_length=start + seq_len + 1,
+        # max_length=start + seq_len + 1,
         truncation=True,
         return_tensors="pt",
     )
-
+    import ipdb; ipdb.set_trace()
     total_len = encoded["input_ids"].shape[1]
     required_len = start + seq_len + 1
     if total_len < required_len:
@@ -313,14 +313,14 @@ def fit_bias_by_layer(ctx, args, budget, layer_idx_list, head_idx, pos_list, mod
             adaptive_budget=args.adaptive_budget,
         )
 
-        _alpha_base = build_qk_routing_alpha(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            mask=mask,
-            device=ctx.device,
-        )
+        # _alpha_base = build_qk_routing_alpha(
+        #     ctx=layer_ctx,
+        #     layer_idx=layer_idx,
+        #     head_idx=head_idx,
+        #     pos_list=pos_list,
+        #     mask=mask,
+        #     device=ctx.device,
+        # )
 
         qk_logits = _get_qk_logits(
             ctx=layer_ctx,

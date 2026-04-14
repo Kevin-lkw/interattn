@@ -1,3 +1,7 @@
+"""
+This module contains utility functions
+comput NLL and KL
+"""
 import torch
 from torch.nn import functional as F
 
@@ -7,7 +11,7 @@ def compute_metrics(ref_tail_logits, student_tail_logits, labels, unbiased=False
     logp_teacher = F.log_softmax(ref_tail_logits, dim=-1)
     logp_student = F.log_softmax(student_tail_logits, dim=-1)
 
-    # 逐 token KL: shape = labels.shape
+    # 逐 token KL: shape = la bels.shape
     kl_per_token = (p_teacher * (logp_teacher - logp_student)).sum(dim=-1)
 
     # 逐 token NLL

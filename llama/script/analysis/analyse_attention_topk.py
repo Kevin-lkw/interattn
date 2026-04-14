@@ -1,3 +1,12 @@
+"""
+analyse the distribution of top-k attention mass for different budgets and layers. T
+his is a sanity check to understand how much of the attention mass is concentrated in the top-k tokens,
+
+Foundings: 
+- layer 0 and layer 1 attnetion is dense(more uniformly distributed)
+- other layers are sparse (attention mass is concentrated in a small fraction of tokens)
+"""
+
 import math
 import os
 

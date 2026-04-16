@@ -12,8 +12,13 @@ import argparse
 import os
 
 import torch
+from torch.nn import functional as F
 
-from .attention import build_qk_routing_alpha, gen_mask_h2o_with_belong
+from .attention import (
+    build_qk_routing_alpha,
+    gen_mask_h2o_with_belong,
+    get_attention_map_after_rope,
+)
 from .compare_utils import (
     add_common_compare_args,
     build_baseline_prefix_patches,
@@ -44,23 +49,71 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_sumv_refined_v(alpha, v_head, hh_sumv_idx, hh_sumv_val):
+def get_qk_logits(ctx, layer_idx, head_idx, pos_list, device):
+    qk_scores, _ = get_attention_map_after_rope(
+        ctx,
+        layer_idx,
+        causal=True,
+        dtype=torch.float32,
+        device=device,
+    )
+    return qk_scores[head_idx][:, pos_list, :].to(torch.float32)
+
+
+def build_count_refined_alpha(qk_logits, mask, count, pos_list, recent_budget):
+    n_heads, n_pos, _seq_len = qk_logits.shape
+    if mask.shape != qk_logits.shape:
+        raise ValueError(f"mask shape mismatch: got {tuple(mask.shape)} expected {tuple(qk_logits.shape)}")
+    if count.shape != qk_logits.shape:
+        raise ValueError(
+            f"count shape mismatch: got {tuple(count.shape)} expected {tuple(qk_logits.shape)}"
+        )
+
+    logits = qk_logits.to(torch.float32).clone()
+    mask_f = mask.to(torch.float32)
+
+    for h in range(n_heads):
+        for i, pos in enumerate(pos_list):
+            total_available = pos + 1
+            recent_start = max(0, total_available - recent_budget)
+
+            counts = count[h, i, :total_available].to(torch.float32)
+            visible = ~torch.isneginf(mask_f[h, i, :total_available])
+            hh_visible = visible.clone()
+            hh_visible[recent_start:total_available] = False
+            hh_idx = torch.nonzero(hh_visible, as_tuple=False).squeeze(-1)
+
+            if len(hh_idx) > 0:
+                c = counts[hh_idx].clamp_min(1.0)
+                logits[h, i, hh_idx] = logits[h, i, hh_idx] + torch.log(c)
+
+    return F.softmax(logits + mask_f, dim=-1)
+
+
+def build_avgv_refined_v(alpha, v_head, hh_sumv_idx, hh_sumv_val, count):
     n_heads, n_pos, seq_len = alpha.shape
     if v_head.shape[0] != n_heads or v_head.shape[1] != seq_len:
         raise ValueError(
             f"v_head shape mismatch: got {tuple(v_head.shape)} expected heads={n_heads}, seq={seq_len}, d=*"
         )
+    if count.shape != alpha.shape:
+        raise ValueError(
+            f"count shape mismatch: got {tuple(count.shape)} expected {tuple(alpha.shape)}"
+        )
 
-    # Start from baseline alpha @ V, then only patch heavy-hitter keys with precomputed summed-V.
-    v_new = alpha.float() @ v_head.float()  # [h, n_pos, hd]
+    # Start from alpha @ original V, then patch heavy-hitter columns to averaged V.
+    v_new = alpha.float() @ v_head.float()
     for h in range(n_heads):
         for i in range(n_pos):
             idx = hh_sumv_idx[h][i]
-            val = hh_sumv_val[h][i]
-            if idx is None or val is None or idx.numel() == 0:
+            val_sum = hh_sumv_val[h][i]
+            if idx is None or val_sum is None or idx.numel() == 0:
                 continue
-            w = alpha[h, i, idx].float().unsqueeze(-1)  # [k, 1]
-            delta = val.float() - v_head[h, idx].float()  # [k, hd]
+
+            c = count[h, i, idx].to(torch.float32).clamp_min(1.0).unsqueeze(-1)
+            val_avg = val_sum.float() / c
+            w = alpha[h, i, idx].float().unsqueeze(-1)
+            delta = val_avg - v_head[h, idx].float()
             v_new[h, i] = v_new[h, i] + (w * delta).sum(dim=0)
 
     return v_new
@@ -134,7 +187,7 @@ def main():
     )
     layer_ctx = build_runtime_layer_ctx(ctx, args.layer, artifacts)
 
-    route_mask, belong, _count, hh_sumv_idx, hh_sumv_val = gen_mask_h2o_with_belong(
+    route_mask, belong, count, hh_sumv_idx, hh_sumv_val = gen_mask_h2o_with_belong(
         ctx=layer_ctx,
         layer_idx=args.layer,
         pos_list=pos_list,
@@ -154,6 +207,27 @@ def main():
         device=ctx.device,
     )
 
+    qk_logits = get_qk_logits(
+        ctx=layer_ctx,
+        layer_idx=args.layer,
+        head_idx=head_idx,
+        pos_list=pos_list,
+        device=ctx.device,
+    )
+
+    visible = int(args.seq_len * args.budget)
+    if args.adaptive_budget and (args.layer == 0 or args.layer == 1):
+        visible = args.seq_len
+    recent_budget = visible // 2
+
+    alpha_count = build_count_refined_alpha(
+        qk_logits=qk_logits,
+        mask=route_mask,
+        count=count,
+        pos_list=pos_list,
+        recent_budget=recent_budget,
+    )
+
     v_head = layer_ctx.rope_qkv[args.layer]["v"].to(ctx.device)[0][head_idx].float()
     v_gt = (
         layer_ctx.attn_output[args.layer]["output"][0, pos_list]
@@ -163,11 +237,12 @@ def main():
     )
 
     v_base = alpha_base.float() @ v_head.float()
-    v_sumv = build_sumv_refined_v(
-        alpha=alpha_base,
+    v_sumv = build_avgv_refined_v(
+        alpha=alpha_count,
         v_head=v_head,
         hh_sumv_idx=hh_sumv_idx,
         hh_sumv_val=hh_sumv_val,
+        count=count,
     )
 
     base_metric = v_l2_per_pos_from_v(v_base, v_gt)

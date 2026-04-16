@@ -180,6 +180,7 @@ def gen_mask_h2o_with_belong(
     seq_len,
     adaptive_budget,
     return_hh_sumv=False,
+    return_hh_sumk=False,
 ):
     """
     H2O-only mask generator with belong mapping.
@@ -192,6 +193,8 @@ def gen_mask_h2o_with_belong(
         (optional) hh_sumv_idx, hh_sumv_val:
             hh_sumv_idx[h][i] -> LongTensor [k_i] visible heavy-hitter key indices at pos i.
             hh_sumv_val[h][i] -> FloatTensor [k_i, hd] summed V for those heavy hitters.
+        (optional) hh_sumk_val:
+            hh_sumk_val[h][i] -> FloatTensor [k_i, hd] summed K for same hh_sumv_idx[h][i].
 
     Rule:
     - If token x is evicted, assign belong[x] = y where y is the kept heavy-hitter
@@ -233,9 +236,14 @@ def gen_mask_h2o_with_belong(
     count_mtx = torch.zeros(num_out_heads, num_pos, seq_len, device=device, dtype=torch.long)
     hh_sumv_idx = None
     hh_sumv_val = None
+    hh_sumk_val = None
     if return_hh_sumv:
         hh_sumv_idx = [[None for _ in range(num_pos)] for _ in range(num_out_heads)]
         hh_sumv_val = [[None for _ in range(num_pos)] for _ in range(num_out_heads)]
+    if return_hh_sumk:
+        if hh_sumv_idx is None:
+            hh_sumv_idx = [[None for _ in range(num_pos)] for _ in range(num_out_heads)]
+        hh_sumk_val = [[None for _ in range(num_pos)] for _ in range(num_out_heads)]
     t1 = time.time()
 
     for out_h, head in enumerate(head_idx):
@@ -247,7 +255,8 @@ def gen_mask_h2o_with_belong(
         in_cache = torch.zeros(seq_len, dtype=torch.bool, device=device)
         parent = torch.arange(seq_len, device=device, dtype=torch.long)
         count = torch.ones(seq_len, dtype=torch.long, device=device)
-        group_sum = torch.zeros_like(v_head)
+        group_sum_v = torch.zeros_like(v_head)
+        group_sum_k = torch.zeros_like(k_head)
         def find_root(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
@@ -259,7 +268,8 @@ def gen_mask_h2o_with_belong(
 
             acc[:total_available] += attn[pos, :total_available]
             in_cache[pos] = True
-            group_sum[pos] = v_head[pos]
+            group_sum_v[pos] = v_head[pos]
+            group_sum_k[pos] = k_head[pos]
 
             cur_cache_size = int(in_cache[:total_available].sum().item())
             if cur_cache_size > visible:
@@ -292,8 +302,10 @@ def gen_mask_h2o_with_belong(
                 parent[victim] = y
                 count[y] += count[victim]
                 count[victim] = 0
-                group_sum[y] += group_sum[victim]
-                group_sum[victim].zero_()
+                group_sum_v[y] += group_sum_v[victim]
+                group_sum_v[victim].zero_()
+                group_sum_k[y] += group_sum_k[victim]
+                group_sum_k[victim].zero_()
 
             invisible_now = ~in_cache[:total_available]
             mask[out_h, i, :total_available][invisible_now] = float("-inf")
@@ -311,7 +323,11 @@ def gen_mask_h2o_with_belong(
             count_mtx[out_h, i, :total_available] = count[:total_available]
             if return_hh_sumv:
                 hh_sumv_idx[out_h][i] = hh_idx.clone()
-                hh_sumv_val[out_h][i] = group_sum[hh_idx].clone()
+                hh_sumv_val[out_h][i] = group_sum_v[hh_idx].clone()
+            elif return_hh_sumk:
+                hh_sumv_idx[out_h][i] = hh_idx.clone()
+            if return_hh_sumk:
+                hh_sumk_val[out_h][i] = group_sum_k[hh_idx].clone()
 
     t2 = time.time()
     print(f"[h2o_with_belong] mask+belong build time: {t2 - t1:.4f}s")
@@ -320,8 +336,12 @@ def gen_mask_h2o_with_belong(
         mask[:, i, pos + 1 :] = float("-inf")
         belong[:, i, pos + 1 :] = -1
 
+    if return_hh_sumv and return_hh_sumk:
+        return mask, belong, count_mtx, hh_sumv_idx, hh_sumv_val, hh_sumk_val
     if return_hh_sumv:
         return mask, belong, count_mtx, hh_sumv_idx, hh_sumv_val
+    if return_hh_sumk:
+        return mask, belong, count_mtx, hh_sumv_idx, hh_sumk_val
     return mask, belong, count_mtx
 
 

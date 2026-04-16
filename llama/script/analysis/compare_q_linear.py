@@ -23,6 +23,7 @@ from .compare_utils import (
     resolve_output_dir,
     save_per_pos_metric_tsv,
     validate_common_args,
+    plot_per_pos_two_lines,
 )
 from .config import set_seed, str_to_torch_dtype
 from .online_routing import build_runtime_layer_ctx, capture_layer_artifacts
@@ -38,7 +39,7 @@ def parse_args():
         parser,
         strategy_choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
         default_strategy="h2o",
-        include_loss_type=False,
+        include_loss_type=True,
         include_plot_dpi=True,
     )
 
@@ -246,7 +247,7 @@ def main():
         args=args,
         head_idx=head_idx,
         compare_tag="compare_q_linear",
-        include_loss_type=False,
+        include_loss_type=True,
     )
 
     if args.prefix_mode == "optimal_saved":
@@ -340,7 +341,18 @@ def main():
         other_metric=linear_metric,
         other_name="linear",
     )
-
+    
+    plot_path = os.path.join(output_dir, "per_pos_v_l2.png")
+    plot_per_pos_two_lines(
+        out_path=plot_path,
+        pos_list=pos_list,
+        y1=base_metric,
+        y2=linear_metric,
+        label1="base_v_l2",
+        label2="linear_v_l2",
+        title=f"Per-Position V-L2: Base vs Linear with budget={args.budget:g}",
+        dpi=args.plot_dpi,
+    )
     w_norm_tsv_path = os.path.join(output_dir, "w_norm_per_head.tsv")
     save_w_norm_tsv(w_norm_tsv_path, w, head_idx)
 

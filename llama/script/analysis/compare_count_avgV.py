@@ -276,7 +276,7 @@ def main():
         y2=sumv_metric,
         label1="base_v_l2",
         label2="sumV_v_l2",
-        title="Per-Position V-L2: Base vs SumV",
+        title="Per-Position V-L2: Base vs SumV with budget={:.2f}".format(args.budget),
         dpi=args.plot_dpi,
     )
 

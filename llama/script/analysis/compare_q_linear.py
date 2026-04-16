@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from .attention import build_qk_routing_alpha, gen_mask
 from .compare_utils import (
+    add_common_compare_args,
     build_baseline_prefix_patches,
     build_optimal_saved_prefix_patches,
     resolve_head_indices,
@@ -33,30 +34,13 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Compare QK routing and Q-linear routing (qWk) with v_l2_gt objective."
     )
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
-    parser.add_argument("--dataset", type=str, default="wikitext")
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="float32",
-        choices=["float32", "float16", "bfloat16"],
+    add_common_compare_args(
+        parser,
+        strategy_choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
+        default_strategy="h2o",
+        include_loss_type=False,
+        include_plot_dpi=True,
     )
-
-    parser.add_argument(
-        "--strategy",
-        type=str,
-        default="h2o",
-        choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
-    )
-    parser.add_argument("--adaptive-budget", action="store_true")
-    parser.add_argument("--budget", type=float, required=True)
-
-    parser.add_argument("--layer", type=int, required=True)
-    parser.add_argument("--head", type=int, default=None)
-    parser.add_argument("--heads", type=int, nargs="+", default=None)
 
     parser.add_argument("--w-steps", type=int, default=600)
     parser.add_argument("--w-lr", type=float, default=1e-3)
@@ -77,22 +61,6 @@ def parse_args():
         help="Fixed target for this script.",
     )
 
-    parser.add_argument(
-        "--prefix-mode",
-        type=str,
-        default="optimal_saved",
-        choices=["optimal_saved", "baseline_rebuild"],
-        help=(
-            "How to prepare patches before target layer. "
-            "optimal_saved: load saved optimal patch_hidden for layers < target; "
-            "baseline_rebuild: rebuild baseline patches online for layers < target."
-        ),
-    )
-
-    parser.add_argument("--pos-start", type=int, default=0)
-    parser.add_argument("--pos-end", type=int, default=None)
-    parser.add_argument("--plot-dpi", type=int, default=180)
-    parser.add_argument("--output-dir", type=str, default=None)
     return parser.parse_args()
 
 

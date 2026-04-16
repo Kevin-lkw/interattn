@@ -9,6 +9,63 @@ from .runner import get_result_path, normalize_budget_key
 from .sanity import build_modified_attn_hidden
 
 
+def add_common_compare_args(
+    parser,
+    *,
+    strategy_choices,
+    default_strategy="h2o",
+    include_loss_type=True,
+    include_plot_dpi=False,
+):
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--dataset", type=str, default="wikitext")
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+    )
+
+    parser.add_argument("--strategy", type=str, default=default_strategy, choices=strategy_choices)
+    parser.add_argument("--adaptive-budget", action="store_true")
+    parser.add_argument("--budget", type=float, required=True)
+
+    parser.add_argument("--layer", type=int, required=True)
+    parser.add_argument("--head", type=int, default=None)
+    parser.add_argument("--heads", type=int, nargs="+", default=None)
+
+    if include_loss_type:
+        parser.add_argument(
+            "--loss-type",
+            type=str,
+            default="v_l2",
+            choices=["logits_kl", "v_l2", "v_kl"],
+            help="Only used to locate saved prefix patch results.",
+        )
+
+    parser.add_argument(
+        "--prefix-mode",
+        type=str,
+        default="optimal_saved",
+        choices=["optimal_saved", "baseline_rebuild"],
+        help=(
+            "How to prepare patches before target layer. "
+            "optimal_saved: load saved optimal patch_hidden for layers < target; "
+            "baseline_rebuild: rebuild baseline patches online for layers < target."
+        ),
+    )
+
+    parser.add_argument("--pos-start", type=int, default=0)
+    parser.add_argument("--pos-end", type=int, default=None)
+    if include_plot_dpi:
+        parser.add_argument("--plot-dpi", type=int, default=180)
+    parser.add_argument("--output-dir", type=str, default=None)
+    return parser
+
+
 def validate_common_args(args, num_layers, num_heads):
     if args.layer < 0 or args.layer >= num_layers:
         raise ValueError(f"Invalid --layer {args.layer}; expected [0, {num_layers - 1}]")

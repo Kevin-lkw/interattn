@@ -171,6 +171,133 @@ def build_qk_routing_alpha(ctx, layer_idx, head_idx, pos_list, mask, device=None
     return F.softmax(qk_logits + mask.to(torch.float32), dim=-1)
 
 
+def gen_mask_h2o_with_belong(
+    ctx,
+    layer_idx,
+    pos_list,
+    head_idx,
+    budget,
+    seq_len,
+    adaptive_budget,
+):
+    """
+    H2O-only mask generator with belong mapping.
+
+    Returns:
+        mask:   [n_heads, n_pos, seq_len], additive mask (0 or -inf)
+        belong: [n_heads, n_pos, seq_len], belong indices for keys <= current pos,
+                and -1 for keys > current pos.
+
+    Rule:
+    - If token x is evicted, assign belong[x] = y where y is the kept heavy-hitter
+      token (older-than-recent window) with maximum key dot-product similarity.
+    - If token x is kept (or no valid heavy hitter exists), belong[x] = x.
+    - Transitive merge is resolved by DSU root when emitting belong rows.
+    """
+    device = ctx.device
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+
+    visible = int(seq_len * budget)
+    if adaptive_budget and (layer_idx == 0 or layer_idx == 1):
+        budget = 1.0
+        visible = seq_len
+
+    recent_budget = visible // 2
+
+    print(
+        f"layer {layer_idx}: visible {visible} tokens for strategy h2o_with_belong with budget {budget}"
+    )
+
+    k_all = ctx.rope_qkv[layer_idx]["k"].to(device=device, dtype=torch.float32)[0][head_idx]
+    _, attention_score = get_attention_map_after_rope(
+        ctx, layer_idx, causal=True, dtype=ctx.dtype, device=device
+    )
+
+    num_out_heads = len(head_idx)
+    num_pos = len(pos_list)
+
+    mask = torch.zeros(num_out_heads, num_pos, seq_len, device=device)
+    belong = torch.full(
+        (num_out_heads, num_pos, seq_len),
+        fill_value=-1,
+        device=device,
+        dtype=torch.long,
+    )
+    count_mtx = torch.zeros(num_out_heads, num_pos, seq_len, device=device, dtype=torch.long)
+    t1 = time.time()
+
+    for out_h, head in enumerate(head_idx):
+        attn = attention_score[head]
+        k_head = k_all[out_h]
+
+        acc = torch.zeros(seq_len, device=device)
+        in_cache = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        parent = torch.arange(seq_len, device=device, dtype=torch.long)
+        count = torch.ones(seq_len, dtype=torch.long, device=device)
+        def find_root(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i, pos in enumerate(pos_list):
+            total_available = pos + 1
+
+            acc[:total_available] += attn[pos, :total_available]
+            in_cache[pos] = True
+
+            cur_cache_size = int(in_cache[:total_available].sum().item())
+            if cur_cache_size > visible:
+                cache_idx = torch.nonzero(
+                    in_cache[:total_available], as_tuple=False
+                ).squeeze(-1)
+
+                recent_start = max(0, total_available - recent_budget)
+                hh_idx = cache_idx[cache_idx < recent_start]
+                if len(hh_idx) == 0:
+                    victim = int(cache_idx[0].item())
+                else:
+                    victim_local = torch.argmin(acc[hh_idx])
+                    victim = int(hh_idx[victim_local].item())
+
+                in_cache[victim] = False
+
+                cache_idx_after = torch.nonzero(
+                    in_cache[:total_available], as_tuple=False
+                ).squeeze(-1)
+                hh_kept_idx = cache_idx_after[cache_idx_after < recent_start]
+
+                if len(hh_kept_idx) > 0:
+                    sims = torch.matmul(k_head[hh_kept_idx], k_head[victim])
+                    y = int(hh_kept_idx[torch.argmax(sims)].item())
+                else:
+                    assert False, f"No heavy hitter to assign for victim {victim} at position {pos}"
+                
+
+                parent[victim] = y
+                count[y] += count[victim]
+                count[victim] = 0
+
+            invisible_now = ~in_cache[:total_available]
+            mask[out_h, i, :total_available][invisible_now] = float("-inf")
+
+            # roots = torch.arange(total_available, device=device, dtype=torch.long)
+            # for x in range(total_available):
+            #     roots[x] = find_root(int(roots[x].item()))
+            belong[out_h, i, :total_available] = parent[:total_available]
+            count_mtx[out_h, i, :total_available] = count[:total_available]
+
+    t2 = time.time()
+    print(f"[h2o_with_belong] mask+belong build time: {t2 - t1:.4f}s")
+
+    for i, pos in enumerate(pos_list):
+        mask[:, i, pos + 1 :] = float("-inf")
+        belong[:, i, pos + 1 :] = -1
+
+    return mask, belong, count_mtx
+
+
 def gen_mask(
     ctx,
     layer_idx,

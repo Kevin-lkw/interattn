@@ -15,10 +15,18 @@ import torch
 from torch.nn import functional as F
 
 from .attention import build_qk_routing_alpha, gen_mask
+from .compare_utils import (
+    build_baseline_prefix_patches,
+    build_optimal_saved_prefix_patches,
+    resolve_head_indices,
+    resolve_output_dir,
+    save_per_pos_metric_tsv,
+    validate_common_args,
+)
 from .config import set_seed, str_to_torch_dtype
 from .online_routing import build_runtime_layer_ctx, capture_layer_artifacts
-from .runner import get_result_path, load_context, normalize_budget_key
-from .sanity import build_modified_attn_hidden, move_model_inputs_to_device
+from .runner import load_context
+from .sanity import move_model_inputs_to_device
 
 
 def parse_args():
@@ -86,126 +94,6 @@ def parse_args():
     parser.add_argument("--plot-dpi", type=int, default=180)
     parser.add_argument("--output-dir", type=str, default=None)
     return parser.parse_args()
-
-
-def validate_args(args, num_layers, num_heads):
-    if args.layer < 0 or args.layer >= num_layers:
-        raise ValueError(f"Invalid --layer {args.layer}; expected [0, {num_layers - 1}]")
-    if args.head is not None and (args.head < 0 or args.head >= num_heads):
-        raise ValueError(f"Invalid --head {args.head}; expected [0, {num_heads - 1}]")
-    if args.heads is not None:
-        for h in args.heads:
-            if h < 0 or h >= num_heads:
-                raise ValueError(f"Invalid --heads entry {h}; expected [0, {num_heads - 1}]")
-    if args.budget <= 0:
-        raise ValueError("--budget must be > 0")
-    if args.pos_start < 0:
-        raise ValueError("--pos-start must be >= 0")
-    if args.pos_end is not None and args.pos_end <= args.pos_start:
-        raise ValueError("--pos-end must be larger than --pos-start")
-
-
-def resolve_head_indices(args, num_heads):
-    if args.heads is not None and len(args.heads) > 0:
-        return sorted(set(int(x) for x in args.heads))
-    if args.head is not None:
-        return [int(args.head)]
-    return list(range(num_heads))
-
-
-def resolve_output_dir(args, head_idx):
-    if args.output_dir is not None:
-        out_dir = args.output_dir
-    else:
-        adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
-        if len(head_idx) == 1:
-            head_tag = f"head{head_idx[0]}"
-        else:
-            head_tag = f"heads_{len(head_idx)}"
-        out_dir = (
-            f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/"
-            f"compare_q_linear/layer{args.layer}_{head_tag}/budget_{args.budget:g}"
-        )
-    os.makedirs(out_dir, exist_ok=True)
-    return out_dir
-
-
-def load_saved_patch_hidden_for_layer(args, layer_idx, budget, device):
-    path = get_result_path(
-        layer_idx=layer_idx,
-        dataset=args.dataset,
-        start=args.start,
-        adaptive_budget=args.adaptive_budget,
-        strategy=args.strategy,
-        loss_type="v_l2",
-    )
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Missing optimal layer result for layer={layer_idx}. Expected file: {path}"
-        )
-
-    result = torch.load(path, map_location="cpu", weights_only=False)
-    key = normalize_budget_key(result, budget)
-    if key is None:
-        raise KeyError(
-            f"Budget {budget} not found in layer={layer_idx} result keys: {list(result.keys())}"
-        )
-
-    entry = result[key]
-    if not isinstance(entry, dict) or "patch_hidden" not in entry:
-        raise KeyError(
-            f"layer={layer_idx}, budget={budget} has no patch_hidden in saved result entry."
-        )
-    return entry["patch_hidden"].to(device)
-
-
-def build_optimal_saved_prefix_patches(args, target_layer, budget, device):
-    patches = {}
-    for layer_idx in range(target_layer):
-        patches[layer_idx] = load_saved_patch_hidden_for_layer(args, layer_idx, budget, device)
-    return patches
-
-
-def build_baseline_prefix_patches(ctx, args, target_layer, pos_list, model_inputs):
-    patches = {}
-    head_idx = list(range(ctx.model_config.num_attention_heads))
-    for layer_idx in range(target_layer):
-        artifacts = capture_layer_artifacts(
-            ctx=ctx,
-            layer_idx=layer_idx,
-            pos_list=pos_list,
-            model_inputs=model_inputs,
-            layer_to_patch=patches,
-        )
-        layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, artifacts)
-        mask = gen_mask(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            pos_list=pos_list,
-            head_idx=head_idx,
-            strategy=args.strategy,
-            budget=args.budget,
-            seq_len=args.seq_len,
-            adaptive_budget=args.adaptive_budget,
-        )
-        alpha_baseline = build_qk_routing_alpha(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            mask=mask,
-            device=ctx.device,
-        )
-        patches[layer_idx] = build_modified_attn_hidden(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            alpha=alpha_baseline,
-            device=ctx.device,
-        )
-        print(f"[prefix baseline rebuild] layer {layer_idx} done")
-    return patches
 
 
 def build_qk_linear_logits(layer_ctx, layer_idx, head_idx, pos_list, w, device):
@@ -335,15 +223,6 @@ def v_l2_per_pos(alpha, v_head, v_gt):
     return l2.mean(dim=0)
 
 
-def save_per_pos_v_l2_tsv(out_path, pos_list, base_metric, linear_metric):
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("pos\tbase_v_l2\tlinear_v_l2\tdelta_base_minus_linear\n")
-        for i, pos in enumerate(pos_list):
-            mb = float(base_metric[i].item())
-            ml = float(linear_metric[i].item())
-            f.write(f"{pos}\t{mb:.8e}\t{ml:.8e}\t{(mb - ml):.8e}\n")
-
-
 def save_w_norm_tsv(out_path, w, head_idx):
     h = w.shape[0]
     d = w.shape[-1]
@@ -382,7 +261,7 @@ def main():
     ctx = load_context(args, dtype=dtype, device=args.device)
     ctx.model.eval()
 
-    validate_args(
+    validate_common_args(
         args,
         num_layers=ctx.model_config.num_hidden_layers,
         num_heads=ctx.model_config.num_attention_heads,
@@ -395,7 +274,12 @@ def main():
         raise ValueError("Empty pos_list after applying --pos-start/--pos-end")
 
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
-    output_dir = resolve_output_dir(args, head_idx)
+    output_dir = resolve_output_dir(
+        args=args,
+        head_idx=head_idx,
+        compare_tag="compare_q_linear",
+        include_loss_type=False,
+    )
 
     if args.prefix_mode == "optimal_saved":
         prefix_patches = build_optimal_saved_prefix_patches(
@@ -403,6 +287,7 @@ def main():
             target_layer=args.layer,
             budget=args.budget,
             device=ctx.device,
+            loss_type_override="v_l2",
         )
     else:
         prefix_patches = build_baseline_prefix_patches(
@@ -411,6 +296,16 @@ def main():
             target_layer=args.layer,
             pos_list=pos_list,
             model_inputs=model_inputs,
+            build_mask_fn=lambda layer_ctx, layer_idx, hi: gen_mask(
+                ctx=layer_ctx,
+                layer_idx=layer_idx,
+                pos_list=pos_list,
+                head_idx=hi,
+                strategy=args.strategy,
+                budget=args.budget,
+                seq_len=args.seq_len,
+                adaptive_budget=args.adaptive_budget,
+            ),
         )
 
     artifacts = capture_layer_artifacts(
@@ -470,7 +365,13 @@ def main():
     )
 
     per_pos_path = os.path.join(output_dir, "per_pos_v_l2.tsv")
-    save_per_pos_v_l2_tsv(per_pos_path, pos_list, base_metric, linear_metric)
+    save_per_pos_metric_tsv(
+        out_path=per_pos_path,
+        pos_list=pos_list,
+        base_metric=base_metric,
+        other_metric=linear_metric,
+        other_name="linear",
+    )
 
     w_norm_tsv_path = os.path.join(output_dir, "w_norm_per_head.tsv")
     save_w_norm_tsv(w_norm_tsv_path, w, head_idx)

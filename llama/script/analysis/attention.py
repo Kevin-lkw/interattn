@@ -179,6 +179,7 @@ def gen_mask_h2o_with_belong(
     budget,
     seq_len,
     adaptive_budget,
+    return_hh_sumv=False,
 ):
     """
     H2O-only mask generator with belong mapping.
@@ -187,6 +188,10 @@ def gen_mask_h2o_with_belong(
         mask:   [n_heads, n_pos, seq_len], additive mask (0 or -inf)
         belong: [n_heads, n_pos, seq_len], belong indices for keys <= current pos,
                 and -1 for keys > current pos.
+        count_mtx: [n_heads, n_pos, seq_len], merged-set sizes on parent indices.
+        (optional) hh_sumv_idx, hh_sumv_val:
+            hh_sumv_idx[h][i] -> LongTensor [k_i] visible heavy-hitter key indices at pos i.
+            hh_sumv_val[h][i] -> FloatTensor [k_i, hd] summed V for those heavy hitters.
 
     Rule:
     - If token x is evicted, assign belong[x] = y where y is the kept heavy-hitter
@@ -210,6 +215,7 @@ def gen_mask_h2o_with_belong(
     )
 
     k_all = ctx.rope_qkv[layer_idx]["k"].to(device=device, dtype=torch.float32)[0][head_idx]
+    v_all = ctx.rope_qkv[layer_idx]["v"].to(device=device, dtype=torch.float32)[0][head_idx]
     _, attention_score = get_attention_map_after_rope(
         ctx, layer_idx, causal=True, dtype=ctx.dtype, device=device
     )
@@ -225,16 +231,23 @@ def gen_mask_h2o_with_belong(
         dtype=torch.long,
     )
     count_mtx = torch.zeros(num_out_heads, num_pos, seq_len, device=device, dtype=torch.long)
+    hh_sumv_idx = None
+    hh_sumv_val = None
+    if return_hh_sumv:
+        hh_sumv_idx = [[None for _ in range(num_pos)] for _ in range(num_out_heads)]
+        hh_sumv_val = [[None for _ in range(num_pos)] for _ in range(num_out_heads)]
     t1 = time.time()
 
     for out_h, head in enumerate(head_idx):
         attn = attention_score[head]
         k_head = k_all[out_h]
+        v_head = v_all[out_h]
 
         acc = torch.zeros(seq_len, device=device)
         in_cache = torch.zeros(seq_len, dtype=torch.bool, device=device)
         parent = torch.arange(seq_len, device=device, dtype=torch.long)
         count = torch.ones(seq_len, dtype=torch.long, device=device)
+        group_sum = torch.zeros_like(v_head)
         def find_root(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
@@ -246,6 +259,7 @@ def gen_mask_h2o_with_belong(
 
             acc[:total_available] += attn[pos, :total_available]
             in_cache[pos] = True
+            group_sum[pos] = v_head[pos]
 
             cur_cache_size = int(in_cache[:total_available].sum().item())
             if cur_cache_size > visible:
@@ -278,15 +292,26 @@ def gen_mask_h2o_with_belong(
                 parent[victim] = y
                 count[y] += count[victim]
                 count[victim] = 0
+                group_sum[y] += group_sum[victim]
+                group_sum[victim].zero_()
 
             invisible_now = ~in_cache[:total_available]
             mask[out_h, i, :total_available][invisible_now] = float("-inf")
+
+            recent_start = max(0, total_available - recent_budget)
+            visible_now = in_cache[:total_available]
+            hh_visible = visible_now.clone()
+            hh_visible[recent_start:total_available] = False
+            hh_idx = torch.nonzero(hh_visible, as_tuple=False).squeeze(-1)
 
             # roots = torch.arange(total_available, device=device, dtype=torch.long)
             # for x in range(total_available):
             #     roots[x] = find_root(int(roots[x].item()))
             belong[out_h, i, :total_available] = parent[:total_available]
             count_mtx[out_h, i, :total_available] = count[:total_available]
+            if return_hh_sumv:
+                hh_sumv_idx[out_h][i] = hh_idx.clone()
+                hh_sumv_val[out_h][i] = group_sum[hh_idx].clone()
 
     t2 = time.time()
     print(f"[h2o_with_belong] mask+belong build time: {t2 - t1:.4f}s")
@@ -295,6 +320,8 @@ def gen_mask_h2o_with_belong(
         mask[:, i, pos + 1 :] = float("-inf")
         belong[:, i, pos + 1 :] = -1
 
+    if return_hh_sumv:
+        return mask, belong, count_mtx, hh_sumv_idx, hh_sumv_val
     return mask, belong, count_mtx
 
 

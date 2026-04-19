@@ -1,11 +1,11 @@
 """
-Compare baseline H2O routing and count-refined H2O routing.
+Compare baseline H2O routing and varK+avgV refined routing.
 
-Count refinement rule (heavy hitter only):
-    refined_logit = qk + log(C)
-where C is the size of the belong-set mapped to that heavy hitter key.
-Recent tokens are not adjusted.
-Wrong, abandoned: do not consider avg K and avg V
+For heavy-hitter keys j at each (head, pos):
+- q_avgk_j = q·(sumK_j / C_j) / sqrt(d)
+- refinement_j = log(C_j) + (1 / C_j) * q^T (sum_x k_x k_x^T - C_j * avgK_j avgK_j^T) q
+- refined_logit_j = q_avgk_j + refinement_j
+- Value vectors: avgV_j = sumV_j / C_j
 """
 
 import argparse
@@ -23,11 +23,11 @@ from .compare_utils import (
     add_common_compare_args,
     build_baseline_prefix_patches,
     build_optimal_saved_prefix_patches,
+    plot_per_pos_two_lines,
     resolve_head_indices,
     resolve_output_dir,
     save_per_pos_metric_tsv,
     validate_common_args,
-    plot_per_pos_two_lines,
 )
 from .config import set_seed, str_to_torch_dtype
 from .online_routing import build_runtime_layer_ctx, capture_layer_artifacts
@@ -37,7 +37,7 @@ from .sanity import move_model_inputs_to_device
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compare baseline H2O routing and count-refined H2O routing."
+        description="Compare baseline H2O routing and varK+avgV refined routing."
     )
     add_common_compare_args(
         parser,
@@ -60,50 +60,132 @@ def get_qk_logits(ctx, layer_idx, head_idx, pos_list, device):
     return qk_scores[head_idx][:, pos_list, :].to(torch.float32)
 
 
-def build_count_refined_alpha(qk_logits, mask, belong, count, pos_list, recent_budget):
-    n_heads, n_pos, seq_len = qk_logits.shape
+def resolve_roots_from_belong_row(belong_row, total_available):
+    parents = belong_row[:total_available].to(torch.long)
+    roots = torch.empty_like(parents)
+
+    for x in range(total_available):
+        path = []
+        r = x
+        while True:
+            p = int(parents[r].item())
+            if p < 0 or p == r:
+                break
+            path.append(r)
+            r = p
+        roots[x] = r
+        for n in path:
+            parents[n] = r
+
+    return roots
+
+
+def build_vark_refined_alpha(
+    qk_logits,
+    q_head,
+    k_head,
+    mask,
+    belong,
+    count,
+    hh_sumk_idx,
+    hh_sumk_val,
+    pos_list,
+    recent_budget,
+):
+    n_heads, n_pos, _seq_len = qk_logits.shape
     if mask.shape != qk_logits.shape:
         raise ValueError(f"mask shape mismatch: got {tuple(mask.shape)} expected {tuple(qk_logits.shape)}")
-    if belong.shape != qk_logits.shape:
-        raise ValueError(
-            f"belong shape mismatch: got {tuple(belong.shape)} expected {tuple(qk_logits.shape)}"
-        )
     if count.shape != qk_logits.shape:
         raise ValueError(
             f"count shape mismatch: got {tuple(count.shape)} expected {tuple(qk_logits.shape)}"
         )
+    if belong.shape != qk_logits.shape:
+        raise ValueError(
+            f"belong shape mismatch: got {tuple(belong.shape)} expected {tuple(qk_logits.shape)}"
+        )
+    if q_head.shape[0] != n_heads or q_head.shape[1] != n_pos:
+        raise ValueError(
+            f"q_head shape mismatch: got {tuple(q_head.shape)} expected ({n_heads}, {n_pos}, d)"
+        )
+    if k_head.shape[0] != n_heads:
+        raise ValueError(
+            f"k_head shape mismatch: got {tuple(k_head.shape)} expected ({n_heads}, seq, d)"
+        )
 
     logits = qk_logits.to(torch.float32).clone()
     mask_f = mask.to(torch.float32)
+    scale = float(q_head.shape[-1]) ** 0.5
 
     for h in range(n_heads):
+        print(f"Processing head {h} for VarK refinement...")
         for i, pos in enumerate(pos_list):
-            # import ipdb; ipdb.set_trace()
             total_available = pos + 1
             recent_start = max(0, total_available - recent_budget)
 
-            row_belong = belong[h, i, :total_available]
-            if (row_belong < 0).any():
-                raise ValueError("belong contains invalid negative index in lower-triangular region")
+            idx = hh_sumk_idx[h][i]
+            sumk = hh_sumk_val[h][i]
+            if idx is None or sumk is None or idx.numel() == 0:
+                continue
 
-            counts = count[h, i, :total_available]
-            assert counts.sum() == total_available, "count should sum up to total_available"
-            
+            # Safety gate: ensure idx still corresponds to visible heavy-hitter keys.
             visible = ~torch.isneginf(mask_f[h, i, :total_available])
             hh_visible = visible.clone()
             hh_visible[recent_start:total_available] = False
-            hh_idx = torch.nonzero(hh_visible, as_tuple=False).squeeze(-1)
+            if hh_visible[idx].any().item() is False:
+                continue
 
-            if len(hh_idx) > 0:
-                c = counts[hh_idx]
-                assert c.min() >= 1, "count should be >= 1 for visible tokens"
-                logits[h, i, hh_idx] = logits[h, i, hh_idx] + torch.log(c.float())
+            c = count[h, i, idx].to(torch.float32).clamp_min(1.0)
+            avgk = sumk.float() / c.unsqueeze(-1)
+            roots = resolve_roots_from_belong_row(belong[h, i], total_available)
+
+            q = q_head[h, i].float()
+            q_avgk = (avgk * q.unsqueeze(0)).sum(dim=-1) / scale
+
+            quad_term = torch.zeros_like(c)
+            for t, rep_tensor in enumerate(idx):
+                rep = int(rep_tensor.item())
+                member_idx = torch.nonzero(roots == rep, as_tuple=False).squeeze(-1)
+                if member_idx.numel() == 0:
+                    continue
+                delta_k = k_head[h, member_idx].float() - avgk[t].unsqueeze(0)
+                proj = delta_k @ q
+                quad_term[t] = (proj * proj).sum() / c[t]
+
+            refinement = torch.log(c) + quad_term
+            logits[h, i, idx] = q_avgk + refinement
 
     return F.softmax(logits + mask_f, dim=-1)
 
 
-def v_l2_per_pos(alpha, v_head, v_gt):
+def build_avgv_refined_v(alpha, v_head, hh_sumv_idx, hh_sumv_val, count):
+    n_heads, n_pos, seq_len = alpha.shape
+    if v_head.shape[0] != n_heads or v_head.shape[1] != seq_len:
+        raise ValueError(
+            f"v_head shape mismatch: got {tuple(v_head.shape)} expected heads={n_heads}, seq={seq_len}, d=*"
+        )
+    if count.shape != alpha.shape:
+        raise ValueError(
+            f"count shape mismatch: got {tuple(count.shape)} expected {tuple(alpha.shape)}"
+        )
+
     v_new = alpha.float() @ v_head.float()
+    for h in range(n_heads):
+        for i in range(n_pos):
+            idx = hh_sumv_idx[h][i]
+            val_sum = hh_sumv_val[h][i]
+            if idx is None or val_sum is None or idx.numel() == 0:
+                continue
+
+            c = count[h, i, idx].to(torch.float32).clamp_min(1.0).unsqueeze(-1)
+            val_avg = val_sum.float() / c
+            w = alpha[h, i, idx].float().unsqueeze(-1)
+            delta = val_avg - v_head[h, idx].float()
+            v_new[h, i] = v_new[h, i] + (w * delta).sum(dim=0)
+
+    return v_new
+
+
+def v_l2_per_pos_from_v(v_new, v_gt):
     l2 = torch.norm(v_new - v_gt.float(), p=2, dim=-1)
     return l2.mean(dim=0)
 
@@ -132,7 +214,7 @@ def main():
     output_dir = resolve_output_dir(
         args=args,
         head_idx=head_idx,
-        compare_tag="compare_count",
+        compare_tag="compare_count_vark",
         include_loss_type=True,
     )
 
@@ -160,6 +242,7 @@ def main():
                 adaptive_budget=args.adaptive_budget,
             )[0],
         )
+
     print("Prefix patches prepared for layers", list(prefix_patches.keys()))
     artifacts = capture_layer_artifacts(
         ctx=ctx,
@@ -170,7 +253,7 @@ def main():
     )
     layer_ctx = build_runtime_layer_ctx(ctx, args.layer, artifacts)
 
-    route_mask, belong, count = gen_mask_h2o_with_belong(
+    route_mask, belong, count, hh_sumv_idx, hh_sumv_val, hh_sumk_val = gen_mask_h2o_with_belong(
         ctx=layer_ctx,
         layer_idx=args.layer,
         pos_list=pos_list,
@@ -178,6 +261,8 @@ def main():
         budget=args.budget,
         seq_len=args.seq_len,
         adaptive_budget=args.adaptive_budget,
+        return_hh_sumv=True,
+        return_hh_sumk=True,
     )
 
     alpha_base = build_qk_routing_alpha(
@@ -197,18 +282,25 @@ def main():
         device=ctx.device,
     )
 
+    q_head = layer_ctx.rope_qkv[args.layer]["q"].to(ctx.device)[0][head_idx][:, pos_list, :].float()
+    k_head = layer_ctx.rope_qkv[args.layer]["k"].to(ctx.device)[0][head_idx].float()
+
     visible = int(args.seq_len * args.budget)
     if args.adaptive_budget and (args.layer == 0 or args.layer == 1):
         visible = args.seq_len
     recent_budget = visible // 2
 
-    alpha_count = build_count_refined_alpha(
+    alpha_vark = build_vark_refined_alpha(
         qk_logits=qk_logits,
+        q_head=q_head,
+        k_head=k_head,
         mask=route_mask,
         belong=belong,
+        count=count,
+        hh_sumk_idx=hh_sumv_idx,
+        hh_sumk_val=hh_sumk_val,
         pos_list=pos_list,
         recent_budget=recent_budget,
-        count=count,
     )
 
     v_head = layer_ctx.rope_qkv[args.layer]["v"].to(ctx.device)[0][head_idx].float()
@@ -219,18 +311,27 @@ def main():
         .float()
     )
 
-    base_metric = v_l2_per_pos(alpha_base.detach().to(torch.float32), v_head, v_gt)
-    count_metric = v_l2_per_pos(alpha_count.detach().to(torch.float32), v_head, v_gt)
+    v_base = alpha_base.float() @ v_head.float()
+    v_vark = build_avgv_refined_v(
+        alpha=alpha_vark,
+        v_head=v_head,
+        hh_sumv_idx=hh_sumv_idx,
+        hh_sumv_val=hh_sumv_val,
+        count=count,
+    )
 
-    print("===== Compare-Count Summary =====")
+    base_metric = v_l2_per_pos_from_v(v_base, v_gt)
+    vark_metric = v_l2_per_pos_from_v(v_vark, v_gt)
+
+    print("===== Compare-Count-VarK Summary =====")
     print(
         f"layer={args.layer}, heads={head_idx}, budget={args.budget:g}, "
         f"prefix_mode={args.prefix_mode}, strategy={args.strategy}"
     )
     print(
         f"mean base v_l2={float(base_metric.mean().item()):.8e}, "
-        f"mean count v_l2={float(count_metric.mean().item()):.8e}, "
-        f"mean improvement={float((base_metric - count_metric).mean().item()):.8e}"
+        f"mean vark v_l2={float(vark_metric.mean().item()):.8e}, "
+        f"mean improvement={float((base_metric - vark_metric).mean().item()):.8e}"
     )
 
     per_pos_path = os.path.join(output_dir, "per_pos_v_l2.tsv")
@@ -238,19 +339,19 @@ def main():
         out_path=per_pos_path,
         pos_list=pos_list,
         base_metric=base_metric,
-        other_metric=count_metric,
-        other_name="count",
+        other_metric=vark_metric,
+        other_name="vark",
     )
-    
+
     plot_path = os.path.join(output_dir, "per_pos_v_l2.png")
     plot_per_pos_two_lines(
         out_path=plot_path,
         pos_list=pos_list,
         y1=base_metric,
-        y2=count_metric,
+        y2=vark_metric,
         label1="base_v_l2",
-        label2="count_v_l2",
-        title="Per-Position V-L2: Base vs Count-Refined",
+        label2="vark_v_l2",
+        title="Per-Position V-L2: Base vs VarK with budget={:.2f}".format(args.budget),
         dpi=args.plot_dpi,
     )
 
@@ -264,15 +365,16 @@ def main():
         "pos_list": pos_list,
         "metric_name": "v_l2",
         "mean_base_metric": float(base_metric.mean().item()),
-        "mean_count_metric": float(count_metric.mean().item()),
-        "mean_improvement": float((base_metric - count_metric).mean().item()),
+        "mean_vark_metric": float(vark_metric.mean().item()),
+        "mean_improvement": float((base_metric - vark_metric).mean().item()),
         "base_metric_per_pos": base_metric.detach().cpu(),
-        "count_metric_per_pos": count_metric.detach().cpu(),
+        "vark_metric_per_pos": vark_metric.detach().cpu(),
     }
-    stats_path = os.path.join(output_dir, "compare_count_stats.pt")
+    stats_path = os.path.join(output_dir, "compare_count_vark_stats.pt")
     torch.save(stats, stats_path)
 
     print(f"Saved per-pos v_l2 table to: {per_pos_path}")
+    print(f"Saved per-pos v_l2 plot to: {plot_path}")
     print(f"Saved belong tensor to: {belong_path}")
     print(f"Saved stats to: {stats_path}")
 

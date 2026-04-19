@@ -151,7 +151,7 @@ def build_vark_refined_alpha(
                 proj = delta_k @ q
                 quad_term[t] = (proj * proj).sum() / c[t]
 
-            refinement = torch.log(c) + quad_term
+            refinement = torch.log(c) + quad_term / 2 / scale / scale
             logits[h, i, idx] = q_avgk + refinement
 
     return F.softmax(logits + mask_f, dim=-1)

@@ -11,18 +11,14 @@ Note:
 - This runner only supports tau-target = v_l2_gt.
 """
 
-import argparse
 import os
 
 import torch
-from datasets import load_dataset
-from torch.nn import functional as F
 
 from .attention import (
     gen_mask,
 )
 from .compare_q_linear import build_q_linear_alpha, optimize_w_v_l2
-from .context import RunContext
 
 from .online_routing import (
     build_runtime_layer_ctx,
@@ -35,40 +31,31 @@ from .runner import (
     resolve_layers,
     validate_args_with_cache,
 )
+from .runner_utils import (
+    add_tau_target_arg,
+    build_context_with_new_start,
+    create_base_runner_parser,
+    finalize_runner_args,
+    load_existing_baseline_metrics,
+    load_existing_optimal_metrics,
+    mean_nll_and_ppl,
+    resolve_head_indices,
+    resolve_output_dir,
+    set_seed,
+    str_to_torch_dtype,
+)
 from .sanity import build_modified_attn_hidden, get_tail_labels, move_model_inputs_to_device
 
 
-def set_seed(seed: int):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def str_to_torch_dtype(dtype_str):
-    if dtype_str == "float32":
-        return torch.float32
-    if dtype_str == "float16":
-        return torch.float16
-    if dtype_str == "bfloat16":
-        return torch.bfloat16
-    raise ValueError(f"Unknown dtype: {dtype_str}")
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(
+    parser = create_base_runner_parser(
         description=(
             "Run baseline/optimal/inter_q_linear routing online and compare PPL. "
             "Inter-Q-Linear routing uses per-head linear map W with v_l2_gt objective."
-        )
+        ),
+        strategy_choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
+        default_strategy="h2o",
     )
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
-    parser.add_argument("--dataset", type=str, default="wikitext")
-    parser.add_argument(
-        "--strategy",
-        type=str,
-        default="h2o",
-        choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
-    )
-    parser.add_argument("--start", type=int, default=0)
     parser.add_argument(
         "--eval-start",
         type=int,
@@ -78,31 +65,6 @@ def parse_args():
             "Use a different value to test W generalization across samples."
         ),
     )
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="float32",
-        choices=["float32", "float16", "bfloat16"],
-    )
-
-    parser.add_argument("--training-steps", type=int, default=1000)
-    parser.add_argument("--lr", type=float, default=0.1)
-    parser.add_argument(
-        "--loss-type",
-        type=str,
-        default="v_l2",
-        choices=["logits_kl", "v_l2", "v_kl"],
-    )
-
-    layer_group = parser.add_mutually_exclusive_group()
-    layer_group.add_argument("--layers", type=int, nargs="+", default=None)
-    layer_group.add_argument("--all-layers", action="store_true")
-
-    parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--adaptive-budget", action="store_true")
-    parser.add_argument("--budgets", type=float, nargs="+", default=[0.01, 0.025, 0.05])
-
     parser.add_argument("--w-steps", type=int, default=600)
     parser.add_argument("--w-lr", type=float, default=1e-3)
     parser.add_argument("--w-l2", type=float, default=0.0)
@@ -114,176 +76,11 @@ def parse_args():
         help="Constraint for per-head W in qWk. full: unconstrained matrix; diag: diagonal-only.",
     )
 
-    parser.add_argument(
-        "--tau-target",
-        type=str,
-        default="v_l2_gt",
-        choices=["v_l2_gt"],
-        help="Fixed target for this runner.",
-    )
+    add_tau_target_arg(parser)
 
-    parser.add_argument("--output-dir", type=str, default=None)
-
-    args = parser.parse_args()
-    if args.layers is None:
-        args.all_layers = True
-    else:
-        args.all_layers = False
-    return args
+    return finalize_runner_args(parser.parse_args())
 
 
-def resolve_output_dir(args):
-    if args.output_dir is not None:
-        out_dir = args.output_dir
-    else:
-        adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
-        sample_tag = f"fit{args.start}" if args.eval_start == args.start else f"fit{args.start}_eval{args.eval_start}"
-        out_dir = (
-            f"../result/{args.dataset}_{sample_tag}/{adaptive_str}/{args.strategy}/"
-            f"{args.loss_type}/runner_inter_q_linear"
-        )
-    os.makedirs(out_dir, exist_ok=True)
-    return out_dir
-
-
-def _adaptive_str(adaptive_budget):
-    return "adaptive" if adaptive_budget else "fixed"
-
-
-def _nll_to_ppl(nll):
-    return float(torch.exp(torch.tensor(float(nll), dtype=torch.float32)).item())
-
-
-def load_existing_baseline_metrics(args, budget):
-    metric_start = args.eval_start
-    path = (
-        f"../result/{args.dataset}_{metric_start}/"
-        f"{_adaptive_str(args.adaptive_budget)}/{args.strategy}/qk_routing.pt"
-    )
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Missing baseline summary file: {path}. "
-            "Please run runner.py baseline comparison first."
-        )
-
-    summary = torch.load(path, map_location="cpu", weights_only=False)
-    budgets = summary.get("budgets", {}) if isinstance(summary, dict) else {}
-    key = normalize_budget_key(budgets, budget)
-    if key is None:
-        raise KeyError(f"Budget {budget} not found in baseline summary keys: {list(budgets.keys())}")
-
-    entry = budgets[key]
-    if "student_nll" not in entry:
-        raise KeyError(f"Invalid baseline entry at budget {key}: missing student_nll")
-
-    nll = float(entry["student_nll"])
-    return {"nll": nll, "ppl": _nll_to_ppl(nll), "raw": entry}
-
-
-def load_existing_optimal_metrics(args, budget):
-    metric_start = args.eval_start
-    path = (
-        f"../result/{args.dataset}_{metric_start}/"
-        f"{_adaptive_str(args.adaptive_budget)}/{args.strategy}/{args.loss_type}/"
-        "layer_all/budget_to_final_metrics.pt"
-    )
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Missing optimal summary file: {path}. "
-            "Please run runner.py optimization first."
-        )
-
-    summary = torch.load(path, map_location="cpu", weights_only=False)
-    key = normalize_budget_key(summary, budget)
-    if key is None:
-        raise KeyError(f"Budget {budget} not found in optimal summary keys: {list(summary.keys())}")
-
-    entry = summary[key]
-    if "student_nll" not in entry:
-        raise KeyError(f"Invalid optimal entry at budget {key}: missing student_nll")
-
-    nll = float(entry["student_nll"])
-    return {"nll": nll, "ppl": _nll_to_ppl(nll), "raw": entry}
-
-
-def mean_nll_and_ppl(logits, labels):
-    nll = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        labels.reshape(-1),
-        reduction="mean",
-    )
-    ppl = torch.exp(nll)
-    return float(nll.item()), float(ppl.item())
-
-
-def _resolve_head_indices(num_heads):
-    return list(range(num_heads))
-
-
-def _build_prompt(dataset_name):
-    if dataset_name == "wikitext":
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        return "\n".join([text for text in dataset["text"] if text.strip()])
-    if dataset_name == "pg19":
-        dataset = load_dataset("emozilla/pg19-test", split="test")
-        return "\n".join([text for text in dataset["text"] if text.strip()])
-    if dataset_name == "oasst2":
-        dataset = load_dataset("OpenAssistant/oasst2", split="train")
-        texts = dataset["text"]
-        langs = dataset["lang"] if "lang" in dataset.column_names else None
-        if langs is None:
-            filtered_texts = [text for text in texts if isinstance(text, str) and text.strip()]
-        else:
-            filtered_texts = [
-                text
-                for text, lang in zip(texts, langs)
-                if isinstance(text, str)
-                and text.strip()
-                and (lang is None or str(lang).startswith("en"))
-            ]
-        if len(filtered_texts) == 0:
-            raise ValueError("No valid text found in OASST2 after filtering.")
-        return "\n".join(filtered_texts)
-    raise ValueError(
-        f"Unsupported dataset '{dataset_name}'. Supported now: wikitext, pg19, oasst2"
-    )
-
-
-def build_context_with_new_start(base_ctx, dataset_name, start, seq_len):
-    prompt = _build_prompt(dataset_name)
-    encoded = base_ctx.tokenizer(
-        prompt,
-        max_length=start + seq_len + 1,
-        truncation=True,
-        return_tensors="pt",
-    )
-
-    total_len = encoded["input_ids"].shape[1]
-    required_len = start + seq_len + 1
-    if total_len < required_len:
-        raise ValueError(
-            f"Tokenized prompt length ({total_len}) is shorter than required ({required_len})."
-        )
-
-    inputs = {
-        key: value[:, start : start + seq_len]
-        for key, value in encoded.items()
-    }
-    gt_label = encoded["input_ids"][:, start + 1 : start + seq_len + 1]
-
-    return RunContext(
-        model=base_ctx.model,
-        tokenizer=base_ctx.tokenizer,
-        rope_qkv=None,
-        inputs=inputs,
-        outputs=None,
-        attn_output=None,
-        layer_input=None,
-        gt_label=gt_label,
-        model_config=base_ctx.model_config,
-        dtype=base_ctx.dtype,
-        device=base_ctx.device,
-    )
 
 
 def fit_w_by_layer(ctx, args, budget, layer_idx_list, head_idx, pos_list, model_inputs):
@@ -409,7 +206,7 @@ def main():
     fit_ctx = load_context(args, dtype=dtype, device=args.device)
     validate_args_with_cache(fit_ctx, args)
     fit_ctx.model.eval()
-    import ipdb; ipdb.set_trace()
+
     eval_ctx = fit_ctx
     if args.eval_start != args.start:
         eval_ctx = build_context_with_new_start(
@@ -420,7 +217,7 @@ def main():
         )
         validate_args_with_cache(eval_ctx, args)
 
-    head_idx = _resolve_head_indices(fit_ctx.model_config.num_attention_heads)
+    head_idx = resolve_head_indices(fit_ctx.model_config.num_attention_heads)
     pos_list = list(range(args.seq_len))
     layer_idx_list = resolve_layers(
         args.layers,
@@ -436,7 +233,7 @@ def main():
         ref_logits = eval_ctx.model(**eval_model_inputs, use_cache=False).logits[:, pos_list, :].float()
     ref_nll, ref_ppl = mean_nll_and_ppl(ref_logits, eval_labels)
 
-    out_dir = resolve_output_dir(args)
+    out_dir = resolve_output_dir(args, runner_name="runner_inter_q_linear")
     save_path = os.path.join(out_dir, "runner_inter_q_linear_summary.pt")
 
     summary = {

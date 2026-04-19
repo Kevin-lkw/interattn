@@ -1,22 +1,23 @@
 """
-Run baseline and optimal routing online, and compare with q-bias routing.
+Run baseline and optimal routing online, and compare with inter-avgKV routing.
 
-Inter-Q-Bias routing pipeline per layer:
-1) build baseline alpha from QK logits + mask
-2) fit per-head per-key bias with v_l2_gt objective
-3) build alpha_bias from qk + bias
-4) patch hidden states with alpha_bias and run multilayer evaluation
+Inter-avgKV routing pipeline per layer:
+1) build baseline alpha from QK logits + H2O-with-belong mask
+2) refine HH routing logits with q·avgK + log(C)
+3) refine value vectors with avgV = sumV / C on HH representatives
+4) patch hidden states with refined V and run multilayer evaluation
 
 Note:
-- This runner only supports tau-target = v_l2_gt.
+- This runner is deterministic (no trainable parameters).
+- Strategy is restricted to h2o because avgKV refinement depends on belong/count metadata.
 """
 
 import os
 
 import torch
+from torch.nn import functional as F
 
-from .attention import gen_mask, get_attention_map_after_rope
-from .compare_q_bias import build_bias_routing_alpha, optimize_bias_v_l2
+from .attention import gen_mask_h2o_with_belong, get_attention_map_after_rope
 from .online_routing import (
     build_runtime_layer_ctx,
     capture_layer_artifacts,
@@ -29,7 +30,6 @@ from .runner import (
     validate_args_with_cache,
 )
 from .runner_utils import (
-    add_tau_target_arg,
     build_context_with_new_start,
     create_base_runner_parser,
     finalize_runner_args,
@@ -41,17 +41,18 @@ from .runner_utils import (
     set_seed,
     str_to_torch_dtype,
 )
-from .sanity import build_modified_attn_hidden, get_tail_labels, move_model_inputs_to_device
+from .sanity import get_tail_labels, move_model_inputs_to_device
 
 
 def parse_args():
     parser = create_base_runner_parser(
         description=(
-            "Run baseline/optimal/inter_q_bias routing online and compare PPL. "
-            "Inter-Q-Bias routing uses per-head per-key bias with v_l2_gt objective."
+            "Run baseline/optimal/inter_avgKV routing online and compare PPL. "
+            "Inter-avgKV routing uses q·avgK+log(C) and avgV refinement per layer."
         ),
-        strategy_choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
+        strategy_choices=["h2o"],
         default_strategy="h2o",
+        strategy_help="avgKV refinement currently requires h2o_with_belong metadata.",
     )
     parser.add_argument(
         "--eval-start",
@@ -59,15 +60,9 @@ def parse_args():
         default=None,
         help=(
             "Start index for evaluation sample. If not set, use --start. "
-            "Use a different value to test bias generalization across samples."
+            "For inter-avgKV this only changes evaluation sample; no fitted params are reused."
         ),
     )
-    parser.add_argument("--bias-steps", type=int, default=500)
-    parser.add_argument("--bias-lr", type=float, default=5e-2)
-    parser.add_argument("--bias-l2", type=float, default=0.0)
-
-    add_tau_target_arg(parser)
-
     return finalize_runner_args(parser.parse_args())
 
 
@@ -84,92 +79,105 @@ def _get_qk_logits(ctx, layer_idx, head_idx, pos_list, device):
     return qk_scores[head_idx][:, pos_list, :].to(torch.float32)
 
 
-def fit_bias_by_layer(ctx, args, budget, layer_idx_list, head_idx, pos_list, model_inputs):
-    patches_fit = {}
-    bias_by_layer = {}
-    losses_by_layer = {}
-
-    for layer_idx in layer_idx_list:
-        artifacts = capture_layer_artifacts(
-            ctx=ctx,
-            layer_idx=layer_idx,
-            pos_list=pos_list,
-            model_inputs=model_inputs,
-            layer_to_patch=patches_fit,
+def build_avgk_count_refined_alpha(
+    qk_logits,
+    q_head,
+    mask,
+    count,
+    hh_sumk_idx,
+    hh_sumk_val,
+    pos_list,
+    recent_budget,
+):
+    n_heads, n_pos, _seq_len = qk_logits.shape
+    if mask.shape != qk_logits.shape:
+        raise ValueError(
+            f"mask shape mismatch: got {tuple(mask.shape)} expected {tuple(qk_logits.shape)}"
         )
-        layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, artifacts)
-
-        mask = gen_mask(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            pos_list=pos_list,
-            head_idx=head_idx,
-            strategy=args.strategy,
-            budget=budget,
-            seq_len=args.seq_len,
-            adaptive_budget=args.adaptive_budget,
+    if count.shape != qk_logits.shape:
+        raise ValueError(
+            f"count shape mismatch: got {tuple(count.shape)} expected {tuple(qk_logits.shape)}"
+        )
+    if q_head.shape[0] != n_heads or q_head.shape[1] != n_pos:
+        raise ValueError(
+            f"q_head shape mismatch: got {tuple(q_head.shape)} expected ({n_heads}, {n_pos}, d)"
         )
 
-        # _alpha_base = build_qk_routing_alpha(
-        #     ctx=layer_ctx,
-        #     layer_idx=layer_idx,
-        #     head_idx=head_idx,
-        #     pos_list=pos_list,
-        #     mask=mask,
-        #     device=ctx.device,
-        # )
+    logits = qk_logits.to(torch.float32).clone()
+    mask_f = mask.to(torch.float32)
+    scale = float(q_head.shape[-1]) ** 0.5
 
-        qk_logits = _get_qk_logits(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            device=ctx.device,
+    for h in range(n_heads):
+        for i, pos in enumerate(pos_list):
+            total_available = pos + 1
+            recent_start = max(0, total_available - recent_budget)
+
+            idx = hh_sumk_idx[h][i]
+            sumk = hh_sumk_val[h][i]
+            if idx is None or sumk is None or idx.numel() == 0:
+                continue
+
+            visible = ~torch.isneginf(mask_f[h, i, :total_available])
+            hh_visible = visible.clone()
+            hh_visible[recent_start:total_available] = False
+            if hh_visible[idx].any().item() is False:
+                continue
+
+            c = count[h, i, idx].to(torch.float32).clamp_min(1.0)
+            avgk = sumk.float() / c.unsqueeze(-1)
+            q = q_head[h, i].float().unsqueeze(0)
+            q_avgk = (q * avgk).sum(dim=-1) / scale
+            logits[h, i, idx] = q_avgk + torch.log(c)
+
+    return F.softmax(logits + mask_f, dim=-1)
+
+
+def build_avgv_refined_v(alpha, v_head, hh_sumv_idx, hh_sumv_val, count):
+    n_heads, n_pos, seq_len = alpha.shape
+    if v_head.shape[0] != n_heads or v_head.shape[1] != seq_len:
+        raise ValueError(
+            f"v_head shape mismatch: got {tuple(v_head.shape)} expected heads={n_heads}, seq={seq_len}, d=*"
+        )
+    if count.shape != alpha.shape:
+        raise ValueError(
+            f"count shape mismatch: got {tuple(count.shape)} expected {tuple(alpha.shape)}"
         )
 
-        v_head = layer_ctx.rope_qkv[layer_idx]["v"].to(ctx.device)[0][head_idx].float()
-        v_gt = (
-            layer_ctx.attn_output[layer_idx]["output"][0, pos_list]
-            .permute(1, 0, 2)
-            .to(ctx.device)[head_idx]
-            .float()
-        )
+    v_new = alpha.float() @ v_head.float()
+    for h in range(n_heads):
+        for i in range(n_pos):
+            idx = hh_sumv_idx[h][i]
+            val_sum = hh_sumv_val[h][i]
+            if idx is None or val_sum is None or idx.numel() == 0:
+                continue
 
-        bias, alpha_bias, bias_history = optimize_bias_v_l2(
-            v_head=v_head,
-            v_gt=v_gt,
-            qk_logits=qk_logits,
-            mask=mask,
-            bias_steps=args.bias_steps,
-            bias_lr=args.bias_lr,
-            bias_l2=args.bias_l2,
-        )
+            c = count[h, i, idx].to(torch.float32).clamp_min(1.0).unsqueeze(-1)
+            val_avg = val_sum.float() / c
+            w = alpha[h, i, idx].float().unsqueeze(-1)
+            delta = val_avg - v_head[h, idx].float()
+            v_new[h, i] = v_new[h, i] + (w * delta).sum(dim=0)
 
-        alpha_bias = build_bias_routing_alpha(qk_logits=qk_logits, mask=mask, bias=bias)
-
-        # Keep fit-time online behavior: previous fitted layers are patched when fitting later layers.
-        patches_fit[layer_idx] = build_modified_attn_hidden(
-            ctx=layer_ctx,
-            layer_idx=layer_idx,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            alpha=alpha_bias,
-            device=ctx.device,
-        )
-
-        bias_by_layer[layer_idx] = {
-            "bias": bias,
-            "bias_history": bias_history,
-        }
-        losses_by_layer[layer_idx] = "skipped_optimal_routing"
-
-        bias_abs_mean = float(bias.abs().mean().item())
-        print(f"[fit bias] layer={layer_idx} mean(|bias|)={bias_abs_mean:.6f}")
-
-    return bias_by_layer, losses_by_layer
+    return v_new
 
 
-def build_layer_patches_from_bias(
+def build_modified_attn_hidden_from_vnew(ctx, layer_idx, head_idx, pos_list, v_new, device=None):
+    if device is None:
+        device = ctx.device
+
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+
+    layer = ctx.model.model.layers[layer_idx]
+    original = ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(device)
+
+    output = original.clone()
+    output[head_idx] = v_new.to(output.dtype)
+
+    attn_hidden = layer.self_attn.o_proj(output.permute(1, 0, 2).reshape(len(pos_list), -1))
+    return attn_hidden
+
+
+def _build_inter_avgkv_patches(
     ctx,
     args,
     budget,
@@ -177,31 +185,30 @@ def build_layer_patches_from_bias(
     head_idx,
     pos_list,
     model_inputs,
-    bias_by_layer,
 ):
-    patches_eval = {}
-    for layer_idx in layer_idx_list:
-        if layer_idx not in bias_by_layer:
-            raise KeyError(f"Missing fitted bias for layer={layer_idx}")
+    patches = {}
+    layer_meta = {}
 
+    for layer_idx in layer_idx_list:
         artifacts = capture_layer_artifacts(
             ctx=ctx,
             layer_idx=layer_idx,
             pos_list=pos_list,
             model_inputs=model_inputs,
-            layer_to_patch=patches_eval,
+            layer_to_patch=patches,
         )
         layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, artifacts)
 
-        mask = gen_mask(
+        route_mask, _belong, count, hh_sumv_idx, hh_sumv_val, hh_sumk_val = gen_mask_h2o_with_belong(
             ctx=layer_ctx,
             layer_idx=layer_idx,
             pos_list=pos_list,
             head_idx=head_idx,
-            strategy=args.strategy,
             budget=budget,
             seq_len=args.seq_len,
             adaptive_budget=args.adaptive_budget,
+            return_hh_sumv=True,
+            return_hh_sumk=True,
         )
 
         qk_logits = _get_qk_logits(
@@ -212,19 +219,54 @@ def build_layer_patches_from_bias(
             device=ctx.device,
         )
 
-        bias = bias_by_layer[layer_idx]["bias"]
-        alpha_bias = build_bias_routing_alpha(qk_logits=qk_logits, mask=mask, bias=bias)
+        q_head = (
+            layer_ctx.rope_qkv[layer_idx]["q"]
+            .to(ctx.device)[0][head_idx][:, pos_list, :]
+            .float()
+        )
 
-        patches_eval[layer_idx] = build_modified_attn_hidden(
+        visible = int(args.seq_len * budget)
+        if args.adaptive_budget and (layer_idx == 0 or layer_idx == 1):
+            visible = args.seq_len
+        recent_budget = visible // 2
+
+        alpha_avgkv = build_avgk_count_refined_alpha(
+            qk_logits=qk_logits,
+            q_head=q_head,
+            mask=route_mask,
+            count=count,
+            hh_sumk_idx=hh_sumv_idx,
+            hh_sumk_val=hh_sumk_val,
+            pos_list=pos_list,
+            recent_budget=recent_budget,
+        )
+
+        v_head = layer_ctx.rope_qkv[layer_idx]["v"].to(ctx.device)[0][head_idx].float()
+        v_avgkv = build_avgv_refined_v(
+            alpha=alpha_avgkv,
+            v_head=v_head,
+            hh_sumv_idx=hh_sumv_idx,
+            hh_sumv_val=hh_sumv_val,
+            count=count,
+        )
+
+        patches[layer_idx] = build_modified_attn_hidden_from_vnew(
             ctx=layer_ctx,
             layer_idx=layer_idx,
             head_idx=head_idx,
             pos_list=pos_list,
-            alpha=alpha_bias,
+            v_new=v_avgkv,
             device=ctx.device,
         )
 
-    return patches_eval
+        layer_meta[layer_idx] = {
+            "recent_budget": int(recent_budget),
+            "visible_budget": int(visible),
+            "mean_alpha": float(alpha_avgkv.mean().item()),
+            "mean_v_norm": float(torch.norm(v_avgkv, p=2, dim=-1).mean().item()),
+        }
+
+    return patches, layer_meta
 
 
 def main():
@@ -256,7 +298,6 @@ def main():
         fit_ctx.model_config.num_hidden_layers,
     )
 
-    fit_model_inputs = move_model_inputs_to_device(fit_ctx.inputs, fit_ctx.device)
     eval_model_inputs = move_model_inputs_to_device(eval_ctx.inputs, eval_ctx.device)
     eval_labels = get_tail_labels(eval_ctx, pos_list, eval_ctx.device)
 
@@ -264,8 +305,8 @@ def main():
         ref_logits = eval_ctx.model(**eval_model_inputs, use_cache=False).logits[:, pos_list, :].float()
     ref_nll, ref_ppl = mean_nll_and_ppl(ref_logits, eval_labels)
 
-    out_dir = resolve_output_dir(args, runner_name="runner_inter_q_bias")
-    save_path = os.path.join(out_dir, "runner_inter_q_bias_summary.pt")
+    out_dir = resolve_output_dir(args, runner_name="runner_inter_avgKV")
+    save_path = os.path.join(out_dir, "runner_inter_avgKV_summary.pt")
 
     summary = {
         "dataset": args.dataset,
@@ -274,12 +315,7 @@ def main():
         "seq_len": args.seq_len,
         "strategy": args.strategy,
         "loss_type": args.loss_type,
-        "tau_target": args.tau_target,
-        "bias": {
-            "bias_steps": int(args.bias_steps),
-            "bias_lr": float(args.bias_lr),
-            "bias_l2": float(args.bias_l2),
-        },
+        "method": "inter_avgKV",
         "budgets": [float(x) for x in args.budgets],
         "layers": layer_idx_list,
         "reference": {"nll": ref_nll, "ppl": ref_ppl},
@@ -299,14 +335,13 @@ def main():
                 "seq_len",
                 "strategy",
                 "loss_type",
-                "tau_target",
-                "bias",
+                "method",
                 "layers",
                 "reference",
             ]:
                 if key in old_summary:
                     summary[key] = old_summary[key]
-        print(f"Loaded existing runner_inter_q_bias summary: {save_path}")
+        print(f"Loaded existing runner_inter_avgKV summary: {save_path}")
 
     pending_budgets = []
     for budget in args.budgets:
@@ -321,7 +356,7 @@ def main():
         return
 
     for budget in pending_budgets:
-        print(f"\n[runner_inter_q_bias] budget={budget}")
+        print(f"\n[runner_inter_avgKV] budget={budget}")
 
         baseline_loaded = None
         optimal_loaded = None
@@ -343,17 +378,7 @@ def main():
                 f"(eval_start={args.eval_start}): {exc}"
             )
 
-        inter_q_bias_meta, inter_q_bias_losses = fit_bias_by_layer(
-            ctx=fit_ctx,
-            args=args,
-            budget=budget,
-            layer_idx_list=layer_idx_list,
-            head_idx=head_idx,
-            pos_list=pos_list,
-            model_inputs=fit_model_inputs,
-        )
-
-        inter_q_bias_patches = build_layer_patches_from_bias(
+        inter_avgkv_patches, inter_avgkv_meta = _build_inter_avgkv_patches(
             ctx=eval_ctx,
             args=args,
             budget=budget,
@@ -361,19 +386,18 @@ def main():
             head_idx=head_idx,
             pos_list=pos_list,
             model_inputs=eval_model_inputs,
-            bias_by_layer=inter_q_bias_meta,
         )
 
-        inter_q_bias_logits = run_with_multilayer_patches(
+        inter_avgkv_logits = run_with_multilayer_patches(
             ctx=eval_ctx,
-            layer_to_patch=inter_q_bias_patches,
+            layer_to_patch=inter_avgkv_patches,
             pos_list=pos_list,
             model_inputs=eval_model_inputs,
         )
-        inter_q_bias_nll, inter_q_bias_ppl = mean_nll_and_ppl(inter_q_bias_logits, eval_labels)
+        inter_avgkv_nll, inter_avgkv_ppl = mean_nll_and_ppl(inter_avgkv_logits, eval_labels)
 
         delta_vs_ref = {
-            "inter_q_bias_nll_gap": inter_q_bias_nll - ref_nll,
+            "inter_avgkv_nll_gap": inter_avgkv_nll - ref_nll,
         }
         if baseline_nll is not None:
             delta_vs_ref["baseline_nll_gap"] = baseline_nll - ref_nll
@@ -389,17 +413,13 @@ def main():
         summary["results"][float(budget)] = {
             "baseline": None if baseline_nll is None else {"nll": baseline_nll, "ppl": baseline_ppl},
             "optimal": None if optimal_nll is None else {"nll": optimal_nll, "ppl": optimal_ppl},
-            "inter_q_bias": {"nll": inter_q_bias_nll, "ppl": inter_q_bias_ppl},
+            "inter_avgkv": {"nll": inter_avgkv_nll, "ppl": inter_avgkv_ppl},
             "delta_vs_ref": delta_vs_ref,
-            "losses": {
-                "optimal": "loaded_from_existing_summary" if optimal_loaded is not None else "not_available",
-                "inter_q_bias": inter_q_bias_losses,
-            },
-            "bias": inter_q_bias_meta,
+            "meta": inter_avgkv_meta,
             "loaded_metrics": loaded_metrics,
         }
 
-        msg = f"[ppl@eval_start={args.eval_start}] ref={ref_ppl:.6f}, inter_q_bias(v_l2_gt)={inter_q_bias_ppl:.6f}"
+        msg = f"[ppl@eval_start={args.eval_start}] ref={ref_ppl:.6f}, inter_avgKV={inter_avgkv_ppl:.6f}"
         if baseline_ppl is not None:
             msg += f", baseline={baseline_ppl:.6f}"
         if optimal_ppl is not None:

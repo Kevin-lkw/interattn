@@ -52,12 +52,7 @@ def parse_args():
         ),
         strategy_choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
         default_strategy="h2o",
-    )
-    parser.add_argument(
-        "--eval-start",
-        type=int,
-        default=None,
-        help=(
+        eval_start_help=(
             "Start index for evaluation sample. If not set, use --start. "
             "Use a different value to test bias generalization across samples."
         ),

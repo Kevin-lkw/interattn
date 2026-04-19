@@ -53,12 +53,7 @@ def parse_args():
         strategy_choices=["h2o"],
         default_strategy="h2o",
         strategy_help="avgKV refinement currently requires h2o_with_belong metadata.",
-    )
-    parser.add_argument(
-        "--eval-start",
-        type=int,
-        default=None,
-        help=(
+        eval_start_help=(
             "Start index for evaluation sample. If not set, use --start. "
             "For inter-avgKV this only changes evaluation sample; no fitted params are reused."
         ),

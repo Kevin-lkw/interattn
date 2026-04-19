@@ -14,6 +14,7 @@ def create_base_runner_parser(
     strategy_choices,
     default_strategy: str = "h2o",
     strategy_help: str = None,
+    eval_start_help: str = None,
 ):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
@@ -29,14 +30,17 @@ def create_base_runner_parser(
     parser.add_argument("--strategy", **strategy_kwargs)
 
     parser.add_argument("--start", type=int, default=0)
+    if eval_start_help is None:
+        eval_start_help = (
+            "Start index for evaluation sample. If not set, use --start. "
+            "Use a different value to evaluate on another sample."
+        )
+
     parser.add_argument(
         "--eval-start",
         type=int,
         default=None,
-        help=(
-            "Start index for evaluation sample. If not set, use --start. "
-            "Use a different value to evaluate on another sample."
-        ),
+        help=eval_start_help,
     )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(

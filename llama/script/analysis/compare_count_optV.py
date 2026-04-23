@@ -114,6 +114,26 @@ def build_hh_mask(hh_positions, device):
     return hh_mask
 
 
+def canonicalize_belong(belong, pos_list):
+    root = belong.clone()
+    n_heads, n_pos, _ = root.shape
+
+    for h in range(n_heads):
+        for i, pos in enumerate(pos_list):
+            total_available = pos + 1
+            row = root[h, i, :total_available]
+
+            while True:
+                parent = row[row]
+                if torch.equal(parent, row):
+                    break
+                row = parent
+
+            root[h, i, :total_available] = row
+
+    return root
+
+
 def compute_cluster_gt(alpha_full, v_head, belong, hh_positions):
     n_heads, n_pos, _ = alpha_full.shape
     d = v_head.shape[-1]
@@ -130,8 +150,8 @@ def compute_cluster_gt(alpha_full, v_head, belong, hh_positions):
     for h in range(n_heads):
         for i in range(n_pos):
             hh_ids = hh_positions[h][i]
-            for slot, _hh in enumerate(hh_ids):
-                members = (belong[h, i] == slot).nonzero(as_tuple=False).squeeze(-1)
+            for slot, hh in enumerate(hh_ids):
+                members = (belong[h, i] == hh).nonzero(as_tuple=False).squeeze(-1)
                 if members.numel() == 0:
                     continue
                 w = alpha_full[h, i, members].float()
@@ -156,7 +176,7 @@ def build_tilde_v(choice, v_head, belong, hh_positions, g, cluster_w):
                 if choice == "hh":
                     tv[h, i, slot] = v_head[h, hh].float()
                 elif choice == "avg":
-                    members = (belong[h, i] == slot).nonzero(as_tuple=False).squeeze(-1)
+                    members = (belong[h, i] == hh).nonzero(as_tuple=False).squeeze(-1)
                     if members.numel() == 0:
                         tv[h, i, slot] = v_head[h, hh].float()
                     else:
@@ -164,6 +184,24 @@ def build_tilde_v(choice, v_head, belong, hh_positions, g, cluster_w):
                 else:
                     raise ValueError(f"Unsupported tilde_v choice: {choice}")
     return tv
+
+
+def compute_recent_contrib(alpha_full, v_head, pos_list, recent_budget):
+    n_heads, n_pos, _ = alpha_full.shape
+    d = v_head.shape[-1]
+    out = torch.zeros(n_heads, n_pos, d, device=alpha_full.device)
+
+    for i, pos in enumerate(pos_list):
+        total_available = pos + 1
+        recent_start = max(0, total_available - recent_budget)
+        if recent_start >= total_available:
+            continue
+        idx = torch.arange(recent_start, total_available, device=alpha_full.device)
+        w = alpha_full[:, i, idx].float()  # [H, R]
+        v = v_head[:, idx, :].float()      # [H, R, d]
+        out[:, i] = (w.unsqueeze(-1) * v).sum(1)
+
+    return out
 
 
 def optimal_scalar_output(tilde_v, g, hh_mask):
@@ -295,11 +333,19 @@ def main():
     hh_positions = extract_hh_positions(route_mask, recent_budget, pos_list)
     hh_mask = build_hh_mask(hh_positions, ctx.device)
 
+    belong_root = canonicalize_belong(belong, pos_list)
+
     g, cluster_w = compute_cluster_gt(
         alpha_full=alpha_full,
         v_head=v_head,
-        belong=belong,
+        belong=belong_root,
         hh_positions=hh_positions,
+    )
+    recent_gt = compute_recent_contrib(
+        alpha_full=alpha_full,
+        v_head=v_head,
+        pos_list=pos_list,
+        recent_budget=recent_budget,
     )
 
     v_base = alpha_base.float() @ v_head.float()
@@ -310,13 +356,14 @@ def main():
         tv = build_tilde_v(
             choice=choice,
             v_head=v_head,
-            belong=belong,
+            belong=belong_root,
             hh_positions=hh_positions,
             g=g,
             cluster_w=cluster_w,
         )
 
-        out_approx, r_star, residual = optimal_scalar_output(tv, g, hh_mask)
+        out_cluster, r_star, residual = optimal_scalar_output(tv, g, hh_mask)
+        out_approx = out_cluster + recent_gt
         metric = v_l2_per_pos_from_v(out_approx, v_gt)
         r_mean, r_std = r_star_stats(r_star, hh_mask)
 
@@ -345,6 +392,9 @@ def main():
             f"mean improvement={float((base_metric - m).mean().item()):.8e}, "
             f"r_mean={results[choice]['r_mean']:.4f}, r_std={results[choice]['r_std']:.4f}"
         )
+
+    if "wavg" in results:
+        print(f"wavg sanity (mean v_l2, should be ~0): {float(results['wavg']['metric'].mean().item()):.8e}")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -389,6 +439,7 @@ def main():
         "mean_base_metric": float(base_metric.mean().item()),
         "base_metric_per_pos": base_metric.detach().cpu(),
         "belong": belong.detach().cpu(),
+        "belong_root": belong_root.detach().cpu(),
         "hh_mask": hh_mask.detach().cpu(),
         "cluster_w": cluster_w.detach().cpu(),
     }

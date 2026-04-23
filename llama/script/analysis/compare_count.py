@@ -5,7 +5,6 @@ Count refinement rule (heavy hitter only):
     refined_logit = qk + log(C)
 where C is the size of the belong-set mapped to that heavy hitter key.
 Recent tokens are not adjusted.
-Wrong, abandoned: do not consider avg K and avg V
 """
 
 import argparse

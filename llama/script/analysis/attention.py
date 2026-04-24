@@ -179,6 +179,7 @@ def gen_mask_h2o_with_belong(
     budget,
     seq_len,
     adaptive_budget,
+    merge_metric="k",
     return_hh_sumv=False,
     return_hh_sumk=False,
 ):
@@ -198,13 +199,16 @@ def gen_mask_h2o_with_belong(
 
     Rule:
     - If token x is evicted, assign belong[x] = y where y is the kept heavy-hitter
-      token (older-than-recent window) with maximum key dot-product similarity.
+      token (older-than-recent window) with maximum dot-product similarity under
+      the selected merge_metric ("k" or "v").
     - If token x is kept (or no valid heavy hitter exists), belong[x] = x.
     - Transitive merge is resolved by DSU root when emitting belong rows.
     """
     device = ctx.device
     if isinstance(head_idx, int):
         head_idx = [head_idx]
+    if merge_metric not in {"k", "v"}:
+        raise ValueError(f"Unsupported merge_metric {merge_metric}. Expected 'k' or 'v'.")
 
     visible = int(seq_len * budget)
     if adaptive_budget and (layer_idx == 0 or layer_idx == 1):
@@ -257,11 +261,6 @@ def gen_mask_h2o_with_belong(
         count = torch.ones(seq_len, dtype=torch.long, device=device)
         group_sum_v = torch.zeros_like(v_head)
         group_sum_k = torch.zeros_like(k_head)
-        def find_root(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
 
         for i, pos in enumerate(pos_list):
             total_available = pos + 1
@@ -293,7 +292,10 @@ def gen_mask_h2o_with_belong(
                 hh_kept_idx = cache_idx_after[cache_idx_after < recent_start]
 
                 if len(hh_kept_idx) > 0:
-                    sims = torch.matmul(k_head[hh_kept_idx], k_head[victim])
+                    if merge_metric == "k":
+                        sims = torch.matmul(k_head[hh_kept_idx], k_head[victim])
+                    else:
+                        sims = torch.matmul(v_head[hh_kept_idx], v_head[victim])
                     y = int(hh_kept_idx[torch.argmax(sims)].item())
                 else:
                     assert False, f"No heavy hitter to assign for victim {victim} at position {pos}"

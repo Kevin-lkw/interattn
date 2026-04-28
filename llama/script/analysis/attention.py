@@ -347,6 +347,134 @@ def gen_mask_h2o_with_belong(
     return mask, belong, count_mtx
 
 
+def gen_mask_h2o_with_belong_all(
+    ctx,
+    layer_idx,
+    pos_list,
+    head_idx,
+    budget,
+    seq_len,
+    adaptive_budget,
+    merge_metric="k",
+):
+    """
+    H2O mask generator with belong mapping for all visible tokens.
+
+        Difference from gen_mask_h2o_with_belong:
+    - Eviction policy remains H2O-style (evict from heavy-hitter part, not recent window).
+    - Routing refinement is applied to all visible tokens via count_mtx.
+        - When assigning an evicted token x, merge target y is selected from all
+            currently kept tokens by maximum similarity under merge_metric ("k" or "v").
+
+    Returns:
+        mask:   [n_heads, n_pos, seq_len], additive mask (0 or -inf)
+        belong: [n_heads, n_pos, seq_len], parent index for keys <= current pos,
+                and -1 for keys > current pos.
+        count_mtx: [n_heads, n_pos, seq_len], merged-set sizes on parent indices.
+    """
+    device = ctx.device
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+    if merge_metric not in {"k", "v"}:
+        raise ValueError(f"Unsupported merge_metric {merge_metric}. Expected 'k' or 'v'.")
+
+    visible = int(seq_len * budget)
+    if adaptive_budget and (layer_idx == 0 or layer_idx == 1):
+        budget = 1.0
+        visible = seq_len
+
+    recent_budget = visible // 2
+
+    print(
+        f"layer {layer_idx}: visible {visible} tokens for strategy h2o_with_belong_all with budget {budget}"
+    )
+
+    k_all = ctx.rope_qkv[layer_idx]["k"].to(device=device, dtype=torch.float32)[0][head_idx]
+    v_all = ctx.rope_qkv[layer_idx]["v"].to(device=device, dtype=torch.float32)[0][head_idx]
+    _, attention_score = get_attention_map_after_rope(
+        ctx, layer_idx, causal=True, dtype=ctx.dtype, device=device
+    )
+
+    num_out_heads = len(head_idx)
+    num_pos = len(pos_list)
+
+    mask = torch.zeros(num_out_heads, num_pos, seq_len, device=device)
+    belong = torch.full(
+        (num_out_heads, num_pos, seq_len),
+        fill_value=-1,
+        device=device,
+        dtype=torch.long,
+    )
+    count_mtx = torch.zeros(num_out_heads, num_pos, seq_len, device=device, dtype=torch.long)
+
+    t1 = time.time()
+
+    for out_h, head in enumerate(head_idx):
+        attn = attention_score[head]
+        k_head = k_all[out_h]
+        v_head = v_all[out_h]
+
+        acc = torch.zeros(seq_len, device=device)
+        in_cache = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        parent = torch.arange(seq_len, device=device, dtype=torch.long)
+        count = torch.ones(seq_len, dtype=torch.long, device=device)
+
+        for i, pos in enumerate(pos_list):
+            total_available = pos + 1
+
+            acc[:total_available] += attn[pos, :total_available]
+            in_cache[pos] = True
+
+            cur_cache_size = int(in_cache[:total_available].sum().item())
+            if cur_cache_size > visible:
+                cache_idx = torch.nonzero(
+                    in_cache[:total_available], as_tuple=False
+                ).squeeze(-1)
+
+                recent_start = max(0, total_available - recent_budget)
+                hh_idx = cache_idx[cache_idx < recent_start]
+                if len(hh_idx) == 0:
+                    victim = int(cache_idx[0].item())
+                else:
+                    victim_local = torch.argmin(acc[hh_idx])
+                    victim = int(hh_idx[victim_local].item())
+
+                in_cache[victim] = False
+
+                kept_idx = torch.nonzero(
+                    in_cache[:total_available], as_tuple=False
+                ).squeeze(-1)
+                if len(kept_idx) == 0:
+                    raise RuntimeError(
+                        f"No kept token to assign for victim {victim} at position {pos}."
+                    )
+
+                if merge_metric == "k":
+                    sims = torch.matmul(k_head[kept_idx], k_head[victim])
+                else:
+                    sims = torch.matmul(v_head[kept_idx], v_head[victim])
+                y = int(kept_idx[torch.argmax(sims)].item())
+
+                parent[victim] = y
+                count[y] += count[victim]
+                count[victim] = 0
+
+            invisible_now = ~in_cache[:total_available]
+            mask[out_h, i, :total_available][invisible_now] = float("-inf")
+
+            belong[out_h, i, :total_available] = parent[:total_available]
+            count_mtx[out_h, i, :total_available] = count[:total_available]
+
+    t2 = time.time()
+    print(f"[h2o_with_belong_all] mask+belong build time: {t2 - t1:.4f}s")
+
+    for i, pos in enumerate(pos_list):
+        mask[:, i, pos + 1 :] = float("-inf")
+        belong[:, i, pos + 1 :] = -1
+
+    return mask, belong, count_mtx
+
+
 def gen_mask(
     ctx,
     layer_idx,

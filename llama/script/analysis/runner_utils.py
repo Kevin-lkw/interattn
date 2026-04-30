@@ -65,7 +65,7 @@ def create_base_runner_parser(
 
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--adaptive-budget", action="store_true")
-    parser.add_argument("--budgets", type=float, nargs="+", default=[0.01, 0.025, 0.05])
+    parser.add_argument("--budgets", type=float, nargs="+", default=[0.01, 0.025, 0.05, 0.1])
     parser.add_argument("--output-dir", type=str, default=None)
 
     return parser

@@ -1,5 +1,4 @@
 from pathlib import Path
-from sqlite3 import adapt
 
 import torch
 from torch.nn import functional as F
@@ -29,7 +28,7 @@ def run_multilayer_baseline_check(
 
     if out_path.exists():
         print(f"Found existing baseline comparison result at {out_path}, loading...")
-        summary = torch.load(out_path)
+        summary = torch.load(out_path, map_location="cpu", weights_only=False)
     else:
         summary = {
             "layers": target_layers,
@@ -96,6 +95,9 @@ def run_multilayer_baseline_check(
                     alpha=alpha_baseline,
                     device=ctx.device,
                 )
+                del baseline_artifacts, baseline_layer_ctx, mask, alpha_baseline
+                if torch.cuda.is_available() and str(ctx.device).startswith("cuda"):
+                    torch.cuda.empty_cache()
         except ValueError as exc:
             print(f"[WARN] Skip budget {budget}: {exc}")
             continue
@@ -110,6 +112,9 @@ def run_multilayer_baseline_check(
         baseline_metrics = compute_metrics(ref_tail_logits, baseline_tail_logits, labels)
 
         summary["budgets"][budget_key] = baseline_metrics
+        del baseline_layer_patch, baseline_tail_logits
+        if torch.cuda.is_available() and str(ctx.device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     torch.save(summary, out_path)
     print(f"Saved/updated multi-layer baseline comparison to: {out_path}")

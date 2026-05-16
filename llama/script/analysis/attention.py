@@ -64,7 +64,6 @@ def optimize_alpha_star(
     a_param = torch.nn.Parameter(
         torch.randn(len(head_idx), n_pos, seq_len, device=device) * 0.1
     )
-    a_param.retain_grad()
 
     opt = torch.optim.Adam([a_param], lr=lr)
 
@@ -143,7 +142,11 @@ def optimize_alpha_star(
         loss.backward()
         opt.step()
 
-    alpha = F.softmax(a_param + mask, dim=-1)
+    with torch.no_grad():
+        alpha = F.softmax(a_param + mask, dim=-1).detach()
+        if p_alpha is not None:
+            p_alpha = p_alpha.detach()
+
     return alpha, p_alpha, p_teacher, losses
 
 

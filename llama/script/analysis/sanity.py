@@ -62,16 +62,17 @@ def build_modified_attn_hidden(ctx, layer_idx, head_idx, pos_list, alpha, device
     if isinstance(head_idx, int):
         head_idx = [head_idx]
 
-    layer = ctx.model.model.layers[layer_idx]
-    original = ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(device)
-    V_head = ctx.rope_qkv[layer_idx]["v"].to(device)[0][head_idx]
+    with torch.no_grad():
+        layer = ctx.model.model.layers[layer_idx]
+        original = ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(device)
+        V_head = ctx.rope_qkv[layer_idx]["v"].to(device)[0][head_idx]
 
-    V_new = alpha.to(device) @ V_head.float()
-    output = original.clone()
-    output[head_idx] = V_new.to(V_head.dtype)
+        V_new = alpha.detach().to(device) @ V_head.float()
+        output = original.clone()
+        output[head_idx] = V_new.to(V_head.dtype)
 
-    attn_hidden = layer.self_attn.o_proj(output.permute(1, 0, 2).reshape(len(pos_list), -1))
-    return attn_hidden
+        attn_hidden = layer.self_attn.o_proj(output.permute(1, 0, 2).reshape(len(pos_list), -1))
+        return attn_hidden.detach()
 
 
 def get_tail_labels(ctx, pos_list, device):
@@ -132,4 +133,3 @@ def compute_final_kl_with_reinjected_alpha(ctx, layer_idx, pos_list, attn_hidden
 def has_full_sanity_metrics(entry):
     required_keys = ["sanity_kl", "teacher_nll", "student_nll", "nll_gap"]
     return all(key in entry for key in required_keys)
-

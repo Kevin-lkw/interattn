@@ -1,12 +1,12 @@
 import argparse
 import os
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from torch.nn import functional as F
 
 from .context import RunContext
-from .runner import normalize_budget_key
 
 
 def create_base_runner_parser(
@@ -50,7 +50,7 @@ def create_base_runner_parser(
         choices=["float32", "float16", "bfloat16"],
     )
 
-    parser.add_argument("--training-steps", type=int, default=1000)
+    parser.add_argument("--training-steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument(
         "--loss-type",
@@ -95,6 +95,7 @@ def finalize_runner_args(args):
 
 
 def set_seed(seed: int):
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -129,6 +130,13 @@ def resolve_output_dir(args, runner_name: str):
 
 def adaptive_budget_tag(adaptive_budget):
     return "adaptive" if adaptive_budget else "fixed"
+
+
+def normalize_budget_key(result_dict, target_budget, atol=1e-12):
+    for key in result_dict.keys():
+        if abs(float(key) - float(target_budget)) <= atol:
+            return key
+    return None
 
 
 def nll_to_ppl(nll):

@@ -6,24 +6,30 @@ This is the main runner for the online routing experiment. It includes:
 4. Running a one-shot multi-layer baseline comparison at the end.
 """
 
+import copy
 import os
-from sqlite3 import adapt
 import time
 
-from numpy import save
 import torch
-from datasets import load_dataset
-from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .attention import gen_mask, optimize_alpha_star
 from .baseline_eval import run_multilayer_baseline_check
-from .config import parse_args, set_seed, str_to_torch_dtype
 from .context import RunContext
 from .online_routing import (
     build_runtime_layer_ctx,
     capture_layer_artifacts,
     run_with_multilayer_patches,
+)
+from .runner_utils import (
+    build_context_with_new_start,
+    build_prompt,
+    create_base_runner_parser,
+    finalize_runner_args,
+    normalize_budget_key,
+    resolve_head_indices,
+    set_seed,
+    str_to_torch_dtype,
 )
 from .sanity import (
     build_modified_attn_hidden,
@@ -31,6 +37,33 @@ from .sanity import (
     move_model_inputs_to_device,
     compute_metrics,
 )
+
+
+def parse_args():
+    parser = create_base_runner_parser(
+        description=(
+            "Run online optimal routing and one-shot QK-routing baseline comparison."
+        ),
+        strategy_choices=["recency", "random", "attention_topk", "h2o", "kvmerger", "sink"],
+        default_strategy="h2o",
+        strategy_help="Mask generation strategy.",
+        eval_start_help=(
+            "Start index for the sample to optimize/evaluate. If not set, use --start. "
+            "The optimized alpha/patches are sample-specific, so --eval-start is fitted "
+            "and evaluated on that sample."
+        ),
+    )
+    parser.set_defaults(
+        training_steps=1000,
+        budgets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="llama-2-7b-hf",
+        help="Short model name kept for compatibility with older scripts.",
+    )
+    return finalize_runner_args(parser.parse_args())
 
 
 def load_context(args, dtype, device):
@@ -45,37 +78,7 @@ def load_context(args, dtype, device):
         use_fast=False,
     )
 
-    if args.dataset == "wikitext":
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        prompt = "\n".join([text for text in dataset["text"] if text.strip()])
-    elif args.dataset == "pg19":
-        dataset = load_dataset("emozilla/pg19-test", split="test")
-        prompt = "\n".join([text for text in dataset["text"] if text.strip()])
-    elif args.dataset == "oasst2":
-        dataset = load_dataset("OpenAssistant/oasst2", split="train")
-
-        texts = dataset["text"]
-        langs = dataset["lang"] if "lang" in dataset.column_names else None
-
-        if langs is None:
-            filtered_texts = [text for text in texts if isinstance(text, str) and text.strip()]
-        else:
-            filtered_texts = [
-                text
-                for text, lang in zip(texts, langs)
-                if isinstance(text, str)
-                and text.strip()
-                and (lang is None or str(lang).startswith("en"))
-            ]
-
-        if len(filtered_texts) == 0:
-            raise ValueError("No valid text found in OASST2 after filtering.")
-
-        prompt = "\n".join(filtered_texts)
-    else:
-        raise ValueError(
-            f"Unsupported dataset '{args.dataset}'. Supported now: wikitext, pg19, oasst2"
-        )
+    prompt = build_prompt(args.dataset)
 
     # Build one continuous context window and next-token labels directly from raw text.
     encoded = tokenizer(
@@ -143,19 +146,12 @@ def get_result_path(layer_idx, dataset, start, adaptive_budget, strategy, loss_t
     return f"../result/{dataset}_{start}/{adaptive_str}/{strategy}/{loss_type}/layer{layer_idx}/result.pt"
 
 
-def normalize_budget_key(result_dict, target_budget, atol=1e-12):
-    for key in result_dict.keys():
-        if abs(float(key) - float(target_budget)) <= atol:
-            return key
-    return None
-
-
 def load_or_init_layer_results(layer_idx_list, args):
     layer_results = {}
     for layer_idx in layer_idx_list:
         save_path = get_result_path(layer_idx, args.dataset, args.start, args.adaptive_budget, args.strategy, args.loss_type)
         if os.path.exists(save_path):
-            result = torch.load(save_path, weights_only=False)
+            result = torch.load(save_path, map_location="cpu", weights_only=False)
             print(
                 f"Loaded existing results for layer {layer_idx}. Existing budgets: {list(result.keys())}"
             )
@@ -165,6 +161,17 @@ def load_or_init_layer_results(layer_idx_list, args):
             print(f"No existing file found for layer {layer_idx}, starting a new one.")
         layer_results[layer_idx] = result
     return layer_results
+
+
+def load_or_init_final_metrics(args):
+    adaptive_str = "adaptive" if args.adaptive_budget else "fixed"
+    save_path = f"../result/{args.dataset}_{args.start}/{adaptive_str}/{args.strategy}/{args.loss_type}/layer_all/budget_to_final_metrics.pt"
+    if os.path.exists(save_path):
+        metrics = torch.load(save_path, map_location="cpu", weights_only=False)
+        if isinstance(metrics, dict):
+            print(f"Loaded existing final metrics. Existing budgets: {list(metrics.keys())}")
+            return metrics
+    return {}
 
 
 def save_results(layer_idx_list, layer_results, budget_to_final_metrics, args):
@@ -205,6 +212,8 @@ def run_budget_online(
         layer_result = layer_results[layer_idx]
         budget_key = normalize_budget_key(layer_result, budget)
         patch_hidden = None
+        mask = None
+        alpha = None
         if budget_key is not None:
             existing_entry = layer_result[budget_key]
             if (
@@ -227,7 +236,7 @@ def run_budget_online(
                 adaptive_budget=args.adaptive_budget,
             )
             print(f"Optimizing alpha_star for layer {layer_idx}, budget {budget}")
-            alpha, p_alpha, p_teacher, loss = optimize_alpha_star(
+            alpha, _p_alpha, _p_teacher, loss = optimize_alpha_star(
                 ctx=layer_ctx,
                 layer_idx=layer_idx,
                 head_idx=head_idx,
@@ -247,14 +256,22 @@ def run_budget_online(
                 alpha=alpha,
                 device=ctx.device,
             )
+            patch_hidden = patch_hidden.detach()
             layer_result[float(budget)] = {
-                "patch_hidden": patch_hidden.detach().cpu(),
+                "patch_hidden": patch_hidden.cpu(),
                 "loss": loss,
                 "loss_type": args.loss_type,
                 "optimized_online": True,
             }
 
         layer_to_patch[layer_idx] = patch_hidden
+        del artifacts, layer_ctx
+        if mask is not None:
+            del mask
+        if alpha is not None:
+            del alpha
+        if torch.cuda.is_available() and str(ctx.device).startswith("cuda"):
+            torch.cuda.empty_cache()
         t1 = time.time()
         print(f"Layer {layer_idx} done for budget {budget} in {t1 - t0:.2f} seconds.")
         print("estimated time for this budget: ", f"{(t1 - t0) * (len(layer_idx_list)) / 60:.2f} minutes")
@@ -264,15 +281,32 @@ def run_budget_online(
 def main():
     set_seed(42)
     args = parse_args()
+    if args.eval_start is None:
+        args.eval_start = args.start
     dtype = str_to_torch_dtype(args.dtype)
-    device = args.device
 
-    ctx = load_context(args, dtype=dtype, device=device)
+    base_ctx = load_context(args, dtype=dtype, device=args.device)
+    validate_args_with_cache(base_ctx, args)
+    base_ctx.model.eval()
 
-    validate_args_with_cache(ctx, args)
+    ctx = base_ctx
+    run_args = args
+    if args.eval_start != args.start:
+        ctx = build_context_with_new_start(
+            base_ctx=base_ctx,
+            dataset_name=args.dataset,
+            start=args.eval_start,
+            seq_len=args.seq_len,
+        )
+        validate_args_with_cache(ctx, args)
+        run_args = copy.copy(args)
+        run_args.start = args.eval_start
+        print(
+            "[runner] eval_start differs from start; fitting and evaluating "
+            "online optimal routing on the eval sample because patches are sample-specific."
+        )
 
-    n_heads = ctx.model_config.num_attention_heads
-    head_idx = list(range(n_heads))
+    head_idx = resolve_head_indices(ctx.model_config.num_attention_heads)
     pos_list = list(range(args.seq_len))
     layer_idx_list = resolve_layers(
         args.layers,
@@ -281,7 +315,6 @@ def main():
     )
 
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
-    ctx.model.eval()
 
     ref_tail_logits = None
     labels = None
@@ -291,14 +324,18 @@ def main():
     print("Reference logits computed for check routines.")
     labels = get_tail_labels(ctx, pos_list, ctx.device)
 
-    layer_results = load_or_init_layer_results(layer_idx_list, args)
-    budget_to_final_metrics = {}
+    layer_results = load_or_init_layer_results(layer_idx_list, run_args)
+    budget_to_final_metrics = load_or_init_final_metrics(run_args)
 
     for budget in args.budgets:
+        if normalize_budget_key(budget_to_final_metrics, budget) is not None:
+            print(f"[skip] budget={budget} already exists in final metrics, skip.")
+            continue
+
         print(f"\n[online optimize] budget={budget}")
         final_layer_patch = run_budget_online(
             ctx=ctx,
-            args=args,
+            args=run_args,
             budget=budget,
             layer_idx_list=layer_idx_list,
             head_idx=head_idx,
@@ -322,15 +359,22 @@ def main():
             f"student NLL={final_metrics['student_nll']:.6f}, "
             f"NLL gap={final_metrics['nll_gap']:.6f}"
         )
-    save_results(layer_idx_list, layer_results, budget_to_final_metrics, args)
+        save_results(layer_idx_list, layer_results, budget_to_final_metrics, run_args)
+        del final_layer_patch, student_tail_logits
+        if torch.cuda.is_available() and str(ctx.device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     print("Running one-shot multi-layer baseline comparison...")
     run_multilayer_baseline_check(
         ctx=ctx,
-        args=args,
+        args=run_args,
         target_layers=layer_idx_list,
         head_idx=head_idx,
         pos_list=pos_list,
         model_inputs=model_inputs,
         ref_tail_logits=ref_tail_logits,
     )
+
+
+if __name__ == "__main__":
+    main()

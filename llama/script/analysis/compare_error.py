@@ -185,17 +185,21 @@ def decompose_count_all_error(qk_logits, v_head, route_mask, belong_root, count,
     full_den = (approx_den + key_den_error).clamp_min(eps)
 
     count_all_v = approx_num / approx_den.unsqueeze(-1)
+    value_corrected_v = (approx_num + value_num_error) / full_den.unsqueeze(-1)
     key_corrected_v = (approx_num + key_num_error) / full_den.unsqueeze(-1)
     reconstructed_v = (approx_num + key_num_error + value_num_error) / full_den.unsqueeze(-1)
 
     key_term_v = key_num_error / full_den.unsqueeze(-1)
+    value_corrected_term_v = value_num_error / full_den.unsqueeze(-1)
     value_term_v = value_num_error / full_den.unsqueeze(-1)
 
     return {
         "count_all_v": count_all_v,
+        "value_corrected_v": value_corrected_v,
         "key_corrected_v": key_corrected_v,
         "reconstructed_v": reconstructed_v,
         "key_term_v": key_term_v,
+        "value_corrected_term_v": value_corrected_term_v,
         "value_term_v": value_term_v,
         "approx_num": approx_num,
         "key_num_error": key_num_error,
@@ -214,14 +218,29 @@ def norm_per_pos(x):
     return torch.norm(x.float(), p=2, dim=-1).mean(dim=0)
 
 
+def cosine_per_pos_from_v(v_new, v_gt, eps=1e-12):
+    v_new_f = v_new.float()
+    v_gt_f = v_gt.float()
+    dot = (v_new_f * v_gt_f).sum(dim=-1)
+    denom = torch.norm(v_new_f, p=2, dim=-1) * torch.norm(v_gt_f, p=2, dim=-1)
+    return (dot / denom.clamp_min(eps)).mean(dim=0)
+
+
 def save_error_decomposition_tsv(out_path, pos_list, metrics):
     names = [
         "count_all_v_l2",
+        "value_corrected_v_l2",
         "key_corrected_v_l2",
         "reconstructed_v_l2",
+        "count_all_gt_cos",
+        "value_corrected_gt_cos",
+        "key_corrected_gt_cos",
+        "reconstructed_gt_cos",
         "key_term_l2",
+        "value_corrected_term_l2",
         "value_term_l2",
         "key_delta_l2",
+        "value_corrected_delta_l2",
         "value_delta_l2",
         "den_rel_gap",
     ]
@@ -341,11 +360,18 @@ def main():
 
     metrics = {
         "count_all_v_l2": v_l2_per_pos_from_v(decomp["count_all_v"], v_gt),
+        "value_corrected_v_l2": v_l2_per_pos_from_v(decomp["value_corrected_v"], v_gt),
         "key_corrected_v_l2": v_l2_per_pos_from_v(decomp["key_corrected_v"], v_gt),
         "reconstructed_v_l2": v_l2_per_pos_from_v(decomp["reconstructed_v"], v_gt),
+        "count_all_gt_cos": cosine_per_pos_from_v(decomp["count_all_v"], v_gt),
+        "value_corrected_gt_cos": cosine_per_pos_from_v(decomp["value_corrected_v"], v_gt),
+        "key_corrected_gt_cos": cosine_per_pos_from_v(decomp["key_corrected_v"], v_gt),
+        "reconstructed_gt_cos": cosine_per_pos_from_v(decomp["reconstructed_v"], v_gt),
         "key_term_l2": norm_per_pos(decomp["key_term_v"]),
+        "value_corrected_term_l2": norm_per_pos(decomp["value_corrected_term_v"]),
         "value_term_l2": norm_per_pos(decomp["value_term_v"]),
         "key_delta_l2": norm_per_pos(decomp["key_corrected_v"] - decomp["count_all_v"]),
+        "value_corrected_delta_l2": norm_per_pos(decomp["value_corrected_v"] - decomp["count_all_v"]),
         "value_delta_l2": norm_per_pos(decomp["reconstructed_v"] - decomp["key_corrected_v"]),
         "den_rel_gap": (
             decomp["key_den_error"].abs() / decomp["full_den"].abs().clamp_min(1e-30)
@@ -360,13 +386,21 @@ def main():
     )
     print(
         f"mean count_all v_l2={float(metrics['count_all_v_l2'].mean().item()):.8e}, "
+        f"mean value_corrected v_l2={float(metrics['value_corrected_v_l2'].mean().item()):.8e}, "
         f"mean key_corrected v_l2={float(metrics['key_corrected_v_l2'].mean().item()):.8e}, "
         f"mean reconstructed v_l2={float(metrics['reconstructed_v_l2'].mean().item()):.8e}"
     )
     print(
         f"mean key_delta_l2={float(metrics['key_delta_l2'].mean().item()):.8e}, "
+        f"mean value_corrected_delta_l2={float(metrics['value_corrected_delta_l2'].mean().item()):.8e}, "
         f"mean value_delta_l2={float(metrics['value_delta_l2'].mean().item()):.8e}, "
         f"sanity max reconstructed-v_gt l2={float(recon_abs.max().item()):.8e}"
+    )
+    print(
+        f"mean count_all gt_cos={float(metrics['count_all_gt_cos'].mean().item()):.8e}, "
+        f"mean value_corrected gt_cos={float(metrics['value_corrected_gt_cos'].mean().item()):.8e}, "
+        f"mean key_corrected gt_cos={float(metrics['key_corrected_gt_cos'].mean().item()):.8e}, "
+        f"mean reconstructed gt_cos={float(metrics['reconstructed_gt_cos'].mean().item()):.8e}"
     )
 
     per_pos_path = os.path.join(output_dir, "per_pos_error_decomposition.tsv")
@@ -389,10 +423,10 @@ def main():
         out_path=term_plot,
         pos_list=pos_list,
         y1=metrics["key_delta_l2"],
-        y2=metrics["value_delta_l2"],
+        y2=metrics["value_corrected_delta_l2"],
         label1="key_delta_l2",
-        label2="value_delta_l2",
-        title="Per-Position Delta Norm: Key vs Value Error",
+        label2="value_corrected_delta_l2",
+        title="Per-Position Delta Norm: Key vs Value-Corrected Error",
         dpi=args.plot_dpi,
     )
 
@@ -406,11 +440,18 @@ def main():
         "pos_list": pos_list,
         "metric_name": "v_l2",
         "mean_count_all_v_l2": float(metrics["count_all_v_l2"].mean().item()),
+        "mean_value_corrected_v_l2": float(metrics["value_corrected_v_l2"].mean().item()),
         "mean_key_corrected_v_l2": float(metrics["key_corrected_v_l2"].mean().item()),
         "mean_reconstructed_v_l2": float(metrics["reconstructed_v_l2"].mean().item()),
+        "mean_count_all_gt_cos": float(metrics["count_all_gt_cos"].mean().item()),
+        "mean_value_corrected_gt_cos": float(metrics["value_corrected_gt_cos"].mean().item()),
+        "mean_key_corrected_gt_cos": float(metrics["key_corrected_gt_cos"].mean().item()),
+        "mean_reconstructed_gt_cos": float(metrics["reconstructed_gt_cos"].mean().item()),
         "mean_key_delta_l2": float(metrics["key_delta_l2"].mean().item()),
+        "mean_value_corrected_delta_l2": float(metrics["value_corrected_delta_l2"].mean().item()),
         "mean_value_delta_l2": float(metrics["value_delta_l2"].mean().item()),
         "mean_key_term_l2": float(metrics["key_term_l2"].mean().item()),
+        "mean_value_corrected_term_l2": float(metrics["value_corrected_term_l2"].mean().item()),
         "mean_value_term_l2": float(metrics["value_term_l2"].mean().item()),
         "mean_den_rel_gap": float(metrics["den_rel_gap"].mean().item()),
         "sanity_mean_reconstructed_v_gt_l2": float(recon_abs.mean().item()),

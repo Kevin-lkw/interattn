@@ -78,7 +78,7 @@ def _build_error_corrected_patches(
     model_inputs,
     correction_name,
 ):
-    if correction_name not in {"count_all", "key", "value"}:
+    if correction_name not in {"count_all", "key", "value", "kv"}:
         raise ValueError(f"Unsupported correction_name={correction_name}")
 
     patches = {}
@@ -137,8 +137,10 @@ def _build_error_corrected_patches(
             v_new = decomp["count_all_v"]
         elif correction_name == "key":
             v_new = decomp["key_corrected_v"]
-        else:
+        elif correction_name == "value":
             v_new = decomp["value_corrected_v"]
+        else:
+            v_new = decomp["reconstructed_v"]
 
         patches[layer_idx] = build_modified_attn_hidden_from_vnew(
             ctx=layer_ctx,

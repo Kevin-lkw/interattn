@@ -1,12 +1,13 @@
 """
-Scan signed q dot delta K scores for clusters fixed at one reference query.
+Scan q dot K scores for clusters fixed at one reference query.
 
 For a reference query position, choose several routing clusters.  For each
 query position in a scan range, measure
 
-    q_delta_k_i = q dot (K_i - avg_{j in C} K_j) / sqrt(d)
+    qk_i = q dot K_i / sqrt(d)
 
-over the fixed cluster members C.
+over the fixed cluster members C.  The central line in each plot is
+q_avg_k = mean_{i in C}(q dot K_i / sqrt(d)).
 """
 
 import argparse
@@ -36,7 +37,7 @@ from .sanity import move_model_inputs_to_device
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Scan q_delta_k scores for clusters fixed at one reference position."
+        description="Scan qk scores for clusters fixed at one reference position."
     )
     add_common_compare_args(
         parser,
@@ -112,7 +113,7 @@ def _stats(vals):
             "min": float("nan"),
             "p00": float("nan"),
             "p10": float("nan"),
-            "median": float("nan"),
+            "q_avg_k": float("nan"),
             "p90": float("nan"),
             "p100": float("nan"),
             "max": float("nan"),
@@ -124,7 +125,7 @@ def _stats(vals):
         "min": vmin,
         "p00": _percentile(vals, 0.0),
         "p10": _percentile(vals, 0.10),
-        "median": float(vals.median().item()),
+        "q_avg_k": float(vals.mean().item()),
         "p90": _percentile(vals, 0.90),
         "p100": _percentile(vals, 1.0),
         "max": vmax,
@@ -170,7 +171,7 @@ def _choose_evenly(xs, n):
 
 
 def _save_scan_tsv(out_path, rows):
-    stat_names = ["rep", "std", "min", "p00", "p10", "median", "p90", "p100", "max"]
+    stat_names = ["rep", "std", "min", "p00", "p10", "q_avg_k", "p90", "p100", "max"]
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(
             "head\tcluster_pos\tquery_pos\tcluster_rank\troot\tsize\t"
@@ -202,12 +203,12 @@ def _tsv_escape(text):
     return str(text).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
 
 
-def _save_qdelta_argmax_tsv(out_path, rows):
+def _save_qk_argmax_tsv(out_path, rows):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(
             "head\tcluster_pos\tquery_pos\tcluster_rank\troot\tsize\t"
             "argmax_member_index\targmax_pos\targmax_token_id\targmax_token\t"
-            "argmax_q_delta_k\tis_root\n"
+            "argmax_qk\tis_root\n"
         )
         for row in rows:
             f.write(
@@ -215,11 +216,11 @@ def _save_qdelta_argmax_tsv(out_path, rows):
                 f"{row['cluster_rank']}\t{row['root']}\t{row['size']}\t"
                 f"{row['argmax_member_index']}\t{row['argmax_pos']}\t"
                 f"{row['argmax_token_id']}\t{_tsv_escape(row['argmax_token'])}\t"
-                f"{row['argmax_q_delta_k']:.6f}\t{int(row['is_root'])}\n"
+                f"{row['argmax_qk']:.6f}\t{int(row['is_root'])}\n"
             )
 
 
-def _save_qdelta_argmax_summary_tsv(out_path, rows):
+def _save_qk_argmax_summary_tsv(out_path, rows):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(
             "head\tcluster_pos\tcluster_rank\troot\tsize\tqueries\t"
@@ -247,13 +248,13 @@ def _count_mode(xs):
     return mode_pos, mode_count
 
 
-def _plot_qdelta_argmax(out_path, cluster_scans, title, dpi):
+def _plot_qk_argmax(out_path, cluster_scans, title, dpi):
     if len(cluster_scans) == 0:
         fig, ax = plt.subplots(1, 1, figsize=(8.2, 3.2), constrained_layout=True)
         ax.text(
             0.5,
             0.5,
-            "No q_delta_k argmax entries",
+            "No qk argmax entries",
             ha="center",
             va="center",
             transform=ax.transAxes,
@@ -330,11 +331,11 @@ def _plot_cluster_scan(out_path, cluster_scans, title, dpi):
         p10 = scan["p10"]
         p90 = scan["p90"]
         p100 = scan["p100"]
-        median = scan["median"]
+        q_avg_k = scan["q_avg_k"]
         rep = scan["rep"]
         ax.fill_between(x, p00, p100, color="#93c5fd", alpha=0.22, label="p0-p100")
         ax.fill_between(x, p10, p90, color="#60a5fa", alpha=0.42, label="p10-p90")
-        ax.plot(x, median, color="#2563eb", linewidth=1.4, label="median")
+        ax.plot(x, q_avg_k, color="#2563eb", linewidth=1.4, label="q avg K")
         ax.plot(x, rep, color="#111827", linewidth=1.1, linestyle="--", label="rep")
         ax.axhline(0.0, color="#6b7280", linewidth=0.8, alpha=0.7)
         ax.set_title(
@@ -342,7 +343,7 @@ def _plot_cluster_scan(out_path, cluster_scans, title, dpi):
             f"root{scan['root']} size={scan['size']}"
         )
         ax.set_xlabel("query position")
-        ax.set_ylabel("q delta K")
+        ax.set_ylabel("qk")
         ax.grid(alpha=0.2)
         ax.legend(fontsize=8)
 
@@ -352,7 +353,7 @@ def _plot_cluster_scan(out_path, cluster_scans, title, dpi):
     return True
 
 
-def collect_fixed_cluster_qscan(
+def collect_fixed_cluster_qk_scan(
     *,
     out_dir,
     qk_logits,
@@ -404,15 +405,15 @@ def collect_fixed_cluster_qscan(
         for cluster_rank, (root, members) in enumerate(clusters):
             qk_cluster = qk_logits[head_ord, query_i][:, members].float()
             qk_mean = qk_cluster.mean(dim=1, keepdim=True)
-            q_delta_k = qk_cluster - qk_mean
+            qk = qk_cluster
             rep_idx = (members == root).nonzero(as_tuple=False).squeeze(-1)
             if rep_idx.numel() != 1:
                 raise ValueError(f"root {root} is not a unique member for head={head}")
-            rep = q_delta_k[:, int(rep_idx.item())]
+            rep = qk[:, int(rep_idx.item())]
 
             p10 = []
             p90 = []
-            median = []
+            q_avg_k = []
             std = []
             p00 = []
             p100 = []
@@ -425,7 +426,7 @@ def collect_fixed_cluster_qscan(
             argmax_values = []
             argmax_is_root = []
             for row_idx, pos in enumerate(query_positions):
-                vals = q_delta_k[row_idx]
+                vals = qk[row_idx]
                 s = _stats(vals)
                 s["rep"] = float(rep[row_idx].item())
                 argmax_member_idx = int(vals.argmax().item())
@@ -459,7 +460,7 @@ def collect_fixed_cluster_qscan(
                         "argmax_pos": argmax_pos,
                         "argmax_token_id": argmax_token_id,
                         "argmax_token": argmax_token,
-                        "argmax_q_delta_k": argmax_value,
+                        "argmax_qk": argmax_value,
                         "is_root": is_root,
                     }
                 )
@@ -467,7 +468,7 @@ def collect_fixed_cluster_qscan(
                 p10.append(s["p10"])
                 p90.append(s["p90"])
                 p100.append(s["p100"])
-                median.append(s["median"])
+                q_avg_k.append(float(qk_mean[row_idx, 0].item()))
                 std.append(s["std"])
                 min_vals.append(s["min"])
                 max_vals.append(s["max"])
@@ -514,7 +515,7 @@ def collect_fixed_cluster_qscan(
                 "min": min_vals,
                 "p00": p00,
                 "p10": p10,
-                "median": median,
+                "q_avg_k": q_avg_k,
                 "p90": p90,
                 "p100": p100,
                 "max": max_vals,
@@ -537,20 +538,21 @@ def collect_fixed_cluster_qscan(
                     "root": int(root),
                     "members": members.detach().cpu(),
                     "query_positions": torch.tensor(query_positions, dtype=torch.long),
-                    "q_delta_k": q_delta_k.detach().cpu(),
+                    "qk": qk.detach().cpu(),
+                    "q_avg_k": qk_mean.squeeze(-1).detach().cpu(),
                     "rep": rep.detach().cpu(),
                     "argmax_member_indices": torch.tensor(argmax_member_indices, dtype=torch.long),
                     "argmax_positions": torch.tensor(argmax_positions, dtype=torch.long),
                 }
             )
 
-    stats_path = os.path.join(out_dir, "fixed_cluster_qscan_stats.tsv")
+    stats_path = os.path.join(out_dir, "fixed_cluster_qk_scan_stats.tsv")
     _save_scan_tsv(stats_path, rows)
 
     plot_paths = {}
     for head in head_labels:
         head_scans = [scan for scan in cluster_scans if scan["head"] == int(head)]
-        head_plot_path = os.path.join(out_dir, f"fixed_cluster_qscan_head{int(head)}.png")
+        head_plot_path = os.path.join(out_dir, f"fixed_cluster_qk_scan_head{int(head)}.png")
         _plot_cluster_scan(
             head_plot_path,
             head_scans,
@@ -562,30 +564,30 @@ def collect_fixed_cluster_qscan(
         )
         plot_paths[int(head)] = head_plot_path
 
-    argmax_path = os.path.join(out_dir, "fixed_cluster_qdelta_argmax.tsv")
-    _save_qdelta_argmax_tsv(argmax_path, argmax_rows)
+    argmax_path = os.path.join(out_dir, "fixed_cluster_qk_argmax.tsv")
+    _save_qk_argmax_tsv(argmax_path, argmax_rows)
 
-    argmax_summary_path = os.path.join(out_dir, "fixed_cluster_qdelta_argmax_summary.tsv")
-    _save_qdelta_argmax_summary_tsv(argmax_summary_path, argmax_summary_rows)
+    argmax_summary_path = os.path.join(out_dir, "fixed_cluster_qk_argmax_summary.tsv")
+    _save_qk_argmax_summary_tsv(argmax_summary_path, argmax_summary_rows)
 
     argmax_plot_paths = {}
     for head in head_labels:
         head_scans = [scan for scan in cluster_scans if scan["head"] == int(head)]
         head_argmax_plot_path = os.path.join(
-            out_dir, f"fixed_cluster_qdelta_argmax_head{int(head)}.png"
+            out_dir, f"fixed_cluster_qk_argmax_head{int(head)}.png"
         )
-        _plot_qdelta_argmax(
+        _plot_qk_argmax(
             head_argmax_plot_path,
             head_scans,
             title=(
-                f"Head {int(head)} argmax q_delta_k token in fixed clusters from q={args.cluster_pos}; "
+                f"Head {int(head)} argmax qk token in fixed clusters from q={args.cluster_pos}; "
                 f"scan q={args.query_start}..{args.query_end - 1}"
             ),
             dpi=args.plot_dpi,
         )
         argmax_plot_paths[int(head)] = head_argmax_plot_path
 
-    tensor_path = os.path.join(out_dir, "fixed_cluster_qscan_samples.pt")
+    tensor_path = os.path.join(out_dir, "fixed_cluster_qk_scan_samples.pt")
     torch.save(
         {
             "head_labels": head_labels,
@@ -597,14 +599,14 @@ def collect_fixed_cluster_qscan(
         tensor_path,
     )
 
-    print("===== Fixed cluster q_delta_k scan =====")
+    print("===== Fixed cluster qk scan =====")
     print(f"cluster_pos={args.cluster_pos} query_range=[{args.query_start}, {args.query_end})")
     print(f"heads={head_labels} clusters={len(tensor_scans)} rows={len(rows)}")
     print(f"Saved stats to: {stats_path}")
-    print(f"Saved qscan plots to: {list(plot_paths.values())}")
-    print(f"Saved q_delta_k argmax tokens to: {argmax_path}")
-    print(f"Saved q_delta_k argmax summary to: {argmax_summary_path}")
-    print(f"Saved q_delta_k argmax plots to: {list(argmax_plot_paths.values())}")
+    print(f"Saved qk scan plots to: {list(plot_paths.values())}")
+    print(f"Saved qk argmax tokens to: {argmax_path}")
+    print(f"Saved qk argmax summary to: {argmax_summary_path}")
+    print(f"Saved qk argmax plots to: {list(argmax_plot_paths.values())}")
     print(f"Saved samples to: {tensor_path}")
 
     return {
@@ -622,7 +624,7 @@ def _build_routing_pos_list(args):
     if args.pos_start > args.cluster_pos:
         raise ValueError("--pos-start must be <= --cluster-pos for normal cache construction")
     if pos_end < args.query_end:
-        raise ValueError("--pos-end must be >= --query-end for qscan output positions")
+        raise ValueError("--pos-end must be >= --query-end for qk scan output positions")
 
     pos_list = list(range(args.pos_start, pos_end))
     if len(pos_list) == 0:
@@ -657,13 +659,13 @@ def main():
     routing_pos_list = _build_routing_pos_list(args)
     print(
         f"Build routing clusters with pos_list=[{routing_pos_list[0]}, {routing_pos_list[-1]}] "
-        f"({len(routing_pos_list)} positions); output qscan=[{args.query_start}, {args.query_end})"
+        f"({len(routing_pos_list)} positions); output qk scan=[{args.query_start}, {args.query_end})"
     )
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
     output_dir = resolve_output_dir(
         args=args,
         head_idx=head_idx,
-        compare_tag="compare_error_fixed_cluster_qscan",
+        compare_tag="compare_error_fixed_cluster_qk_scan",
         include_loss_type=True,
     )
 
@@ -724,7 +726,7 @@ def main():
         device=ctx.device,
     )
 
-    result = collect_fixed_cluster_qscan(
+    result = collect_fixed_cluster_qk_scan(
         out_dir=output_dir,
         qk_logits=qk_logits,
         route_mask=route_mask,
@@ -736,7 +738,7 @@ def main():
         args=args,
     )
 
-    summary_path = os.path.join(output_dir, "compare_error_fixed_cluster_qscan_summary.pt")
+    summary_path = os.path.join(output_dir, "compare_error_fixed_cluster_qk_scan_summary.pt")
     torch.save(
         {
             "config": vars(args),

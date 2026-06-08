@@ -5,14 +5,15 @@ For each selected query q and each cluster C at that query:
 
     s_C     = q dot mean(K_C) / sqrt(d)
     Z_C     = |C| exp(s_C)
-    p_C     = Z_C / sum_C' Z_C'
+    p_C     = Z_C / sum_C' Z_C'  (mean-K approximation)
+    p_full_C= sum_i in C exp(q dot K_i / sqrt(d)) / full softmax denominator
     delta_C = max_i in C |q dot (K_i - mean(K_C)) / sqrt(d)|
     B_C     = max_i in C ||V_i||
 
-The plotted condition term uses p_C as p_hat_C:
+The plotted condition term uses p_C as p_hat_C and reports the bound contribution:
 
-    p_C * ((cosh(delta_C) - 1) / sum_C' p_C' cosh(delta_C')
-           + tanh(delta_C / 2))
+    p_C * (2B * (cosh(delta_C) - 1) / sum_C' p_C' cosh(delta_C')
+           + 2B_C * tanh(delta_C / 2))
 """
 
 import argparse
@@ -100,8 +101,8 @@ def parse_args():
     )
     parser.add_argument(
         "--cluster-order",
-        choices=["p_desc", "size_desc", "root"],
-        default="p_desc",
+        choices=["p_desc", "p_full_desc", "size_desc", "root"],
+        default="root",
         help="Order clusters on the x-axis and in the saved/printed table.",
     )
     parser.add_argument(
@@ -153,6 +154,8 @@ def _iter_clusters(row_root, total_available):
 def _order_rows(rows, order):
     if order == "p_desc":
         return sorted(rows, key=lambda row: (-row["p"], row["root"]))
+    if order == "p_full_desc":
+        return sorted(rows, key=lambda row: (-row["p_full"], row["root"]))
     if order == "size_desc":
         return sorted(rows, key=lambda row: (-row["size"], row["root"]))
     return sorted(rows, key=lambda row: row["root"])
@@ -168,6 +171,7 @@ def _cluster_condition_rows_and_sanity(
     scale = math.sqrt(q.numel())
     raw_rows = []
     s_vals = []
+    full_logz_vals = []
     sizes = []
     v_bars = []
 
@@ -176,9 +180,10 @@ def _cluster_condition_rows_and_sanity(
         v_cluster = v_head[members].float()
         k_bar = k_cluster.mean(dim=0)
         v_bar = v_cluster.mean(dim=0)
-        centered_scores = torch.mv(k_cluster - k_bar.unsqueeze(0), q.float()) / scale
-        delta = centered_scores.abs().max()
+        qk_cluster = torch.mv(k_cluster, q.float()) / scale
         s_c = torch.dot(q.float(), k_bar.float()) / scale
+        centered_scores = qk_cluster - s_c
+        delta = centered_scores.abs().max()
         b_c = torch.norm(v_cluster, p=2, dim=-1).max()
         raw_rows.append(
             {
@@ -194,6 +199,7 @@ def _cluster_condition_rows_and_sanity(
             }
         )
         s_vals.append(s_c)
+        full_logz_vals.append(torch.logsumexp(qk_cluster, dim=0))
         sizes.append(float(members.numel()))
         v_bars.append(v_bar)
 
@@ -201,13 +207,14 @@ def _cluster_condition_rows_and_sanity(
     size_tensor = torch.tensor(sizes, device=s_tensor.device, dtype=torch.float32)
     z_logits = torch.log(size_tensor) + s_tensor
     p_tensor = torch.softmax(z_logits, dim=0)
+    p_full_tensor = torch.softmax(torch.stack(full_logz_vals).float(), dim=0)
     delta_tensor = torch.tensor(
         [row["delta"] for row in raw_rows], device=s_tensor.device, dtype=torch.float32
     )
-    denom = (p_tensor * torch.cosh(delta_tensor)).sum().clamp_min(1e-30)
-    condition_tensor = p_tensor * (
-        (torch.cosh(delta_tensor) - 1.0) / denom + torch.tanh(delta_tensor / 2.0)
+    b_c_tensor = torch.tensor(
+        [row["B"] for row in raw_rows], device=s_tensor.device, dtype=torch.float32
     )
+    denom = (p_tensor * torch.cosh(delta_tensor)).sum().clamp_min(1e-30)
     v_bar_tensor = torch.stack(v_bars).float()
     approx_output = (p_tensor.unsqueeze(-1) * v_bar_tensor).sum(dim=0)
 
@@ -218,9 +225,12 @@ def _cluster_condition_rows_and_sanity(
     full_output = (full_alpha.unsqueeze(-1) * visible_v).sum(dim=0)
 
     output_l2 = torch.norm(full_output - approx_output, p=2)
-    condition_sum = condition_tensor.sum()
     b_all = torch.norm(visible_v, p=2, dim=-1).max()
-    condition_bound = 2.0 * b_all * condition_sum
+    condition_tensor = p_tensor * (
+        2.0 * b_all * (torch.cosh(delta_tensor) - 1.0) / denom
+        + 2.0 * b_c_tensor * torch.tanh(delta_tensor / 2.0)
+    )
+    condition_sum = condition_tensor.sum()
     output_l2_over_2b = output_l2 / (2.0 * b_all).clamp_min(1e-30)
 
     rows = []
@@ -228,6 +238,7 @@ def _cluster_condition_rows_and_sanity(
         row = dict(row)
         row["Z"] = float(torch.exp(z_logits[cluster_rank]).item())
         row["p"] = float(p_tensor[cluster_rank].item())
+        row["p_full"] = float(p_full_tensor[cluster_rank].item())
         row["condition"] = float(condition_tensor[cluster_rank].item())
         rows.append(row)
 
@@ -242,13 +253,9 @@ def _cluster_condition_rows_and_sanity(
         "condition_sum": float(condition_sum.item()),
         "B": float(b_all.item()),
         "output_l2_over_2B": float(output_l2_over_2b.item()),
-        "condition_sum_lt_output_l2_over_2B": bool(
-            condition_sum.item() < output_l2_over_2b.item()
-        ),
-        "two_B_condition_sum": float(condition_bound.item()),
-        "two_B_condition_sum_lt_output_l2": bool(condition_bound.item() < output_l2.item()),
-        "output_l2_over_two_B_condition_sum": float(
-            output_l2.item() / max(condition_bound.item(), 1e-30)
+        "output_l2_le_condition_sum": bool(output_l2.item() <= condition_sum.item()),
+        "output_l2_over_condition_sum": float(
+            output_l2.item() / max(condition_sum.item(), 1e-30)
         ),
     }
     return ordered, sanity
@@ -266,6 +273,7 @@ def _save_condition_tsv(out_path, rows):
         "s",
         "Z",
         "p",
+        "p_full",
         "delta",
         "B",
         "condition",
@@ -312,10 +320,8 @@ def _save_sanity_tsv(out_path, rows):
         "condition_sum",
         "B",
         "output_l2_over_2B",
-        "condition_sum_lt_output_l2_over_2B",
-        "two_B_condition_sum",
-        "two_B_condition_sum_lt_output_l2",
-        "output_l2_over_two_B_condition_sum",
+        "output_l2_le_condition_sum",
+        "output_l2_over_condition_sum",
     ]
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\t".join(columns) + "\n")
@@ -339,26 +345,28 @@ def _print_sanity_summary(rows):
         print("No sanity rows.")
         return
     output_l2 = torch.tensor([row["output_l2"] for row in rows], dtype=torch.float32)
-    bound = torch.tensor([row["two_B_condition_sum"] for row in rows], dtype=torch.float32)
-    passed = sum(int(row["two_B_condition_sum_lt_output_l2"]) for row in rows)
+    bound = torch.tensor([row["condition_sum"] for row in rows], dtype=torch.float32)
+    passed = sum(int(row["output_l2_le_condition_sum"]) for row in rows)
     print("===== Condition sanity =====")
     print(
-        f"two_B_condition_sum < output_l2: {passed}/{len(rows)} "
+        f"output_l2 <= condition_sum: {passed}/{len(rows)} "
         f"({passed / len(rows):.1%})"
     )
     print(
         f"mean output_l2={float(output_l2.mean().item()):.3g}, "
-        f"mean two_B_condition_sum={float(bound.mean().item()):.3g}, "
+        f"mean condition_sum={float(bound.mean().item()):.3g}, "
         f"max output_l2={float(output_l2.max().item()):.3g}, "
-        f"max two_B_condition_sum={float(bound.max().item()):.3g}"
+        f"max condition_sum={float(bound.max().item()):.3g}"
     )
 
 
 def _plot_head_conditions(out_path, query_rows, head, query_positions, title, dpi):
     metric_specs = [
         ("p", "P_C", "#2563eb"),
+        ("p_full", "P_full_C", "#0891b2"),
         ("condition", "condition", "#059669"),
         ("delta", "delta_C", "#dc2626"),
+        ("B", "B_C", "#ea580c"),
         ("size", "cluster size", "#7c3aed"),
     ]
     nrows = max(1, len(query_positions))
@@ -388,6 +396,51 @@ def _plot_head_conditions(out_path, query_rows, head, query_positions, title, dp
             ax.set_xlabel("cluster")
             ax.set_ylabel(label)
             ax.grid(alpha=0.22)
+
+    fig.suptitle(title)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _plot_sanity_curve(out_path, sanity_rows, head_labels, query_positions, title, dpi):
+    rows_by_head = {int(head): {} for head in head_labels}
+    for row in sanity_rows:
+        rows_by_head[int(row["head"])][int(row["query_pos"])] = row
+
+    nrows = max(1, len(head_labels))
+    fig, axes = plt.subplots(
+        nrows,
+        1,
+        figsize=(8.2, 2.7 * nrows),
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    for row_idx, head in enumerate(head_labels):
+        ax = axes[row_idx, 0]
+        head_rows = rows_by_head.get(int(head), {})
+        x = [int(pos) for pos in query_positions if int(pos) in head_rows]
+        if len(x) == 0:
+            ax.text(0.5, 0.5, "No sanity rows", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+
+        output_l2 = [head_rows[pos]["output_l2"] for pos in x]
+        bound = [head_rows[pos]["condition_sum"] for pos in x]
+        ax.plot(x, output_l2, marker="o", linewidth=1.2, label="|o1-o2|", color="#dc2626")
+        ax.plot(
+            x,
+            bound,
+            marker="o",
+            linewidth=1.2,
+            label="condition",
+            color="#2563eb",
+        )
+        ax.set_title(f"h{int(head)} sanity bound")
+        ax.set_xlabel("query")
+        ax.set_ylabel("L2")
+        ax.grid(alpha=0.22)
+        ax.legend()
 
     fig.suptitle(title)
     fig.savefig(out_path, dpi=dpi)
@@ -453,6 +506,16 @@ def collect_condition_stats(
     _save_sanity_tsv(sanity_path, sanity_rows)
     _print_sanity_summary(sanity_rows)
 
+    sanity_curve_path = os.path.join(out_dir, "condition_sanity_curve.png")
+    _plot_sanity_curve(
+        out_path=sanity_curve_path,
+        sanity_rows=sanity_rows,
+        head_labels=head_labels,
+        query_positions=query_positions,
+        title=f"Layer {args.layer} condition sanity; budget={args.budget:g}",
+        dpi=args.plot_dpi,
+    )
+
     plot_paths = {}
     for head in head_labels:
         plot_path = os.path.join(out_dir, f"condition_head{int(head)}.png")
@@ -478,6 +541,7 @@ def collect_condition_stats(
             "query_positions": [int(x) for x in query_positions],
             "rows": tensor_rows,
             "sanity_rows": sanity_rows,
+            "sanity_curve_path": sanity_curve_path,
         },
         tensor_path,
     )
@@ -489,12 +553,14 @@ def collect_condition_stats(
     )
     print(f"Saved condition table to: {table_path}")
     print(f"Saved condition sanity to: {sanity_path}")
+    print(f"Saved condition sanity curve to: {sanity_curve_path}")
     print(f"Saved condition plots to: {list(plot_paths.values())}")
     print(f"Saved condition tensors to: {tensor_path}")
 
     return {
         "table_path": table_path,
         "sanity_path": sanity_path,
+        "sanity_curve_path": sanity_curve_path,
         "plot_paths": plot_paths,
         "tensor_path": tensor_path,
     }

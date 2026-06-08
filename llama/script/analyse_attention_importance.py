@@ -33,7 +33,15 @@ def parse_args():
         default="float32",
         choices=["float32", "float16", "bfloat16"],
     )
-    parser.add_argument("--layer", type=int, required=True)
+    layer_group = parser.add_mutually_exclusive_group(required=True)
+    layer_group.add_argument("--layer", type=int, default=None)
+    layer_group.add_argument(
+        "--layers",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Layer indices to process in one model load.",
+    )
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--heads", type=int, nargs="+", default=None)
     parser.add_argument("--pos-start", type=int, default=0)
@@ -51,6 +59,12 @@ def parse_args():
         default=0.95,
         help="Mass level highlighted in key-hit plots.",
     )
+    parser.add_argument(
+        "--summary-mass-level",
+        type=float,
+        default=0.90,
+        help="Mass level used for the printed important-key mean table.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--plot-dpi", type=int, default=180)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -58,8 +72,10 @@ def parse_args():
 
 
 def validate_args(args, num_layers, num_heads, seq_len):
-    if args.layer < 0 or args.layer >= num_layers:
-        raise ValueError(f"Invalid --layer {args.layer}; expected [0, {num_layers - 1}]")
+    layers = args.layers if args.layers is not None else [args.layer]
+    bad_layers = [layer for layer in layers if layer < 0 or layer >= num_layers]
+    if bad_layers:
+        raise ValueError(f"Invalid layers {bad_layers}; expected [0, {num_layers - 1}]")
     if args.num_heads <= 0:
         raise ValueError("--num-heads must be > 0")
     if args.pos_start < 0 or args.pos_start >= seq_len:
@@ -85,21 +101,31 @@ def validate_args(args, num_layers, num_heads, seq_len):
     if primary not in mass_levels:
         mass_levels.append(primary)
         mass_levels = sorted(mass_levels)
+    summary_level = float(args.summary_mass_level)
+    if summary_level <= 0.0 or summary_level > 1.0:
+        raise ValueError(f"Invalid summary mass level {summary_level}; expected (0, 1]")
+    if summary_level not in mass_levels:
+        mass_levels.append(summary_level)
+        mass_levels = sorted(mass_levels)
     return pos_end, mass_levels, primary
 
 
-def sample_or_use_explicit(explicit, candidates, n, rng):
+def sample_or_use_explicit(explicit, candidates, n, rng, use_all=False):
     if explicit is not None and len(explicit) > 0:
         return sorted(set(int(x) for x in explicit))
+    if use_all:
+        return list(candidates)
     n = min(n, len(candidates))
     return sorted(rng.sample(candidates, n))
 
 
-def resolve_output_dir(args):
+def resolve_output_dir(args, layer):
     if args.output_dir is not None:
         output_dir = args.output_dir
+        if args.layers is not None:
+            output_dir = os.path.join(output_dir, f"layer{layer}")
     else:
-        output_dir = f"../result/{args.dataset}_{args.start}/analyse_attention_importance/layer{args.layer}"
+        output_dir = f"../result/{args.dataset}_{args.start}/analyse_attention_importance/layer{layer}"
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -319,46 +345,21 @@ def plot_key_hits(out_path, heads, primary_level, hit_count, visible_per_key, dp
     plt.close(fig)
 
 
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-    rng = random.Random(args.seed)
-    dtype = str_to_torch_dtype(args.dtype)
-
+def analyze_layer(args, ctx, layer, heads, pos_list, mass_levels, primary, model_inputs):
     from analysis.online_routing import capture_layer_artifacts
-    from analysis.runner import load_context
-    from analysis.sanity import move_model_inputs_to_device
 
-    ctx = load_context(args, dtype=dtype, device=args.device)
-    ctx.model.eval()
-
-    input_seq_len = ctx.inputs["input_ids"].shape[1]
-    pos_end, mass_levels, primary = validate_args(
-        args=args,
-        num_layers=ctx.model_config.num_hidden_layers,
-        num_heads=ctx.model_config.num_attention_heads,
-        seq_len=input_seq_len,
-    )
     primary_idx = mass_levels.index(primary)
+    input_seq_len = ctx.inputs["input_ids"].shape[1]
 
-    heads = sample_or_use_explicit(
-        args.heads,
-        list(range(ctx.model_config.num_attention_heads)),
-        args.num_heads,
-        rng,
-    )
-    pos_list = list(range(args.pos_start, pos_end))
-
-    print(f"Selected layer: {args.layer}")
+    print(f"Selected layer: {layer}")
     print(f"Selected heads: {heads}")
     print(f"Query positions: [{pos_list[0]}, {pos_list[-1]}], n={len(pos_list)}")
     print(f"Mass levels: {mass_levels}")
     print("Running one forward pass to capture Q/K from checkpoint + dataset...")
 
-    model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
     artifacts = capture_layer_artifacts(
         ctx=ctx,
-        layer_idx=args.layer,
+        layer_idx=layer,
         pos_list=pos_list,
         model_inputs=model_inputs,
     )
@@ -387,7 +388,7 @@ def main():
         mass_levels=mass_levels,
     )
 
-    output_dir = resolve_output_dir(args)
+    output_dir = resolve_output_dir(args, layer)
     query_path = os.path.join(output_dir, "query_required_k.tsv")
     key_path = os.path.join(output_dir, "key_importance_hits.tsv")
     summary_path = os.path.join(output_dir, "summary.tsv")
@@ -459,6 +460,79 @@ def main():
     print(f"Saved summary to {summary_path}")
     print(f"Saved plots to {k_plot_path} and {hit_plot_path}")
     print(f"Saved tensors to {tensor_path}")
+
+    return summary_rows
+
+
+def print_important_key_mean_table(layer_to_summary_rows, summary_mass_level):
+    print("")
+    print(f"Important-key mean table at attention mass >= {summary_mass_level:g}")
+    print("layer\thead\tmean_important_keys")
+    for layer, summary_rows in layer_to_summary_rows.items():
+        rows = [
+            row
+            for row in summary_rows
+            if row["mass_level"] == summary_mass_level and row["head"] != "all"
+        ]
+        for row in sorted(rows, key=lambda x: int(x["head"])):
+            print(f"{layer}\t{row['head']}\t{row['mean_k']:.4f}")
+        layer_rows = [
+            row
+            for row in summary_rows
+            if row["mass_level"] == summary_mass_level and row["head"] == "all"
+        ]
+        if layer_rows:
+            print(f"{layer}\tall_heads_mean\t{layer_rows[0]['mean_k']:.4f}")
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    rng = random.Random(args.seed)
+    dtype = str_to_torch_dtype(args.dtype)
+
+    from analysis.runner import load_context
+    from analysis.sanity import move_model_inputs_to_device
+
+    ctx = load_context(args, dtype=dtype, device=args.device)
+    ctx.model.eval()
+
+    input_seq_len = ctx.inputs["input_ids"].shape[1]
+    pos_end, mass_levels, primary = validate_args(
+        args=args,
+        num_layers=ctx.model_config.num_hidden_layers,
+        num_heads=ctx.model_config.num_attention_heads,
+        seq_len=input_seq_len,
+    )
+    layers = args.layers if args.layers is not None else [args.layer]
+
+    heads = sample_or_use_explicit(
+        args.heads,
+        list(range(ctx.model_config.num_attention_heads)),
+        args.num_heads,
+        rng,
+        use_all=args.layers is not None,
+    )
+    pos_list = list(range(args.pos_start, pos_end))
+
+    model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
+    layer_to_summary_rows = {}
+    for layer in layers:
+        layer_to_summary_rows[layer] = analyze_layer(
+            args=args,
+            ctx=ctx,
+            layer=layer,
+            heads=heads,
+            pos_list=pos_list,
+            mass_levels=mass_levels,
+            primary=primary,
+            model_inputs=model_inputs,
+        )
+
+    print_important_key_mean_table(
+        layer_to_summary_rows=layer_to_summary_rows,
+        summary_mass_level=float(args.summary_mass_level),
+    )
 
 
 if __name__ == "__main__":

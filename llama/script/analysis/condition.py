@@ -150,20 +150,24 @@ def _order_rows(rows, order):
     return sorted(rows, key=lambda row: row["root"])
 
 
-def _cluster_condition_rows(q, k_head, v_head, row_root, total_available, head, query_pos, order):
+def _cluster_condition_rows_and_sanity(
+    q, k_head, v_head, row_root, total_available, head, query_pos, order
+):
     clusters = _iter_clusters(row_root, total_available)
     if len(clusters) == 0:
-        return []
+        return [], None
 
     scale = math.sqrt(q.numel())
     raw_rows = []
     s_vals = []
     sizes = []
+    v_bars = []
 
     for root, members in clusters:
         k_cluster = k_head[members].float()
         v_cluster = v_head[members].float()
         k_bar = k_cluster.mean(dim=0)
+        v_bar = v_cluster.mean(dim=0)
         centered_scores = torch.mv(k_cluster - k_bar.unsqueeze(0), q.float()) / scale
         delta = centered_scores.abs().max()
         s_c = torch.dot(q.float(), k_bar.float()) / scale
@@ -183,6 +187,7 @@ def _cluster_condition_rows(q, k_head, v_head, row_root, total_available, head, 
         )
         s_vals.append(s_c)
         sizes.append(float(members.numel()))
+        v_bars.append(v_bar)
 
     s_tensor = torch.stack(s_vals).float()
     size_tensor = torch.tensor(sizes, device=s_tensor.device, dtype=torch.float32)
@@ -195,6 +200,20 @@ def _cluster_condition_rows(q, k_head, v_head, row_root, total_available, head, 
     condition_tensor = p_tensor * (
         (torch.cosh(delta_tensor) - 1.0) / denom + torch.tanh(delta_tensor / 2.0)
     )
+    v_bar_tensor = torch.stack(v_bars).float()
+    approx_output = (p_tensor.unsqueeze(-1) * v_bar_tensor).sum(dim=0)
+
+    visible_k = k_head[:total_available].float()
+    visible_v = v_head[:total_available].float()
+    full_logits = torch.mv(visible_k, q.float()) / scale
+    full_alpha = torch.softmax(full_logits, dim=0)
+    full_output = (full_alpha.unsqueeze(-1) * visible_v).sum(dim=0)
+
+    output_l2 = torch.norm(full_output - approx_output, p=2)
+    condition_sum = condition_tensor.sum()
+    b_all = torch.norm(visible_v, p=2, dim=-1).max()
+    condition_bound = 2.0 * b_all * condition_sum
+    output_l2_over_2b = output_l2 / (2.0 * b_all).clamp_min(1e-30)
 
     rows = []
     for cluster_rank, row in enumerate(raw_rows):
@@ -207,7 +226,24 @@ def _cluster_condition_rows(q, k_head, v_head, row_root, total_available, head, 
     ordered = _order_rows(rows, order)
     for rank, row in enumerate(ordered):
         row["cluster_rank"] = rank
-    return ordered
+    sanity = {
+        "head": int(head),
+        "query_pos": int(query_pos),
+        "clusters": int(len(clusters)),
+        "output_l2": float(output_l2.item()),
+        "condition_sum": float(condition_sum.item()),
+        "B": float(b_all.item()),
+        "output_l2_over_2B": float(output_l2_over_2b.item()),
+        "condition_sum_lt_output_l2_over_2B": bool(
+            condition_sum.item() < output_l2_over_2b.item()
+        ),
+        "two_B_condition_sum": float(condition_bound.item()),
+        "two_B_condition_sum_lt_output_l2": bool(condition_bound.item() < output_l2.item()),
+        "output_l2_over_two_B_condition_sum": float(
+            output_l2.item() / max(condition_bound.item(), 1e-30)
+        ),
+    }
+    return ordered, sanity
 
 
 def _save_condition_tsv(out_path, rows):
@@ -257,6 +293,57 @@ def _print_condition_table(rows, columns, max_rows):
         print("\t".join(vals))
     if max_rows >= 0 and len(rows) > max_rows:
         print(f"... printed {max_rows}/{len(rows)} rows; full table saved to TSV.")
+
+
+def _save_sanity_tsv(out_path, rows):
+    columns = [
+        "head",
+        "query_pos",
+        "clusters",
+        "output_l2",
+        "condition_sum",
+        "B",
+        "output_l2_over_2B",
+        "condition_sum_lt_output_l2_over_2B",
+        "two_B_condition_sum",
+        "two_B_condition_sum_lt_output_l2",
+        "output_l2_over_two_B_condition_sum",
+    ]
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\t".join(columns) + "\n")
+        for row in rows:
+            vals = []
+            for col in columns:
+                val = row[col]
+                if isinstance(val, float):
+                    vals.append(f"{val:.3g}")
+                elif isinstance(val, bool):
+                    vals.append(str(int(val)))
+                else:
+                    vals.append(str(val))
+            f.write("\t".join(vals) + "\n")
+    return columns
+
+
+def _print_sanity_summary(rows):
+    if len(rows) == 0:
+        print("===== Condition sanity =====")
+        print("No sanity rows.")
+        return
+    output_l2 = torch.tensor([row["output_l2"] for row in rows], dtype=torch.float32)
+    bound = torch.tensor([row["two_B_condition_sum"] for row in rows], dtype=torch.float32)
+    passed = sum(int(row["two_B_condition_sum_lt_output_l2"]) for row in rows)
+    print("===== Condition sanity =====")
+    print(
+        f"two_B_condition_sum < output_l2: {passed}/{len(rows)} "
+        f"({passed / len(rows):.1%})"
+    )
+    print(
+        f"mean output_l2={float(output_l2.mean().item()):.3g}, "
+        f"mean two_B_condition_sum={float(bound.mean().item()):.3g}, "
+        f"max output_l2={float(output_l2.max().item()):.3g}, "
+        f"max two_B_condition_sum={float(bound.max().item()):.3g}"
+    )
 
 
 def _plot_head_conditions(out_path, query_rows, head, query_positions, title, dpi):
@@ -320,13 +407,14 @@ def collect_condition_stats(
     v_all = layer_ctx.rope_qkv[args.layer]["v"].to(ctx_device)[0][head_labels].float()
 
     all_rows = []
+    sanity_rows = []
     rows_by_head_query = {int(head): {} for head in head_labels}
     tensor_rows = []
 
     for head_ord, head in enumerate(head_labels):
         for query_pos in query_positions:
             i = pos_to_i[int(query_pos)]
-            rows = _cluster_condition_rows(
+            rows, sanity = _cluster_condition_rows_and_sanity(
                 q=q_all[head_ord, int(query_pos)],
                 k_head=k_all[head_ord],
                 v_head=v_all[head_ord],
@@ -338,17 +426,24 @@ def collect_condition_stats(
             )
             rows_by_head_query[int(head)][int(query_pos)] = rows
             all_rows.extend(rows)
+            if sanity is not None:
+                sanity_rows.append(sanity)
             tensor_rows.append(
                 {
                     "head": int(head),
                     "query_pos": int(query_pos),
                     "rows": rows,
+                    "sanity": sanity,
                 }
             )
 
     table_path = os.path.join(out_dir, "condition_table.tsv")
     columns = _save_condition_tsv(table_path, all_rows)
     _print_condition_table(all_rows, columns, args.print_rows)
+
+    sanity_path = os.path.join(out_dir, "condition_sanity.tsv")
+    _save_sanity_tsv(sanity_path, sanity_rows)
+    _print_sanity_summary(sanity_rows)
 
     plot_paths = {}
     for head in head_labels:
@@ -374,6 +469,7 @@ def collect_condition_stats(
             "heads": [int(x) for x in head_labels],
             "query_positions": [int(x) for x in query_positions],
             "rows": tensor_rows,
+            "sanity_rows": sanity_rows,
         },
         tensor_path,
     )
@@ -384,11 +480,13 @@ def collect_condition_stats(
         f"rows={len(all_rows)}"
     )
     print(f"Saved condition table to: {table_path}")
+    print(f"Saved condition sanity to: {sanity_path}")
     print(f"Saved condition plots to: {list(plot_paths.values())}")
     print(f"Saved condition tensors to: {tensor_path}")
 
     return {
         "table_path": table_path,
+        "sanity_path": sanity_path,
         "plot_paths": plot_paths,
         "tensor_path": tensor_path,
     }

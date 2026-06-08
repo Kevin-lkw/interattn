@@ -52,6 +52,14 @@ def parse_args():
         default_strategy="h2o",
         include_loss_type=True,
         include_plot_dpi=True,
+        prefix_mode_default="full_attention",
+        prefix_mode_choices=("full_attention", "optimal_saved", "baseline_rebuild"),
+        prefix_mode_help=(
+            "How to prepare layers before target layer. "
+            "full_attention: keep previous layers unpatched; "
+            "optimal_saved: load saved optimal patch_hidden for layers < target; "
+            "baseline_rebuild: rebuild baseline patches online for layers < target."
+        ),
     )
     parser.add_argument(
         "--merge-metric",
@@ -492,6 +500,37 @@ def collect_condition_stats(
     }
 
 
+def _prepare_prefix_patches(args, ctx, routing_pos_list, model_inputs):
+    if args.prefix_mode == "full_attention":
+        return {}
+    if args.prefix_mode == "optimal_saved":
+        prefix_patches = build_optimal_saved_prefix_patches(
+            args=args,
+            target_layer=args.layer,
+            budget=args.budget,
+            device=ctx.device,
+        )
+        return _align_prefix_patches_to_pos_list(prefix_patches, routing_pos_list, args.seq_len)
+
+    return build_baseline_prefix_patches(
+        ctx=ctx,
+        args=args,
+        target_layer=args.layer,
+        pos_list=routing_pos_list,
+        model_inputs=model_inputs,
+        build_mask_fn=lambda layer_ctx, layer_idx, hi: gen_mask_h2o_with_belong_all(
+            ctx=layer_ctx,
+            layer_idx=layer_idx,
+            pos_list=routing_pos_list,
+            head_idx=hi,
+            budget=args.budget,
+            seq_len=args.seq_len,
+            adaptive_budget=args.adaptive_budget,
+            merge_metric=args.merge_metric,
+        )[0],
+    )
+
+
 def main():
     set_seed(42)
     args = parse_args()
@@ -529,35 +568,7 @@ def main():
         include_loss_type=True,
     )
 
-    if args.prefix_mode == "optimal_saved":
-        prefix_patches = build_optimal_saved_prefix_patches(
-            args=args,
-            target_layer=args.layer,
-            budget=args.budget,
-            device=ctx.device,
-        )
-        prefix_patches = _align_prefix_patches_to_pos_list(
-            prefix_patches, routing_pos_list, args.seq_len
-        )
-    else:
-        prefix_patches = build_baseline_prefix_patches(
-            ctx=ctx,
-            args=args,
-            target_layer=args.layer,
-            pos_list=routing_pos_list,
-            model_inputs=model_inputs,
-            build_mask_fn=lambda layer_ctx, layer_idx, hi: gen_mask_h2o_with_belong_all(
-                ctx=layer_ctx,
-                layer_idx=layer_idx,
-                pos_list=routing_pos_list,
-                head_idx=hi,
-                budget=args.budget,
-                seq_len=args.seq_len,
-                adaptive_budget=args.adaptive_budget,
-                merge_metric=args.merge_metric,
-            )[0],
-        )
-
+    prefix_patches = _prepare_prefix_patches(args, ctx, routing_pos_list, model_inputs)
     print("Prefix patches prepared for layers", list(prefix_patches.keys()))
     artifacts = capture_layer_artifacts(
         ctx=ctx,

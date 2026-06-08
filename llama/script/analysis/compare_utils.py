@@ -16,6 +16,9 @@ def add_common_compare_args(
     default_strategy="h2o",
     include_loss_type=True,
     include_plot_dpi=False,
+    prefix_mode_default="optimal_saved",
+    prefix_mode_choices=("optimal_saved", "baseline_rebuild"),
+    prefix_mode_help=None,
 ):
     parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
     parser.add_argument("--dataset", type=str, default="wikitext")
@@ -46,16 +49,18 @@ def add_common_compare_args(
             help="Only used to locate saved prefix patch results.",
         )
 
-    parser.add_argument(
-        "--prefix-mode",
-        type=str,
-        default="optimal_saved",
-        choices=["optimal_saved", "baseline_rebuild"],
-        help=(
+    if prefix_mode_help is None:
+        prefix_mode_help = (
             "How to prepare patches before target layer. "
             "optimal_saved: load saved optimal patch_hidden for layers < target; "
             "baseline_rebuild: rebuild baseline patches online for layers < target."
-        ),
+        )
+    parser.add_argument(
+        "--prefix-mode",
+        type=str,
+        default=prefix_mode_default,
+        choices=list(prefix_mode_choices),
+        help=prefix_mode_help,
     )
 
     parser.add_argument("--pos-start", type=int, default=0)

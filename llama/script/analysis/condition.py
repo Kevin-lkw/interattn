@@ -111,6 +111,13 @@ def parse_args():
         default=200,
         help="Print at most this many TSV rows to stdout. Use -1 to print all rows.",
     )
+    parser.add_argument(
+        "--condition-eps",
+        type=float,
+        nargs="+",
+        default=[5.0, 1.0, 0.1],
+        help="Thresholds for counting high-condition clusters and hybrid full-attention budget.",
+    )
     return parser.parse_args()
 
 
@@ -292,25 +299,6 @@ def _save_condition_tsv(out_path, rows):
     return columns
 
 
-def _print_condition_table(rows, columns, max_rows):
-    if max_rows == 0:
-        return
-    shown = rows if max_rows < 0 else rows[:max_rows]
-    print("===== Condition table =====")
-    print("\t".join(columns))
-    for row in shown:
-        vals = []
-        for col in columns:
-            val = row[col]
-            if isinstance(val, float):
-                vals.append(f"{val:.3g}")
-            else:
-                vals.append(str(val))
-        print("\t".join(vals))
-    if max_rows >= 0 and len(rows) > max_rows:
-        print(f"... printed {max_rows}/{len(rows)} rows; full table saved to TSV.")
-
-
 def _save_sanity_tsv(out_path, rows):
     columns = [
         "head",
@@ -358,6 +346,103 @@ def _print_sanity_summary(rows):
         f"max output_l2={float(output_l2.max().item()):.3g}, "
         f"max condition_sum={float(bound.max().item()):.3g}"
     )
+
+
+def _condition_eps_values(args):
+    eps_values = getattr(args, "condition_eps", [5.0, 1.0, 0.1])
+    return sorted({float(eps) for eps in eps_values}, reverse=True)
+
+
+def _collect_condition_eps_budget_rows(rows_by_head_query, head_labels, query_positions, args):
+    eps_values = _condition_eps_values(args)
+    budget_rows = []
+    for head in head_labels:
+        head_rows = rows_by_head_query[int(head)]
+        for query_pos in query_positions:
+            rows = head_rows.get(int(query_pos), [])
+            if len(rows) == 0:
+                continue
+
+            total_available = int(query_pos) + 1
+            total_clusters = len(rows)
+            for eps in eps_values:
+                selected = [row for row in rows if row["condition"] > eps]
+                selected_tokens = sum(int(row["size"]) for row in selected)
+                selected_clusters = len(selected)
+                hybrid_tokens = selected_tokens + (total_clusters - selected_clusters)
+                budget_rows.append(
+                    {
+                        "head": int(head),
+                        "query_pos": int(query_pos),
+                        "eps": float(eps),
+                        "clusters_gt_eps": int(selected_clusters),
+                        "tokens_in_clusters_gt_eps": int(selected_tokens),
+                        "hybrid_tokens": int(hybrid_tokens),
+                        "hybrid_budget_seq": float(hybrid_tokens / args.seq_len),
+                        "hybrid_budget_visible": float(hybrid_tokens / total_available),
+                    }
+                )
+    return budget_rows
+
+
+def _save_condition_eps_budget_tsv(out_path, rows):
+    columns = [
+        "head",
+        "query_pos",
+        "eps",
+        "clusters_gt_eps",
+        "tokens_in_clusters_gt_eps",
+        "hybrid_tokens",
+        "hybrid_budget_seq",
+        "hybrid_budget_visible",
+    ]
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\t".join(columns) + "\n")
+        for row in rows:
+            vals = []
+            for col in columns:
+                val = row[col]
+                if isinstance(val, float):
+                    vals.append(f"{val:.6g}")
+                else:
+                    vals.append(str(val))
+            f.write("\t".join(vals) + "\n")
+    return columns
+
+
+def _print_condition_eps_budget_summary(rows):
+    if len(rows) == 0:
+        print("===== Condition eps budget =====")
+        print("No eps budget rows.")
+        return
+
+    print("===== Condition eps budget =====")
+    eps_values = sorted({row["eps"] for row in rows}, reverse=True)
+    for eps in eps_values:
+        eps_rows = [row for row in rows if row["eps"] == eps]
+        clusters = torch.tensor(
+            [row["clusters_gt_eps"] for row in eps_rows], dtype=torch.float32
+        )
+        selected_tokens = torch.tensor(
+            [row["tokens_in_clusters_gt_eps"] for row in eps_rows], dtype=torch.float32
+        )
+        hybrid_tokens = torch.tensor(
+            [row["hybrid_tokens"] for row in eps_rows], dtype=torch.float32
+        )
+        budget_seq = torch.tensor(
+            [row["hybrid_budget_seq"] for row in eps_rows], dtype=torch.float32
+        )
+        budget_visible = torch.tensor(
+            [row["hybrid_budget_visible"] for row in eps_rows], dtype=torch.float32
+        )
+        print(
+            f"eps={eps:g}: "
+            f"mean clusters>{eps:g}={float(clusters.mean().item()):.3g}, "
+            f"mean selected_tokens={float(selected_tokens.mean().item()):.3g}, "
+            f"mean hybrid_tokens={float(hybrid_tokens.mean().item()):.3g}, "
+            f"mean hybrid_budget_seq={float(budget_seq.mean().item()):.3g}, "
+            f"mean hybrid_budget_visible={float(budget_visible.mean().item()):.3g}"
+        )
 
 
 def _plot_head_conditions(out_path, query_rows, head, query_positions, title, dpi):
@@ -499,12 +584,20 @@ def collect_condition_stats(
             )
 
     table_path = os.path.join(out_dir, "condition_table.tsv")
-    columns = _save_condition_tsv(table_path, all_rows)
-    _print_condition_table(all_rows, columns, args.print_rows)
 
     sanity_path = os.path.join(out_dir, "condition_sanity.tsv")
     _save_sanity_tsv(sanity_path, sanity_rows)
     _print_sanity_summary(sanity_rows)
+
+    eps_budget_rows = _collect_condition_eps_budget_rows(
+        rows_by_head_query=rows_by_head_query,
+        head_labels=head_labels,
+        query_positions=query_positions,
+        args=args,
+    )
+    eps_budget_path = os.path.join(out_dir, "condition_eps_budget.tsv")
+    _save_condition_eps_budget_tsv(eps_budget_path, eps_budget_rows)
+    _print_condition_eps_budget_summary(eps_budget_rows)
 
     sanity_curve_path = os.path.join(out_dir, "condition_sanity_curve.png")
     _plot_sanity_curve(
@@ -541,6 +634,7 @@ def collect_condition_stats(
             "query_positions": [int(x) for x in query_positions],
             "rows": tensor_rows,
             "sanity_rows": sanity_rows,
+            "eps_budget_rows": eps_budget_rows,
             "sanity_curve_path": sanity_curve_path,
         },
         tensor_path,
@@ -553,6 +647,7 @@ def collect_condition_stats(
     )
     print(f"Saved condition table to: {table_path}")
     print(f"Saved condition sanity to: {sanity_path}")
+    print(f"Saved condition eps budget to: {eps_budget_path}")
     print(f"Saved condition sanity curve to: {sanity_curve_path}")
     print(f"Saved condition plots to: {list(plot_paths.values())}")
     print(f"Saved condition tensors to: {tensor_path}")
@@ -560,6 +655,7 @@ def collect_condition_stats(
     return {
         "table_path": table_path,
         "sanity_path": sanity_path,
+        "eps_budget_path": eps_budget_path,
         "sanity_curve_path": sanity_curve_path,
         "plot_paths": plot_paths,
         "tensor_path": tensor_path,

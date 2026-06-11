@@ -71,6 +71,15 @@ def parse_args():
         default=[0.1, 1.0, 5.0],
         help="Condition thresholds. Clusters with condition > eps use full attention.",
     )
+    parser.add_argument(
+        "--delta-mode",
+        choices=["exact", "range_bound"],
+        default="range_bound",
+        help=(
+            "How to compute delta_C. exact uses per-token QK scores; "
+            "range_bound uses per-dimension K min/max upper bounds."
+        ),
+    )
     layer_group = parser.add_mutually_exclusive_group()
     layer_group.add_argument("--layers", type=int, nargs="+", default=None)
     layer_group.add_argument("--all-layers", action="store_true")
@@ -179,50 +188,208 @@ def _hybrid_head_output_for_pos(q, k_head, v_head, pos, block_size, eps):
     return out.sum(dim=0), stats
 
 
-def build_condition_block_patch(ctx, layer_idx, artifacts, pos_list, block_size, eps):
+def _pad_blocks(x, block_size):
+    n_heads, seq_len = x.shape[:2]
+    tail_shape = x.shape[2:]
+    n_blocks = math.ceil(seq_len / block_size)
+    pad_len = n_blocks * block_size - seq_len
+    if pad_len > 0:
+        pad = torch.zeros(
+            (n_heads, pad_len, *tail_shape),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        x = torch.cat([x, pad], dim=1)
+    return x.reshape(n_heads, n_blocks, block_size, *tail_shape), n_blocks
+
+
+def _gather_prefix(prefix_tensor, prefix_idx):
+    n_heads, n_blocks, block_size = prefix_tensor.shape[:3]
+    tail_shape = prefix_tensor.shape[3:]
+    n_query = prefix_idx.shape[0]
+    expanded = prefix_tensor.unsqueeze(1).expand(
+        n_heads, n_query, n_blocks, block_size, *tail_shape
+    )
+    gather_idx = prefix_idx.view(1, n_query, n_blocks, 1, *([1] * len(tail_shape))).expand(
+        n_heads, n_query, n_blocks, 1, *tail_shape
+    )
+    return torch.gather(expanded, dim=3, index=gather_idx).squeeze(3)
+
+
+def _build_block_prefix_tensors(k_all, v_all, block_size):
+    k_block, n_blocks = _pad_blocks(k_all.float(), block_size)
+    v_block, _ = _pad_blocks(v_all.float(), block_size)
+    device = k_all.device
+    seq_len = k_all.shape[1]
+
+    token_idx = torch.arange(n_blocks * block_size, device=device).reshape(
+        n_blocks, block_size
+    )
+    valid_token = token_idx < seq_len
+
+    valid_k = valid_token.view(1, n_blocks, block_size, 1)
+    k_for_max = k_block.masked_fill(~valid_k, float("-inf"))
+    k_for_min = k_block.masked_fill(~valid_k, float("inf"))
+    v_norm = torch.norm(v_block, p=2, dim=-1)
+    v_norm = v_norm.masked_fill(~valid_token.view(1, n_blocks, block_size), float("-inf"))
+
+    return {
+        "k_block": k_block,
+        "v_block": v_block,
+        "token_idx": token_idx,
+        "valid_token": valid_token,
+        "k_cumsum": k_block.cumsum(dim=2),
+        "v_cumsum": v_block.cumsum(dim=2),
+        "k_prefix_max": k_for_max.cummax(dim=2).values,
+        "k_prefix_min": k_for_min.cummin(dim=2).values,
+        "v_norm_prefix_max": v_norm.cummax(dim=2).values,
+        "block_starts": torch.arange(n_blocks, device=device) * block_size,
+        "block_valid_counts": valid_token.sum(dim=1),
+    }
+
+
+def _batched_hybrid_outputs_for_queries(
+    *,
+    q_pos,
+    pos_tensor,
+    prefix,
+    block_size,
+    eps,
+    delta_mode,
+):
+    n_heads, n_query, head_dim = q_pos.shape
+    n_blocks = prefix["block_starts"].numel()
+    scale = math.sqrt(head_dim)
+
+    raw_prefix_len = pos_tensor[:, None] - prefix["block_starts"][None, :] + 1
+    prefix_len = raw_prefix_len.clamp(min=0, max=block_size)
+    size = torch.minimum(prefix_len, prefix["block_valid_counts"][None, :]).long()
+    cluster_exists = size > 0
+    prefix_idx = (size - 1).clamp_min(0)
+    size_float = size.clamp_min(1).float()
+
+    k_sum = _gather_prefix(prefix["k_cumsum"], prefix_idx)
+    v_sum = _gather_prefix(prefix["v_cumsum"], prefix_idx)
+    k_bar = k_sum / size_float.view(1, n_query, n_blocks, 1)
+    v_bar = v_sum / size_float.view(1, n_query, n_blocks, 1)
+
+    s_c = (q_pos[:, :, None, :] * k_bar).sum(dim=-1) / scale
+    block_logits = torch.einsum("hqd,hbtd->hqbt", q_pos, prefix["k_block"]) / scale
+    token_visible = (
+        prefix["valid_token"][None, :, :]
+        & (prefix["token_idx"][None, :, :] <= pos_tensor[:, None, None])
+    )
+
+    if delta_mode == "exact":
+        centered = (block_logits - s_c.unsqueeze(-1)).abs()
+        delta = centered.masked_fill(~token_visible.unsqueeze(0), float("-inf")).amax(dim=-1)
+        delta = delta.masked_fill(~cluster_exists.unsqueeze(0), 0.0)
+    elif delta_mode == "range_bound":
+        k_max = _gather_prefix(prefix["k_prefix_max"], prefix_idx)
+        k_min = _gather_prefix(prefix["k_prefix_min"], prefix_idx)
+        q_for_bounds = q_pos[:, :, None, :]
+        upper_score = torch.maximum(q_for_bounds * k_max, q_for_bounds * k_min).sum(
+            dim=-1
+        ) / scale
+        lower_score = torch.minimum(q_for_bounds * k_max, q_for_bounds * k_min).sum(
+            dim=-1
+        ) / scale
+        delta = torch.maximum((upper_score - s_c).abs(), (lower_score - s_c).abs())
+        delta = delta.masked_fill(~cluster_exists.unsqueeze(0), 0.0)
+    else:
+        raise ValueError(f"Unknown delta mode: {delta_mode}")
+
+    b_c = _gather_prefix(prefix["v_norm_prefix_max"].unsqueeze(-1), prefix_idx).squeeze(-1)
+    b_c = b_c.masked_fill(~cluster_exists.unsqueeze(0), 0.0)
+    b_all = b_c.amax(dim=-1)
+
+    z_logits = torch.log(size_float).view(1, n_query, n_blocks) + s_c
+    z_logits = z_logits.masked_fill(~cluster_exists.unsqueeze(0), float("-inf"))
+    p_tensor = torch.softmax(z_logits, dim=-1)
+    denom = (p_tensor * torch.cosh(delta)).sum(dim=-1).clamp_min(1e-30)
+    condition = p_tensor * (
+        2.0 * b_all.unsqueeze(-1) * (torch.cosh(delta) - 1.0) / denom.unsqueeze(-1)
+        + 2.0 * b_c * torch.tanh(delta / 2.0)
+    )
+    selected = (condition > eps) & cluster_exists.unsqueeze(0)
+
+    token_selected = selected.unsqueeze(-1) & token_visible.unsqueeze(0)
+    token_logits = block_logits.masked_fill(~token_selected, float("-inf"))
+    cluster_logits = z_logits.masked_fill(selected | ~cluster_exists.unsqueeze(0), float("-inf"))
+
+    token_max = token_logits.flatten(2).amax(dim=-1)
+    cluster_max = cluster_logits.amax(dim=-1)
+    max_logit = torch.maximum(token_max, cluster_max).clamp_min(-1e30)
+
+    token_exp = torch.exp(token_logits - max_logit[:, :, None, None]).masked_fill(
+        ~token_selected, 0.0
+    )
+    cluster_active = (~selected) & cluster_exists.unsqueeze(0)
+    cluster_exp = torch.exp(cluster_logits - max_logit[:, :, None]).masked_fill(
+        ~cluster_active, 0.0
+    )
+    normalizer = (
+        token_exp.sum(dim=(2, 3)) + cluster_exp.sum(dim=2)
+    ).clamp_min(1e-30)
+
+    token_num = torch.einsum("hqbt,hbtd->hqd", token_exp, prefix["v_block"])
+    cluster_num = (cluster_exp.unsqueeze(-1) * v_bar).sum(dim=2)
+    output = (token_num + cluster_num) / normalizer.unsqueeze(-1)
+
+    selected_tokens = (selected.long() * size.view(1, n_query, n_blocks)).sum()
+    selected_clusters = selected.sum()
+    clusters = cluster_exists.sum() * n_heads
+    hybrid_tokens = selected_tokens + (cluster_active.sum())
+    total_available = (pos_tensor.long() + 1).sum() * n_heads
+    stats = {
+        "rows": int(n_heads * n_query),
+        "clusters": int(clusters.item()),
+        "selected_clusters": int(selected_clusters.item()),
+        "selected_tokens": int(selected_tokens.item()),
+        "hybrid_tokens": int(hybrid_tokens.item()),
+        "total_available": int(total_available.item()),
+    }
+    return output, stats
+
+
+def build_condition_block_patch(
+    ctx,
+    layer_idx,
+    artifacts,
+    pos_list,
+    block_size,
+    eps,
+    delta_mode="range_bound",
+):
     q_all = artifacts["q"].to(ctx.device)[0]
     k_all = artifacts["k"].to(ctx.device)[0]
     v_all = artifacts["v"].to(ctx.device)[0]
-    output = artifacts["attn_output"][0, pos_list].permute(1, 0, 2).to(ctx.device).clone()
+    output_dtype = artifacts["attn_output"].dtype
 
     n_heads = q_all.shape[0]
     n_pos = len(pos_list)
-    budget_stats = {
-        "rows": 0,
-        "clusters": 0,
-        "selected_clusters": 0,
-        "selected_tokens": 0,
-        "hybrid_tokens": 0,
-        "total_available": 0,
-    }
-
-    for h in range(n_heads):
-        k_head = k_all[h]
-        v_head = v_all[h]
-        for i, pos in enumerate(pos_list):
-            q = q_all[h, pos]
-            out, stats = _hybrid_head_output_for_pos(
-                q=q,
-                k_head=k_head,
-                v_head=v_head,
-                pos=pos,
-                block_size=block_size,
-                eps=eps,
-            )
-            output[h, i] = out.to(output.dtype)
-            budget_stats["rows"] += 1
-            for key in (
-                "clusters",
-                "selected_clusters",
-                "selected_tokens",
-                "hybrid_tokens",
-                "total_available",
-            ):
-                budget_stats[key] += int(stats[key])
+    if k_all.shape[0] != n_heads or v_all.shape[0] != n_heads:
+        raise ValueError(
+            "Batched condition-block runner expects K/V heads to match Q heads. "
+            f"Got q={q_all.shape[0]}, k={k_all.shape[0]}, v={v_all.shape[0]}."
+        )
+    prefix = _build_block_prefix_tensors(k_all, v_all, block_size)
+    pos_tensor = torch.tensor(pos_list, device=ctx.device, dtype=torch.long)
+    q_pos = q_all[:, pos_tensor, :].float()
+    output, budget_stats = _batched_hybrid_outputs_for_queries(
+        q_pos=q_pos,
+        pos_tensor=pos_tensor,
+        prefix=prefix,
+        block_size=block_size,
+        eps=eps,
+        delta_mode=delta_mode,
+    )
+    output = output.to(output_dtype)
 
     layer = ctx.model.model.layers[layer_idx]
+    proj_dtype = layer.self_attn.o_proj.weight.dtype
     patch_hidden = layer.self_attn.o_proj(
-        output.permute(1, 0, 2).reshape(n_pos, -1).to(ctx.device)
+        output.permute(1, 0, 2).reshape(n_pos, -1).to(ctx.device, dtype=proj_dtype)
     )
     return patch_hidden.detach(), budget_stats
 
@@ -281,6 +448,7 @@ def run_for_eps(ctx, args, eps, layer_idx_list, pos_list, model_inputs):
             pos_list=pos_list,
             block_size=args.block_size,
             eps=eps,
+            delta_mode=args.delta_mode,
         )
         layer_to_patch[layer_idx] = patch_hidden
         budget_stats[int(layer_idx)] = _summarize_budget(

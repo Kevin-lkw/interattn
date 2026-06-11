@@ -118,6 +118,15 @@ def parse_args():
         default=[5.0, 1.0, 0.1],
         help="Thresholds for counting high-condition clusters and hybrid full-attention budget.",
     )
+    parser.add_argument(
+        "--delta-mode",
+        choices=["exact", "range_bound"],
+        default="exact",
+        help=(
+            "How to compute delta_C. exact uses all q dot K_i scores; "
+            "range_bound uses per-dimension K min/max to upper-bound delta_C."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -168,8 +177,28 @@ def _order_rows(rows, order):
     return sorted(rows, key=lambda row: row["root"])
 
 
+def _compute_range_bound_delta(q_float, k_cluster, s_c, scale):
+    k_max = k_cluster.max(dim=0).values
+    k_min = k_cluster.min(dim=0).values
+    upper_terms = torch.maximum(q_float * k_max, q_float * k_min)
+    lower_terms = torch.minimum(q_float * k_max, q_float * k_min)
+    upper_score = upper_terms.sum() / scale
+    lower_score = lower_terms.sum() / scale
+    return torch.maximum((upper_score - s_c).abs(), (lower_score - s_c).abs())
+
+
+def _select_delta(exact_delta, range_bound_delta, mode):
+    if mode == "exact":
+        return exact_delta
+
+    if mode == "range_bound":
+        return range_bound_delta
+
+    raise ValueError(f"Unknown delta mode: {mode}")
+
+
 def _cluster_condition_rows_and_sanity(
-    q, k_head, v_head, row_root, total_available, head, query_pos, order
+    q, k_head, v_head, row_root, total_available, head, query_pos, order, delta_mode
 ):
     clusters = _iter_clusters(row_root, total_available)
     if len(clusters) == 0:
@@ -187,11 +216,21 @@ def _cluster_condition_rows_and_sanity(
         v_cluster = v_head[members].float()
         k_bar = k_cluster.mean(dim=0)
         v_bar = v_cluster.mean(dim=0)
-        qk_cluster = torch.mv(k_cluster, q.float()) / scale
-        s_c = torch.dot(q.float(), k_bar.float()) / scale
+        q_float = q.float()
+        qk_cluster = torch.mv(k_cluster, q_float) / scale
+        s_c = torch.dot(q_float, k_bar.float()) / scale
         centered_scores = qk_cluster - s_c
-        delta = centered_scores.abs().max()
+        exact_delta = centered_scores.abs().max()
+        range_bound_delta = _compute_range_bound_delta(
+            q_float=q_float,
+            k_cluster=k_cluster,
+            s_c=s_c,
+            scale=scale,
+        )
+        delta = _select_delta(exact_delta, range_bound_delta, delta_mode)
         b_c = torch.norm(v_cluster, p=2, dim=-1).max()
+        exact_delta_value = float(exact_delta.item())
+        range_bound_delta_value = float(range_bound_delta.item())
         raw_rows.append(
             {
                 "head": int(head),
@@ -200,6 +239,10 @@ def _cluster_condition_rows_and_sanity(
                 "size": int(members.numel()),
                 "s": float(s_c.item()),
                 "delta": float(delta.item()),
+                "delta_exact": exact_delta_value,
+                "delta_range_bound": range_bound_delta_value,
+                "delta_bound_ratio": range_bound_delta_value / max(exact_delta_value, 1e-30),
+                "delta_mode": delta_mode,
                 "B": float(b_c.item()),
                 "member_min": int(members.min().item()),
                 "member_max": int(members.max().item()),
@@ -217,6 +260,14 @@ def _cluster_condition_rows_and_sanity(
     p_full_tensor = torch.softmax(torch.stack(full_logz_vals).float(), dim=0)
     delta_tensor = torch.tensor(
         [row["delta"] for row in raw_rows], device=s_tensor.device, dtype=torch.float32
+    )
+    exact_delta_tensor = torch.tensor(
+        [row["delta_exact"] for row in raw_rows], device=s_tensor.device, dtype=torch.float32
+    )
+    range_bound_delta_tensor = torch.tensor(
+        [row["delta_range_bound"] for row in raw_rows],
+        device=s_tensor.device,
+        dtype=torch.float32,
     )
     b_c_tensor = torch.tensor(
         [row["B"] for row in raw_rows], device=s_tensor.device, dtype=torch.float32
@@ -237,7 +288,21 @@ def _cluster_condition_rows_and_sanity(
         2.0 * b_all * (torch.cosh(delta_tensor) - 1.0) / denom
         + 2.0 * b_c_tensor * torch.tanh(delta_tensor / 2.0)
     )
+    exact_denom = (p_tensor * torch.cosh(exact_delta_tensor)).sum().clamp_min(1e-30)
+    exact_condition_tensor = p_tensor * (
+        2.0 * b_all * (torch.cosh(exact_delta_tensor) - 1.0) / exact_denom
+        + 2.0 * b_c_tensor * torch.tanh(exact_delta_tensor / 2.0)
+    )
+    range_bound_denom = (
+        p_tensor * torch.cosh(range_bound_delta_tensor)
+    ).sum().clamp_min(1e-30)
+    range_bound_condition_tensor = p_tensor * (
+        2.0 * b_all * (torch.cosh(range_bound_delta_tensor) - 1.0) / range_bound_denom
+        + 2.0 * b_c_tensor * torch.tanh(range_bound_delta_tensor / 2.0)
+    )
     condition_sum = condition_tensor.sum()
+    exact_condition_sum = exact_condition_tensor.sum()
+    range_bound_condition_sum = range_bound_condition_tensor.sum()
     output_l2_over_2b = output_l2 / (2.0 * b_all).clamp_min(1e-30)
 
     rows = []
@@ -247,6 +312,10 @@ def _cluster_condition_rows_and_sanity(
         row["p"] = float(p_tensor[cluster_rank].item())
         row["p_full"] = float(p_full_tensor[cluster_rank].item())
         row["condition"] = float(condition_tensor[cluster_rank].item())
+        row["condition_exact"] = float(exact_condition_tensor[cluster_rank].item())
+        row["condition_range_bound"] = float(
+            range_bound_condition_tensor[cluster_rank].item()
+        )
         rows.append(row)
 
     ordered = _order_rows(rows, order)
@@ -258,6 +327,12 @@ def _cluster_condition_rows_and_sanity(
         "clusters": int(len(clusters)),
         "output_l2": float(output_l2.item()),
         "condition_sum": float(condition_sum.item()),
+        "condition_exact_sum": float(exact_condition_sum.item()),
+        "condition_range_bound_sum": float(range_bound_condition_sum.item()),
+        "delta_bound_violations": int(
+            (range_bound_delta_tensor + 1e-6 < exact_delta_tensor).sum().item()
+        ),
+        "delta_mode": delta_mode,
         "B": float(b_all.item()),
         "output_l2_over_2B": float(output_l2_over_2b.item()),
         "output_l2_le_condition_sum": bool(output_l2.item() <= condition_sum.item()),
@@ -282,8 +357,14 @@ def _save_condition_tsv(out_path, rows):
         "p",
         "p_full",
         "delta",
+        "delta_exact",
+        "delta_range_bound",
+        "delta_bound_ratio",
+        "delta_mode",
         "B",
         "condition",
+        "condition_exact",
+        "condition_range_bound",
     ]
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\t".join(columns) + "\n")
@@ -306,6 +387,10 @@ def _save_sanity_tsv(out_path, rows):
         "clusters",
         "output_l2",
         "condition_sum",
+        "condition_exact_sum",
+        "condition_range_bound_sum",
+        "delta_bound_violations",
+        "delta_mode",
         "B",
         "output_l2_over_2B",
         "output_l2_le_condition_sum",
@@ -334,7 +419,18 @@ def _print_sanity_summary(rows):
         return
     output_l2 = torch.tensor([row["output_l2"] for row in rows], dtype=torch.float32)
     bound = torch.tensor([row["condition_sum"] for row in rows], dtype=torch.float32)
+    exact_bound = torch.tensor(
+        [row["condition_exact_sum"] for row in rows], dtype=torch.float32
+    )
+    range_bound = torch.tensor(
+        [row["condition_range_bound_sum"] for row in rows], dtype=torch.float32
+    )
     passed = sum(int(row["output_l2_le_condition_sum"]) for row in rows)
+    delta_violations = sum(int(row["delta_bound_violations"]) for row in rows)
+    condition_sum_violations = sum(
+        int(row["condition_range_bound_sum"] + 1e-6 < row["condition_exact_sum"])
+        for row in rows
+    )
     print("===== Condition sanity =====")
     print(
         f"output_l2 <= condition_sum: {passed}/{len(rows)} "
@@ -345,6 +441,14 @@ def _print_sanity_summary(rows):
         f"mean condition_sum={float(bound.mean().item()):.3g}, "
         f"max output_l2={float(output_l2.max().item()):.3g}, "
         f"max condition_sum={float(bound.max().item()):.3g}"
+    )
+    print(
+        f"delta range-bound violations: {delta_violations}; "
+        f"condition'_sum < condition_sum violations: {condition_sum_violations}"
+    )
+    print(
+        f"mean exact condition_sum={float(exact_bound.mean().item()):.3g}, "
+        f"mean range-bound condition'_sum={float(range_bound.mean().item()):.3g}"
     )
 
 
@@ -475,12 +579,69 @@ def _plot_head_conditions(out_path, query_rows, head, query_positions, title, dp
         x = list(range(len(rows)))
         for col_idx, (key, label, color) in enumerate(metric_specs):
             ax = axes[row_idx, col_idx]
-            vals = [row[key] for row in rows]
-            ax.plot(x, vals, color=color, linewidth=1.1)
+            if key == "delta":
+                vals = [row["delta_exact"] for row in rows]
+                approx_vals = [row["delta_range_bound"] for row in rows]
+                ax.plot(x, vals, color=color, linewidth=1.1, label="exact")
+                ax.plot(
+                    x,
+                    approx_vals,
+                    color="#991b1b",
+                    linewidth=1.0,
+                    linestyle="--",
+                    label="approx",
+                )
+                ax.legend(fontsize=7, frameon=False)
+            elif key == "condition":
+                vals = [row["condition_exact"] for row in rows]
+                approx_vals = [row["condition_range_bound"] for row in rows]
+                ax.plot(x, vals, color=color, linewidth=1.1, label="condition")
+                ax.plot(
+                    x,
+                    approx_vals,
+                    color="#166534",
+                    linewidth=1.0,
+                    linestyle="--",
+                    label="condition'",
+                )
+                ax.legend(fontsize=7, frameon=False)
+            else:
+                vals = [row[key] for row in rows]
+                ax.plot(x, vals, color=color, linewidth=1.1)
             ax.set_title(f"h{head} q={query_pos} {label}")
             ax.set_xlabel("cluster")
             ax.set_ylabel(label)
             ax.grid(alpha=0.22)
+
+    fig.suptitle(title)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _plot_delta_fit(out_path, query_rows, head, query_positions, title, dpi):
+    exact_vals = []
+    range_vals = []
+    colors = []
+    cmap = plt.get_cmap("tab10")
+    for query_idx, query_pos in enumerate(query_positions):
+        rows = query_rows.get(int(query_pos), [])
+        exact_vals.extend(row["delta_exact"] for row in rows)
+        range_vals.extend(row["delta_range_bound"] for row in rows)
+        colors.extend([cmap(query_idx % 10)] * len(rows))
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.6), constrained_layout=True)
+    if len(exact_vals) == 0:
+        ax.text(0.5, 0.5, "No clusters", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+    else:
+        ax.scatter(exact_vals, range_vals, s=12, alpha=0.58, c=colors, linewidths=0)
+        max_val = max(max(exact_vals), max(range_vals))
+        min_val = min(min(exact_vals), min(range_vals), 0.0)
+        ax.plot([min_val, max_val], [min_val, max_val], color="#111827", linewidth=1.0)
+        ax.set_xlabel("exact delta")
+        ax.set_ylabel("range-bound delta")
+        ax.set_title(f"h{head} delta fit")
+        ax.grid(alpha=0.22)
 
     fig.suptitle(title)
     fig.savefig(out_path, dpi=dpi)
@@ -569,6 +730,7 @@ def collect_condition_stats(
                 head=head,
                 query_pos=query_pos,
                 order=args.cluster_order,
+                delta_mode=getattr(args, "delta_mode", "exact"),
             )
             rows_by_head_query[int(head)][int(query_pos)] = rows
             all_rows.extend(rows)
@@ -610,6 +772,7 @@ def collect_condition_stats(
     )
 
     plot_paths = {}
+    delta_fit_paths = {}
     for head in head_labels:
         plot_path = os.path.join(out_dir, f"condition_head{int(head)}.png")
         _plot_head_conditions(
@@ -624,6 +787,19 @@ def collect_condition_stats(
             dpi=args.plot_dpi,
         )
         plot_paths[int(head)] = plot_path
+        delta_fit_path = os.path.join(out_dir, f"delta_fit_head{int(head)}.png")
+        _plot_delta_fit(
+            out_path=delta_fit_path,
+            query_rows=rows_by_head_query[int(head)],
+            head=int(head),
+            query_positions=query_positions,
+            title=(
+                f"Layer {args.layer} head {int(head)} delta fit; "
+                f"budget={args.budget:g}, order={args.cluster_order}"
+            ),
+            dpi=args.plot_dpi,
+        )
+        delta_fit_paths[int(head)] = delta_fit_path
 
     tensor_path = os.path.join(out_dir, "condition_stats.pt")
     torch.save(
@@ -650,6 +826,7 @@ def collect_condition_stats(
     print(f"Saved condition eps budget to: {eps_budget_path}")
     print(f"Saved condition sanity curve to: {sanity_curve_path}")
     print(f"Saved condition plots to: {list(plot_paths.values())}")
+    print(f"Saved delta fit plots to: {list(delta_fit_paths.values())}")
     print(f"Saved condition tensors to: {tensor_path}")
 
     return {
@@ -658,6 +835,7 @@ def collect_condition_stats(
         "eps_budget_path": eps_budget_path,
         "sanity_curve_path": sanity_curve_path,
         "plot_paths": plot_paths,
+        "delta_fit_paths": delta_fit_paths,
         "tensor_path": tensor_path,
     }
 

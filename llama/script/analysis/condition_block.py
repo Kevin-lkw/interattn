@@ -111,6 +111,15 @@ def parse_args():
         default=[5.0, 1.0, 0.1],
         help="Thresholds for counting high-condition clusters and hybrid full-attention budget.",
     )
+    parser.add_argument(
+        "--delta-mode",
+        choices=["exact", "range_bound"],
+        default="exact",
+        help=(
+            "How to compute delta_C. exact uses all q dot K_i scores; "
+            "range_bound uses per-dimension K min/max to upper-bound delta_C."
+        ),
+    )
     return parser.parse_args()
 
 

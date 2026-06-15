@@ -33,9 +33,6 @@ from .runner_utils import (
 from .sanity import compute_metrics, get_tail_labels, move_model_inputs_to_device
 
 
-FULL_ATTENTION_LAYERS = 2
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run condition-thresholded block hybrid attention for all layers."
@@ -73,7 +70,7 @@ def parse_args():
         "--eps",
         type=float,
         nargs="+",
-        default=[ 0.05, 0.075 , 0.1, 0.25,0.1,0.5 ],
+        default=[ 0.05, 0.075, 0.1, 0.15, 0.2, 0.25,0.5],
         help="Condition thresholds. Clusters with condition > eps use full attention.",
     )
     parser.add_argument(
@@ -84,6 +81,12 @@ def parse_args():
             "How to compute delta_C. exact uses per-token QK scores; "
             "range_bound uses per-dimension K min/max upper bounds."
         ),
+    )
+    parser.add_argument(
+        "--full-attention-layers",
+        type=int,
+        default=2,
+        help="Keep the first N layers at full attention. Use 0 to compress every layer.",
     )
     layer_group = parser.add_mutually_exclusive_group()
     layer_group.add_argument("--layers", type=int, nargs="+", default=None)
@@ -99,6 +102,8 @@ def parse_args():
         args.eval_start = args.start
     if args.layers is None:
         args.all_layers = True
+    if args.full_attention_layers < 0:
+        parser.error("--full-attention-layers must be >= 0")
     return args
 
 
@@ -496,7 +501,7 @@ def run_for_eps(ctx, args, eps, layer_idx_list, pos_list, model_inputs):
     for layer_idx in layer_iter:
         t0 = time.time()
         layer_iter.set_postfix(layer=int(layer_idx))
-        if layer_idx < FULL_ATTENTION_LAYERS:
+        if layer_idx < args.full_attention_layers:
             layer_budget_stats = _full_attention_stats(
                 n_heads=ctx.model_config.num_attention_heads,
                 pos_list=pos_list,
@@ -597,7 +602,7 @@ def main():
         "full_attention_layers": [
             layer_idx
             for layer_idx in layer_idx_list
-            if layer_idx < FULL_ATTENTION_LAYERS
+            if layer_idx < args.full_attention_layers
         ],
         "teacher_nll": teacher_nll,
         "teacher_ppl": teacher_ppl,

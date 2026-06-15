@@ -1,9 +1,10 @@
 """
 Run block-condition hybrid attention through all layers and report PPL.
 
-For each layer and eps value, contiguous block clusters are used as the
-compressed attention units.  Clusters with condition > eps are expanded to
-full attention over their members; the rest keep one averaged KV unit.
+Layers 0 and 1 keep full attention. For each later layer and eps value,
+contiguous block clusters are used as the compressed attention units.
+Clusters with condition > eps are expanded to full attention over their
+members; the rest keep one averaged KV unit.
 """
 
 import argparse
@@ -30,6 +31,9 @@ from .runner_utils import (
     str_to_torch_dtype,
 )
 from .sanity import compute_metrics, get_tail_labels, move_model_inputs_to_device
+
+
+FULL_ATTENTION_LAYERS = 2
 
 
 def parse_args():
@@ -69,7 +73,7 @@ def parse_args():
         "--eps",
         type=float,
         nargs="+",
-        default=[0.01, 0.05, 0.1, 0.25 ,0.5],
+        default=[ 0.05, 0.075 , 0.1, 0.25,0.1,0.5 ],
         help="Condition thresholds. Clusters with condition > eps use full attention.",
     )
     parser.add_argument(
@@ -421,6 +425,18 @@ def _merge_stats(total, add):
         total[key] = int(total.get(key, 0)) + int(value)
 
 
+def _full_attention_stats(n_heads, pos_list):
+    total_available = sum(int(pos) + 1 for pos in pos_list) * n_heads
+    return {
+        "rows": n_heads * len(pos_list),
+        "clusters": 0,
+        "selected_clusters": 0,
+        "selected_tokens": total_available,
+        "hybrid_tokens": total_available,
+        "total_available": total_available,
+    }
+
+
 def plot_ppl_vs_budget_from_summary(summary_path, out_path=None):
     summary = torch.load(summary_path, map_location="cpu")
     if out_path is None:
@@ -480,6 +496,22 @@ def run_for_eps(ctx, args, eps, layer_idx_list, pos_list, model_inputs):
     for layer_idx in layer_iter:
         t0 = time.time()
         layer_iter.set_postfix(layer=int(layer_idx))
+        if layer_idx < FULL_ATTENTION_LAYERS:
+            layer_budget_stats = _full_attention_stats(
+                n_heads=ctx.model_config.num_attention_heads,
+                pos_list=pos_list,
+            )
+            budget_stats[int(layer_idx)] = _summarize_budget(
+                layer_budget_stats, seq_len=args.seq_len
+            )
+            _merge_stats(aggregate_stats, layer_budget_stats)
+            tqdm.write(
+                f"[eps={eps:g}] layer {layer_idx} uses full attention; "
+                f"mean budget visible="
+                f"{budget_stats[int(layer_idx)]['mean_budget_visible']:.6f}"
+            )
+            continue
+
         artifacts = capture_layer_artifacts(
             ctx=ctx,
             layer_idx=layer_idx,
@@ -511,12 +543,18 @@ def run_for_eps(ctx, args, eps, layer_idx_list, pos_list, model_inputs):
         if torch.cuda.is_available() and str(ctx.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
-    logits = run_with_multilayer_patches(
-        ctx=ctx,
-        layer_to_patch=layer_to_patch,
-        pos_list=pos_list,
-        model_inputs=model_inputs,
-    )
+    if layer_to_patch:
+        logits = run_with_multilayer_patches(
+            ctx=ctx,
+            layer_to_patch=layer_to_patch,
+            pos_list=pos_list,
+            model_inputs=model_inputs,
+        )
+    else:
+        with torch.no_grad():
+            logits = ctx.model(
+                **model_inputs, use_cache=False
+            ).logits[:, pos_list, :].float()
     return logits, layer_to_patch, {
         "aggregate": _summarize_budget(aggregate_stats, seq_len=args.seq_len),
         "by_layer": budget_stats,
@@ -556,6 +594,11 @@ def main():
         "config": vars(args),
         "block_size": int(args.block_size),
         "layers": layer_idx_list,
+        "full_attention_layers": [
+            layer_idx
+            for layer_idx in layer_idx_list
+            if layer_idx < FULL_ATTENTION_LAYERS
+        ],
         "teacher_nll": teacher_nll,
         "teacher_ppl": teacher_ppl,
         "eps": {},

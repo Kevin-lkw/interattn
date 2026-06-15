@@ -13,6 +13,7 @@ import copy
 import math
 import os
 import time
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
@@ -67,7 +68,7 @@ def parse_args():
         "--budgets",
         type=float,
         nargs="+",
-        default=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+        default=[0.05, 0.1, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 1.0],
         help=(
             "Token-budget fractions of seq_len. Each value is rounded up to a "
             "whole number of pages."
@@ -99,18 +100,18 @@ def parse_args():
 
 def _resolve_output_dir(args):
     if args.output_dir is not None:
-        out_dir = args.output_dir
+        out_dir = Path(args.output_dir)
     else:
         sample_tag = f"{args.dataset}_{args.eval_start}"
-        out_dir = os.path.join(
-            "..",
-            "result",
-            sample_tag,
-            "quest_runner",
-            f"page_size={args.page_size}",
+        out_dir = (
+            Path(__file__).resolve().parents[2]
+            / "result"
+            / sample_tag
+            / "quest_runner"
+            / f"page_size={args.page_size}"
         )
-    os.makedirs(out_dir, exist_ok=True)
-    return out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return str(out_dir)
 
 
 def _resolve_page_budget(seq_len, budget, page_size):

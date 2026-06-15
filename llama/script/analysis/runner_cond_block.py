@@ -12,6 +12,7 @@ import math
 import os
 import time
 
+import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
 
@@ -68,7 +69,7 @@ def parse_args():
         "--eps",
         type=float,
         nargs="+",
-        default=[0.1, 1.0, 5.0],
+        default=[0.01, 0.05, 0.1, 0.25 ,0.5],
         help="Condition thresholds. Clusters with condition > eps use full attention.",
     )
     parser.add_argument(
@@ -99,10 +100,11 @@ def parse_args():
 
 def _resolve_output_dir(args):
     if args.output_dir is not None:
-        out_dir = args.output_dir
+        base_dir = args.output_dir
     else:
         sample_tag = f"{args.dataset}_{args.eval_start}"
-        out_dir = os.path.join("..", "result", sample_tag, "condition_block_runner")
+        base_dir = os.path.join("..", "result", sample_tag, "condition_block_runner")
+    out_dir = os.path.join(base_dir, f"budget={args.budget:g}")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -419,6 +421,51 @@ def _merge_stats(total, add):
         total[key] = int(total.get(key, 0)) + int(value)
 
 
+def plot_ppl_vs_budget_from_summary(summary_path, out_path=None):
+    summary = torch.load(summary_path, map_location="cpu")
+    if out_path is None:
+        out_path = os.path.join(
+            os.path.dirname(summary_path), "ppl_vs_equiv_budget_causal.png"
+        )
+
+    points = []
+    for eps, eps_summary in summary.get("eps", {}).items():
+        budget = eps_summary["budget"]["aggregate"]["mean_budget_causal"]
+        ppl = eps_summary["metrics"]["student_ppl"]
+        points.append((float(budget), float(ppl), float(eps)))
+
+    if not points:
+        raise ValueError(f"No eps results found in summary: {summary_path}")
+
+    points.sort(key=lambda item: item[0])
+    xs = [item[0] for item in points]
+    ys = [item[1] for item in points]
+
+    fig, ax = plt.subplots(figsize=(6.2, 4.2), constrained_layout=True)
+    ax.plot(xs, ys, marker="o", linewidth=1.4, color="#2563eb")
+    for x, y, eps in points:
+        ax.annotate(
+            f"eps={eps:g}",
+            (x, y),
+            textcoords="offset points",
+            xytext=(5, 5),
+            fontsize=8,
+        )
+    teacher_ppl = summary.get("teacher_ppl")
+    if teacher_ppl is not None:
+        ax.axhline(float(teacher_ppl), color="#6b7280", linestyle="--", linewidth=1.0)
+        ax.text(xs[0], float(teacher_ppl), "teacher", va="bottom", fontsize=8)
+
+    ax.set_xlabel("equiv_budget_causal")
+    ax.set_ylabel("PPL")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.24)
+    ax.set_title("PPL vs equiv budget causal")
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
+
 def run_for_eps(ctx, args, eps, layer_idx_list, pos_list, model_inputs):
     layer_to_patch = {}
     budget_stats = {}
@@ -551,6 +598,8 @@ def main():
     summary_path = os.path.join(output_dir, "runner_cond_block_summary.pt")
     torch.save(summary, summary_path)
     print(f"Saved summary to: {summary_path}")
+    plot_path = plot_ppl_vs_budget_from_summary(summary_path)
+    print(f"Saved PPL vs budget plot to: {plot_path}")
 
 
 if __name__ == "__main__":

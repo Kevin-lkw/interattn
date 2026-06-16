@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import torch
+from torch.nn import functional as F
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ..attention import build_qk_routing_alpha, gen_mask
@@ -210,6 +212,104 @@ def run_routing_method(
     )
 
 
+def run_attention_topk_method(
+    *,
+    ctx,
+    budget,
+    full_attention_layers,
+    seq_len,
+    pos_list,
+    model_inputs,
+):
+    if math.isclose(float(budget), 1.0):
+        with torch.no_grad():
+            logits = ctx.model(
+                **model_inputs, use_cache=False
+            ).logits[:, pos_list, :].float()
+        return logits, 1.0
+
+    patches = {}
+    for layer_idx in range(ctx.model_config.num_hidden_layers):
+        if layer_idx < full_attention_layers:
+            continue
+        artifacts = capture_layer_artifacts(
+            ctx=ctx,
+            layer_idx=layer_idx,
+            pos_list=pos_list,
+            model_inputs=model_inputs,
+            layer_to_patch=patches,
+        )
+        layer_ctx = build_runtime_layer_ctx(ctx, layer_idx, artifacts)
+        alpha = build_attention_topk_alpha_from_artifacts(
+            artifacts=artifacts,
+            pos_list=pos_list,
+            budget=budget,
+            seq_len=seq_len,
+            device=ctx.device,
+        )
+        patches[layer_idx] = build_modified_attn_hidden(
+            ctx=layer_ctx,
+            layer_idx=layer_idx,
+            head_idx=list(range(ctx.model_config.num_attention_heads)),
+            pos_list=pos_list,
+            alpha=alpha,
+            device=ctx.device,
+        )
+        del artifacts, layer_ctx, alpha
+        if torch.cuda.is_available() and str(ctx.device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    logits = run_with_multilayer_patches(
+        ctx=ctx,
+        layer_to_patch=patches,
+        pos_list=pos_list,
+        model_inputs=model_inputs,
+    )
+    return logits, effective_causal_budget(
+        seq_len=seq_len,
+        budget=budget,
+        num_layers=ctx.model_config.num_hidden_layers,
+        full_attention_layers=full_attention_layers,
+    )
+
+
+def build_attention_topk_alpha_from_artifacts(
+    *,
+    artifacts,
+    pos_list,
+    budget,
+    seq_len,
+    device,
+):
+    q_all = artifacts["q"].to(device)[0].float()
+    k_all = artifacts["k"].to(device)[0].float()
+    pos_tensor = torch.tensor(pos_list, device=device, dtype=torch.long)
+    q_pos = q_all[:, pos_tensor, :]
+    scale = math.sqrt(q_all.shape[-1])
+    qk_logits = torch.einsum("hqd,hkd->hqk", q_pos, k_all) / scale
+
+    key_idx = torch.arange(seq_len, device=device)
+    causal = key_idx.view(1, 1, seq_len) <= pos_tensor.view(1, -1, 1)
+    visible = max(1, int(seq_len * budget))
+
+    if visible >= seq_len:
+        selected = causal.expand(qk_logits.shape[0], -1, -1)
+    else:
+        masked_logits = qk_logits.masked_fill(~causal, float("-inf"))
+        topk_idx = torch.topk(
+            masked_logits,
+            k=visible,
+            dim=-1,
+            largest=True,
+        ).indices
+        selected = torch.zeros_like(qk_logits, dtype=torch.bool)
+        selected.scatter_(dim=-1, index=topk_idx, value=True)
+        selected &= causal
+
+    alpha_logits = qk_logits.masked_fill(~selected, float("-inf"))
+    return F.softmax(alpha_logits, dim=-1)
+
+
 def effective_causal_budget(seq_len, budget, num_layers, full_attention_layers):
     visible = int(seq_len * budget)
     total_available = seq_len * (seq_len + 1) // 2
@@ -359,11 +459,19 @@ def run_multisample(args, method, settings, evaluate_sample, setting_label):
     summary = load_or_create_summary(summary_path, method, args, settings)
 
     model, tokenizer, encoded, dtype, starts = load_model_and_tokens(args)
-    for sample_idx, start in enumerate(starts):
+    sample_iter = tqdm(
+        list(enumerate(starts)),
+        total=len(starts),
+        desc=f"{method} samples",
+        unit="sample",
+        dynamic_ncols=True,
+    )
+    for sample_idx, start in sample_iter:
         sample_key = int(sample_idx)
         if sample_key in summary["samples"]:
-            print(f"[skip] sample={sample_idx} start={start}")
+            sample_iter.set_postfix(sample=sample_idx, start=start, status="skip")
             continue
+        sample_iter.set_postfix(sample=sample_idx, start=start, status="run")
         ctx = build_sample_context(
             model=model,
             tokenizer=tokenizer,

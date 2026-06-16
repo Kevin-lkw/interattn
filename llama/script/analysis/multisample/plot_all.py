@@ -14,6 +14,10 @@ METHODS = [
     ("quest", "QUEST", "D", "#9333ea"),
 ]
 
+SKIP_LOWEST_SETTINGS = {
+    "quest": 2,
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -26,6 +30,11 @@ def parse_args():
         type=int,
         default=100,
         help="Require at least this many completed samples for every method.",
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Plot methods even when they have fewer than --require-samples samples.",
     )
     return parser.parse_args()
 
@@ -41,10 +50,16 @@ def main():
         summary = torch.load(path, map_location="cpu", weights_only=False)
         completed = int(summary["aggregate"]["num_completed_samples"])
         if completed < args.require_samples:
-            raise ValueError(
-                f"{method} has only {completed} completed samples; "
-                f"{args.require_samples} required."
+            if not args.allow_partial:
+                raise ValueError(
+                    f"{method} has only {completed} completed samples; "
+                    f"{args.require_samples} required."
+                )
+            print(
+                f"Warning: plotting partial result for {method}: "
+                f"{completed}/{args.require_samples} samples."
             )
+        plot_label = f"{label} (n={completed})" if args.allow_partial else label
         points = sorted(
             (
                 float(record["mean_measured_budget"]),
@@ -53,7 +68,10 @@ def main():
             )
             for setting, record in summary["aggregate"]["settings"].items()
         )
-        loaded.append((label, marker, color, points, summary))
+        skip_lowest = SKIP_LOWEST_SETTINGS.get(method, 0)
+        if skip_lowest:
+            points = points[skip_lowest:]
+        loaded.append((plot_label, marker, color, points, summary))
 
     fig, ax = plt.subplots(figsize=(7.4, 4.9), constrained_layout=True)
     for label, marker, color, points, _summary in loaded:
@@ -75,7 +93,10 @@ def main():
             linewidth=1.0,
             label="Full-attention mean PPL",
         )
-    ax.set_title(f"WikiText-2: mean PPL over {args.require_samples} samples")
+    if args.allow_partial:
+        ax.set_title("WikiText-2: mean PPL over available samples")
+    else:
+        ax.set_title(f"WikiText-2: mean PPL over {args.require_samples} samples")
     ax.set_xlabel("Mean equivalent causal attention budget")
     ax.set_ylabel("Mean sample PPL")
     ax.set_yscale("log")

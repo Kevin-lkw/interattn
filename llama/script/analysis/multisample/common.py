@@ -21,18 +21,25 @@ from ..runner_utils import build_prompt, mean_nll_and_ppl, set_seed, str_to_torc
 from ..sanity import (
     build_modified_attn_hidden,
     compute_metrics,
+    expand_kv_to_query_heads,
     get_tail_labels,
     move_model_inputs_to_device,
 )
 
 
-DEFAULT_OUTPUT_ROOT = (
-    Path(__file__).resolve().parents[3] / "result" / "wikitext_n100"
-)
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
+DEFAULT_RESULT_ROOT = Path(__file__).resolve().parents[3] / "result"
+
+
+def model_output_name(model):
+    return str(model).rstrip("/").split("/")[-1]
+
+
+DEFAULT_OUTPUT_ROOT = DEFAULT_RESULT_ROOT / model_output_name(DEFAULT_MODEL) / "wikitext_n100"
 
 
 def add_common_args(parser):
-    parser.add_argument("--model", default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--dataset", default="wikitext")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -50,7 +57,7 @@ def add_common_args(parser):
         help="Token distance between windows. Defaults to seq_len.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", type=Path, default=None)
     return parser
 
 
@@ -65,6 +72,8 @@ def validate_common_args(args):
         args.sample_stride = args.seq_len
     if args.sample_stride <= 0:
         raise ValueError("--sample-stride must be > 0")
+    if args.output_root is None:
+        args.output_root = DEFAULT_RESULT_ROOT / model_output_name(args.model) / "wikitext_n100"
     return args
 
 
@@ -246,6 +255,7 @@ def run_attention_topk_method(
             budget=budget,
             seq_len=seq_len,
             device=ctx.device,
+            model_config=ctx.model_config,
         )
         patches[layer_idx] = build_modified_attn_hidden(
             ctx=layer_ctx,
@@ -280,9 +290,11 @@ def build_attention_topk_alpha_from_artifacts(
     budget,
     seq_len,
     device,
+    model_config=None,
 ):
     q_all = artifacts["q"].to(device)[0].float()
     k_all = artifacts["k"].to(device)[0].float()
+    k_all = expand_kv_to_query_heads(k_all, q_all.shape[0], model_config)
     pos_tensor = torch.tensor(pos_list, device=device, dtype=torch.long)
     q_pos = q_all[:, pos_tensor, :]
     scale = math.sqrt(q_all.shape[-1])

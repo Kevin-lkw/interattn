@@ -9,7 +9,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Verify that the token stream can provide all requested windows."
     )
-    parser.add_argument("--model", default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--model", default="meta-llama/Llama-3.1-8B")
     parser.add_argument("--dataset", default="wikitext")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--num-samples", type=int, default=100)

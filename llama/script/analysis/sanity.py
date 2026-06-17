@@ -5,6 +5,32 @@ comput NLL and KL
 import torch
 from torch.nn import functional as F
 
+
+def expand_kv_to_query_heads(kv, num_query_heads, model_config=None):
+    """Expand GQA K/V heads to query-head layout when needed."""
+    num_kv_heads = kv.shape[0]
+    if num_kv_heads == num_query_heads:
+        return kv
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"Cannot map {num_kv_heads} K/V heads to {num_query_heads} query heads."
+        )
+    if model_config is not None:
+        config_kv_heads = getattr(model_config, "num_key_value_heads", num_kv_heads)
+        if int(config_kv_heads) != int(num_kv_heads):
+            raise ValueError(
+                "Captured K/V head count does not match model config: "
+                f"captured={num_kv_heads}, config={config_kv_heads}."
+            )
+    return kv.repeat_interleave(num_query_heads // num_kv_heads, dim=0)
+
+
+def select_kv_for_query_heads(kv, head_idx, model_config=None):
+    num_query_heads = getattr(model_config, "num_attention_heads", None)
+    if num_query_heads is None:
+        num_query_heads = max(head_idx) + 1 if head_idx else kv.shape[0]
+    return expand_kv_to_query_heads(kv, int(num_query_heads), model_config)[head_idx]
+
 def compute_metrics(ref_tail_logits, student_tail_logits, labels, unbiased=False):
     # [*, vocab]
     p_teacher = F.softmax(ref_tail_logits, dim=-1)
@@ -65,7 +91,11 @@ def build_modified_attn_hidden(ctx, layer_idx, head_idx, pos_list, alpha, device
     with torch.no_grad():
         layer = ctx.model.model.layers[layer_idx]
         original = ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(device)
-        V_head = ctx.rope_qkv[layer_idx]["v"].to(device)[0][head_idx]
+        V_head = select_kv_for_query_heads(
+            ctx.rope_qkv[layer_idx]["v"].to(device)[0],
+            head_idx,
+            ctx.model_config,
+        )
 
         V_new = alpha.detach().to(device) @ V_head.float()
         output = original.clone()

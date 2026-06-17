@@ -4,6 +4,8 @@ import time
 import torch
 from torch.nn import functional as F
 
+from .sanity import expand_kv_to_query_heads
+
 
 def get_attention_map_after_rope(ctx, layer_idx, causal=True, dtype=None, device=None):
     """
@@ -20,7 +22,8 @@ def get_attention_map_after_rope(ctx, layer_idx, causal=True, dtype=None, device
     K = ctx.rope_qkv[layer_idx]["k"]  # [B, nh, seq, hd]
 
     q = Q[0].to(dtype).to(device)  # [nh, seq, hd]
-    k = K[0].to(dtype).to(device)  # [nh, seq, hd]
+    k = K[0].to(dtype).to(device)  # [n_kv_heads, seq, hd]
+    k = expand_kv_to_query_heads(k, q.shape[0], ctx.model_config)
 
     hd = q.shape[-1]
     scores = (q @ k.transpose(-1, -2)) / math.sqrt(hd)  # [nh, seq, seq]

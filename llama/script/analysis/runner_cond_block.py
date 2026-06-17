@@ -30,14 +30,23 @@ from .runner_utils import (
     set_seed,
     str_to_torch_dtype,
 )
-from .sanity import compute_metrics, get_tail_labels, move_model_inputs_to_device
+from .sanity import (
+    compute_metrics,
+    expand_kv_to_query_heads,
+    get_tail_labels,
+    move_model_inputs_to_device,
+)
+
+
+def _model_output_name(model):
+    return str(model).rstrip("/").split("/")[-1]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run condition-thresholded block hybrid attention for all layers."
     )
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B")
     parser.add_argument("--dataset", type=str, default="wikitext")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument(
@@ -112,7 +121,13 @@ def _resolve_output_dir(args):
         base_dir = args.output_dir
     else:
         sample_tag = f"{args.dataset}_{args.eval_start}"
-        base_dir = os.path.join("..", "result", sample_tag, "condition_block_runner")
+        base_dir = os.path.join(
+            "..",
+            "result",
+            _model_output_name(args.model),
+            sample_tag,
+            "condition_block_runner",
+        )
     out_dir = os.path.join(base_dir, f"budget={args.budget:g}")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
@@ -379,11 +394,8 @@ def build_condition_block_patch(
 
     n_heads = q_all.shape[0]
     n_pos = len(pos_list)
-    if k_all.shape[0] != n_heads or v_all.shape[0] != n_heads:
-        raise ValueError(
-            "Batched condition-block runner expects K/V heads to match Q heads. "
-            f"Got q={q_all.shape[0]}, k={k_all.shape[0]}, v={v_all.shape[0]}."
-        )
+    k_all = expand_kv_to_query_heads(k_all, n_heads, ctx.model_config)
+    v_all = expand_kv_to_query_heads(v_all, n_heads, ctx.model_config)
     prefix = _build_block_prefix_tensors(k_all, v_all, block_size)
     pos_tensor = torch.tensor(pos_list, device=ctx.device, dtype=torch.long)
     q_pos = q_all[:, pos_tensor, :].float()

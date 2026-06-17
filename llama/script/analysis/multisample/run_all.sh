@@ -6,10 +6,12 @@ LLAMA_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 GPU_ID="${GPU_ID:-7}"
 CONDA_ENV="${CONDA_ENV:-nanogpt}"
+MODEL="${MODEL:-meta-llama/Llama-3.1-8B}"
+MODEL_NAME="${MODEL_NAME:-${MODEL##*/}}"
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 SEQ_LEN="${SEQ_LEN:-1024}"
 SAMPLE_STRIDE="${SAMPLE_STRIDE:-${SEQ_LEN}}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${LLAMA_DIR}/result/wikitext_n100}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${LLAMA_DIR}/result/${MODEL_NAME}/wikitext_n100}"
 LOG_DIR="${OUTPUT_ROOT}/logs"
 
 mkdir -p "${LOG_DIR}"
@@ -28,6 +30,7 @@ run_method() {
   echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Starting ${module}"
   run_python -m "${module}" \
     --device cuda:0 \
+    --model "${MODEL}" \
     --num-samples "${NUM_SAMPLES}" \
     --seq-len "${SEQ_LEN}" \
     --sample-stride "${SAMPLE_STRIDE}" \
@@ -38,12 +41,14 @@ run_method() {
 
 echo "GPU_ID=${GPU_ID}"
 echo "CONDA_ENV=${CONDA_ENV}"
+echo "MODEL=${MODEL}"
 echo "NUM_SAMPLES=${NUM_SAMPLES}"
 echo "SEQ_LEN=${SEQ_LEN}"
 echo "SAMPLE_STRIDE=${SAMPLE_STRIDE}"
 echo "OUTPUT_ROOT=${OUTPUT_ROOT}"
 
 run_python -m script.analysis.multisample.verify_dataset \
+  --model "${MODEL}" \
   --num-samples "${NUM_SAMPLES}" \
   --seq-len "${SEQ_LEN}" \
   --sample-stride "${SAMPLE_STRIDE}" \

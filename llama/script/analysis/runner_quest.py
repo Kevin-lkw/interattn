@@ -31,17 +31,26 @@ from .runner_utils import (
     set_seed,
     str_to_torch_dtype,
 )
-from .sanity import compute_metrics, get_tail_labels, move_model_inputs_to_device
+from .sanity import (
+    compute_metrics,
+    expand_kv_to_query_heads,
+    get_tail_labels,
+    move_model_inputs_to_device,
+)
 
 
 FULL_ATTENTION_LAYERS = 2
+
+
+def _model_output_name(model):
+    return str(model).rstrip("/").split("/")[-1]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run the QUEST query-aware page selection baseline."
     )
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B")
     parser.add_argument("--dataset", type=str, default="wikitext")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument(
@@ -106,6 +115,7 @@ def _resolve_output_dir(args):
         out_dir = (
             Path(__file__).resolve().parents[2]
             / "result"
+            / _model_output_name(args.model)
             / sample_tag
             / "quest_runner"
             / f"page_size={args.page_size}"
@@ -247,11 +257,8 @@ def build_quest_patch(
 
     n_heads = q_all.shape[0]
     n_pos = len(pos_list)
-    if k_all.shape[0] != n_heads or v_all.shape[0] != n_heads:
-        raise ValueError(
-            "QUEST runner expects K/V heads to match Q heads. "
-            f"Got q={q_all.shape[0]}, k={k_all.shape[0]}, v={v_all.shape[0]}."
-        )
+    k_all = expand_kv_to_query_heads(k_all, n_heads, ctx.model_config)
+    v_all = expand_kv_to_query_heads(v_all, n_heads, ctx.model_config)
 
     metadata = _build_page_metadata(k_all, v_all, page_size)
     pos_tensor = torch.tensor(pos_list, device=ctx.device, dtype=torch.long)

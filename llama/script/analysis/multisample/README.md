@@ -20,7 +20,7 @@ GPU_ID=7 bash script/analysis/multisample/run_all.sh
 ```
 
 This command is suitable for a tmux session. Per-method logs are written to
-`result/wikitext_n100/logs/`. Re-running the command resumes completed methods
+`result/<model>/wikitext_n100/logs/`. Re-running the command resumes completed methods
 from their per-sample checkpoints.
 
 Run from the `llama` directory:
@@ -42,9 +42,9 @@ CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
 Default outputs:
 
 ```text
-result/wikitext_n100/<method>/summary.pt
-result/wikitext_n100/<method>/mean_ppl_vs_budget.png
-result/wikitext_n100/all_methods_mean_ppl_vs_budget.png
+result/<model>/wikitext_n100/<method>/summary.pt
+result/<model>/wikitext_n100/<method>/mean_ppl_vs_budget.png
+result/<model>/wikitext_n100/all_methods_mean_ppl_vs_budget.png
 ```
 
 `summary.pt` contains every sample's NLL/PPL and aggregate statistics:

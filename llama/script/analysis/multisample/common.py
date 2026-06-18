@@ -21,7 +21,7 @@ from ..runner_utils import build_prompt, mean_nll_and_ppl, set_seed, str_to_torc
 from ..sanity import (
     build_modified_attn_hidden,
     compute_metrics,
-    expand_kv_to_query_heads,
+    grouped_query_heads,
     get_tail_labels,
     move_model_inputs_to_device,
 )
@@ -294,11 +294,25 @@ def build_attention_topk_alpha_from_artifacts(
 ):
     q_all = artifacts["q"].to(device)[0].float()
     k_all = artifacts["k"].to(device)[0].float()
-    k_all = expand_kv_to_query_heads(k_all, q_all.shape[0], model_config)
     pos_tensor = torch.tensor(pos_list, device=device, dtype=torch.long)
     q_pos = q_all[:, pos_tensor, :]
     scale = math.sqrt(q_all.shape[-1])
-    qk_logits = torch.einsum("hqd,hkd->hqk", q_pos, k_all) / scale
+    qk_logits = torch.empty(
+        q_all.shape[0],
+        len(pos_list),
+        seq_len,
+        device=device,
+        dtype=torch.float32,
+    )
+    groups = grouped_query_heads(
+        list(range(q_all.shape[0])),
+        model_config,
+        num_kv_heads=k_all.shape[0],
+    )
+    for kv_head, out_indices, query_heads in groups:
+        qk_logits[out_indices] = (
+            torch.einsum("hqd,kd->hqk", q_pos[query_heads], k_all[kv_head]) / scale
+        )
 
     key_idx = torch.arange(seq_len, device=device)
     causal = key_idx.view(1, 1, seq_len) <= pos_tensor.view(1, -1, 1)
@@ -307,15 +321,23 @@ def build_attention_topk_alpha_from_artifacts(
     if visible >= seq_len:
         selected = causal.expand(qk_logits.shape[0], -1, -1)
     else:
-        masked_logits = qk_logits.masked_fill(~causal, float("-inf"))
-        topk_idx = torch.topk(
-            masked_logits,
-            k=visible,
-            dim=-1,
-            largest=True,
-        ).indices
         selected = torch.zeros_like(qk_logits, dtype=torch.bool)
-        selected.scatter_(dim=-1, index=topk_idx, value=True)
+        for _kv_head, out_indices, _query_heads in groups:
+            group_logits = qk_logits[out_indices]
+            select_logits = group_logits.mean(dim=0).masked_fill(
+                ~causal[0],
+                float("-inf"),
+            )
+            topk_idx = torch.topk(
+                select_logits,
+                k=visible,
+                dim=-1,
+                largest=True,
+            ).indices
+            group_selected = torch.zeros_like(select_logits, dtype=torch.bool)
+            group_selected.scatter_(dim=-1, index=topk_idx, value=True)
+            for out_idx in out_indices:
+                selected[out_idx] = group_selected
         selected &= causal
 
     alpha_logits = qk_logits.masked_fill(~selected, float("-inf"))

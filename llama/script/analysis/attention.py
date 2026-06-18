@@ -4,7 +4,11 @@ import time
 import torch
 from torch.nn import functional as F
 
-from .sanity import expand_kv_to_query_heads
+from .sanity import (
+    expand_kv_to_query_heads,
+    grouped_query_heads,
+    select_kv_for_query_heads,
+)
 
 
 def get_attention_map_after_rope(ctx, layer_idx, causal=True, dtype=None, device=None):
@@ -73,7 +77,11 @@ def optimize_alpha_star(
     # constant part
     residual_attn_in = ctx.layer_input[layer_idx][0, pos_list].to(device)  # [n_pos, hidden_size]
     original = ctx.attn_output[layer_idx]["output"][0, pos_list].permute(1, 0, 2).to(device)  # [nh, n_pos, hd]
-    V_head = ctx.rope_qkv[layer_idx]["v"].to(device)[0][head_idx]  # [nh, seq, hd]
+    V_head = select_kv_for_query_heads(
+        ctx.rope_qkv[layer_idx]["v"].to(device)[0],
+        head_idx,
+        ctx.model_config,
+    )  # [nh, seq, hd]
     layer = ctx.model.model.layers[layer_idx]
 
     if V_head.shape[1] != seq_len:
@@ -161,14 +169,30 @@ def build_qk_routing_alpha(ctx, layer_idx, head_idx, pos_list, mask, device=None
     if isinstance(head_idx, int):
         head_idx = [head_idx]
 
-    qk_scores, _ = get_attention_map_after_rope(
-        ctx,
-        layer_idx,
-        causal=True,
-        dtype=torch.float32,
+    q_all = ctx.rope_qkv[layer_idx]["q"].to(device=device, dtype=torch.float32)[0]
+    k_all = ctx.rope_qkv[layer_idx]["k"].to(device=device, dtype=torch.float32)[0]
+    pos_tensor = torch.tensor(pos_list, device=device, dtype=torch.long)
+    qk_logits = torch.empty(
+        len(head_idx),
+        len(pos_list),
+        k_all.shape[1],
         device=device,
+        dtype=torch.float32,
     )
-    qk_logits = qk_scores[head_idx][:, pos_list, :].to(torch.float32)
+    scale = math.sqrt(q_all.shape[-1])
+    for kv_head, out_indices, query_heads in grouped_query_heads(
+        head_idx,
+        ctx.model_config,
+        num_kv_heads=k_all.shape[0],
+    ):
+        qk_logits[out_indices] = (
+            torch.einsum(
+                "hqd,kd->hqk",
+                q_all[query_heads][:, pos_tensor, :],
+                k_all[kv_head],
+            )
+            / scale
+        )
     if qk_logits.shape != mask.shape:
         raise ValueError(
             f"Baseline QK logits shape {qk_logits.shape} does not match mask shape {mask.shape}."
@@ -522,29 +546,36 @@ def gen_mask(
         mask = mask.unsqueeze(0).expand(len(head_idx), -1, -1)  # [nh, n_pos, seq_len]
 
     elif strategy == "attention_topk":
-        attention_unnormalize, _ = get_attention_map_after_rope(
-            ctx, layer_idx, causal=True, dtype=ctx.dtype, device=device
-        )
+        q_all = ctx.rope_qkv[layer_idx]["q"].to(device=device, dtype=torch.float32)[0]
+        k_all = ctx.rope_qkv[layer_idx]["k"].to(device=device, dtype=torch.float32)[0]
         mask = torch.zeros(len(head_idx), len(pos_list), seq_len, device=device)
-        for out_h, head in enumerate(head_idx):
-            attention_score_head = attention_unnormalize[head]  # [seq, seq]
+        scale = math.sqrt(q_all.shape[-1])
+        for kv_head, out_indices, query_heads in grouped_query_heads(
+            head_idx,
+            ctx.model_config,
+            num_kv_heads=k_all.shape[0],
+        ):
+            q_group = q_all[query_heads]
+            k_head = k_all[kv_head]
+            group_scores = torch.matmul(q_group, k_head.transpose(-1, -2)) / scale
+            score_for_select = group_scores.mean(dim=0)
             for i, pos in enumerate(pos_list):
                 total_available = pos + 1
                 if total_available > visible:
                     topk = torch.topk(
-                        attention_score_head[pos, :total_available], k=visible, largest=True
+                        score_for_select[pos, :total_available],
+                        k=visible,
+                        largest=True,
                     ).indices
                     idx_list = topk.tolist()
                     mask_list = list(set(range(total_available)) - set(idx_list))
-                    mask[out_h, i, mask_list] = float("-inf")
+                    for out_idx in out_indices:
+                        mask[out_idx, i, mask_list] = float("-inf")
 
     elif strategy == "h2o":
         recent_budget = visible // 2
-        hh_budget = visible - recent_budget
-
-        _, attention_score = get_attention_map_after_rope(
-            ctx, layer_idx, causal=True, dtype=ctx.dtype, device=device
-        )
+        q_all = ctx.rope_qkv[layer_idx]["q"].to(device=device, dtype=torch.float32)[0]
+        k_all = ctx.rope_qkv[layer_idx]["k"].to(device=device, dtype=torch.float32)[0]
 
         num_out_heads = len(head_idx)
         num_pos = len(pos_list)
@@ -553,9 +584,22 @@ def gen_mask(
         mask = torch.zeros(num_out_heads, num_pos, seq_len, device=device)
 
         t1 = time.time()
+        scale = math.sqrt(q_all.shape[-1])
 
-        for out_h, head in enumerate(head_idx):
-            attn = attention_score[head]  # [seq_len, seq_len]
+        for kv_head, out_indices, query_heads in grouped_query_heads(
+            head_idx,
+            ctx.model_config,
+            num_kv_heads=k_all.shape[0],
+        ):
+            q_group = q_all[query_heads]
+            k_head = k_all[kv_head]
+            scores = torch.matmul(q_group, k_head.transpose(-1, -2)) / scale
+            causal = torch.triu(
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+                diagonal=1,
+            )
+            attn = torch.softmax(scores.masked_fill(causal.unsqueeze(0), float("-inf")), dim=-1)
+            attn = attn.mean(dim=0)
 
             # accumulated attention score for each token j
             acc = torch.zeros(seq_len, device=device)
@@ -576,14 +620,15 @@ def gen_mask(
                     
                     recent_start = max(0, total_available - recent_budget)
                     hh_idx = cache_idx[cache_idx < recent_start]
-                    assert len(hh_idx) > 0, f"No tokens in hh_idx for head {head} at position {pos} with recent_start {recent_start}"
+                    assert len(hh_idx) > 0, f"No tokens in hh_idx for kv_head {kv_head} at position {pos} with recent_start {recent_start}"
                     victim_local = torch.argmin(acc[hh_idx])
                     victim = hh_idx[victim_local]
 
                     in_cache[victim] = False
 
                 invisible_now = ~in_cache[:total_available]
-                mask[out_h, i, :total_available][invisible_now] = float("-inf")
+                for out_idx in out_indices:
+                    mask[out_idx, i, :total_available][invisible_now] = float("-inf")
 
         t2 = time.time()
         print(f"[h2o_paper] mask build time: {t2 - t1:.4f}s")

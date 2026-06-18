@@ -11,6 +11,7 @@ import torch
 from torch.nn import functional as F
 
 from analysis.config import set_seed, str_to_torch_dtype
+from analysis.sanity import expand_kv_to_query_heads
 
 
 def parse_args():
@@ -125,7 +126,16 @@ def resolve_output_dir(args, layer):
         if args.layers is not None:
             output_dir = os.path.join(output_dir, f"layer{layer}")
     else:
-        output_dir = f"../result/{args.dataset}_{args.start}/analyse_attention_importance/layer{layer}"
+        model_name = str(args.model).rstrip("/").split("/")[-1]
+        llama_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_dir = os.path.join(
+            llama_dir,
+            "result",
+            model_name,
+            f"{args.dataset}_{args.start}",
+            "analyse_attention_importance",
+            f"layer{layer}",
+        )
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -134,9 +144,19 @@ def mass_tag(level):
     return f"m{int(round(level * 1000)):03d}"
 
 
-def compute_attention_alpha(q_all, k_all, heads, pos_list, device):
+def query_to_kv_heads(heads, num_query_heads, num_kv_heads):
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"Cannot map {num_query_heads} query heads to {num_kv_heads} KV heads."
+        )
+    group_size = num_query_heads // num_kv_heads
+    return {int(head): int(head) // group_size for head in heads}
+
+
+def compute_attention_alpha(q_all, k_all, heads, pos_list, device, model_config):
     q = q_all[0, heads][:, pos_list, :].to(device=device, dtype=torch.float32)
-    k = k_all[0, heads].to(device=device, dtype=torch.float32)
+    k = k_all[0].to(device=device, dtype=torch.float32)
+    k = expand_kv_to_query_heads(k, q_all.shape[1], model_config)[heads]
     scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(q.shape[-1])
 
     seq_len = scores.shape[-1]
@@ -146,15 +166,23 @@ def compute_attention_alpha(q_all, k_all, heads, pos_list, device):
     return F.softmax(scores + causal.unsqueeze(0), dim=-1)
 
 
-def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
+def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels, q_to_kv):
     query_rows = []
     key_rows = []
     summary_rows = []
+    overlap_rows = []
 
     n_heads = len(heads)
     n_levels = len(mass_levels)
     required_k = torch.zeros(n_heads, len(pos_list), n_levels, dtype=torch.long)
     hit_count = torch.zeros(n_heads, n_levels, seq_len, dtype=torch.long)
+    important_mask = torch.zeros(
+        n_heads,
+        n_levels,
+        len(pos_list),
+        seq_len,
+        dtype=torch.bool,
+    )
     visible_count = torch.zeros(len(pos_list), seq_len, dtype=torch.long)
     max_alpha = torch.zeros(n_heads, seq_len, dtype=torch.float32)
     sum_alpha = torch.zeros(n_heads, seq_len, dtype=torch.float32)
@@ -172,6 +200,7 @@ def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
 
             q_row = {
                 "head": int(head),
+                "kv_head": int(q_to_kv[int(head)]),
                 "query_pos": int(pos),
                 "n_keys": int(pos + 1),
                 "entropy": float(entropy.item()),
@@ -186,6 +215,7 @@ def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
                 k_req = min(k_req, pos + 1)
                 required_k[h_ord, i, level_idx] = k_req
                 important_idx = sorted_idx[:k_req]
+                important_mask[h_ord, level_idx, i, important_idx] = True
                 hit_count[h_ord, level_idx, important_idx] += 1
                 tag = mass_tag(level)
                 q_row[f"k_at_{tag}"] = k_req
@@ -201,6 +231,7 @@ def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
                 continue
             row = {
                 "head": int(head),
+                "kv_head": int(q_to_kv[int(head)]),
                 "key_pos": int(key_pos),
                 "visible_queries": n_visible,
                 "max_alpha": float(max_alpha[h_ord, key_pos].item()),
@@ -230,6 +261,7 @@ def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
             summary_rows.append(
                 {
                     "head": int(head),
+                    "kv_head": int(q_to_kv[int(head)]),
                     "mass_level": float(level),
                     "tag": tag,
                     "queries": len(pos_list),
@@ -242,6 +274,65 @@ def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
                     "p95_frac": float(torch.quantile(frac_values, 0.95).item()),
                     "kv_covered": float(covered.mean().item()),
                     "mean_hit_queries_per_visible_key": float(hits[visible].float().mean().item()),
+            }
+        )
+
+    kv_to_head_ords = {}
+    for h_ord, head in enumerate(heads):
+        kv_to_head_ords.setdefault(int(q_to_kv[int(head)]), []).append(h_ord)
+
+    for kv_head, head_ords in sorted(kv_to_head_ords.items()):
+        if len(head_ords) < 2:
+            continue
+        head_labels = [int(heads[h_ord]) for h_ord in head_ords]
+        for level_idx, level in enumerate(mass_levels):
+            tag = mass_tag(level)
+            pair_jaccards = []
+            pair_overlaps = []
+            all_jaccards = []
+            all_intersections = []
+            all_unions = []
+            for i, pos in enumerate(pos_list):
+                masks = important_mask[head_ords, level_idx, i, : pos + 1]
+                intersection = masks.all(dim=0).sum().item()
+                union = masks.any(dim=0).sum().item()
+                all_intersections.append(float(intersection))
+                all_unions.append(float(union))
+                all_jaccards.append(float(intersection / union) if union > 0 else 1.0)
+                for left in range(len(head_ords)):
+                    for right in range(left + 1, len(head_ords)):
+                        a = masks[left]
+                        b = masks[right]
+                        pair_intersection = (a & b).sum().item()
+                        pair_union = (a | b).sum().item()
+                        pair_jaccards.append(
+                            float(pair_intersection / pair_union)
+                            if pair_union > 0
+                            else 1.0
+                        )
+                        min_size = max(min(int(a.sum().item()), int(b.sum().item())), 1)
+                        pair_overlaps.append(float(pair_intersection / min_size))
+
+            pair_jaccards_t = torch.tensor(pair_jaccards, dtype=torch.float32)
+            pair_overlaps_t = torch.tensor(pair_overlaps, dtype=torch.float32)
+            all_jaccards_t = torch.tensor(all_jaccards, dtype=torch.float32)
+            all_intersections_t = torch.tensor(all_intersections, dtype=torch.float32)
+            all_unions_t = torch.tensor(all_unions, dtype=torch.float32)
+            overlap_rows.append(
+                {
+                    "kv_head": int(kv_head),
+                    "q_heads": ",".join(str(x) for x in head_labels),
+                    "mass_level": float(level),
+                    "tag": tag,
+                    "queries": len(pos_list),
+                    "num_q_heads": len(head_ords),
+                    "mean_pair_jaccard": float(pair_jaccards_t.mean().item()),
+                    "median_pair_jaccard": float(torch.quantile(pair_jaccards_t, 0.5).item()),
+                    "p95_pair_jaccard": float(torch.quantile(pair_jaccards_t, 0.95).item()),
+                    "mean_pair_overlap_min": float(pair_overlaps_t.mean().item()),
+                    "mean_all_q_jaccard": float(all_jaccards_t.mean().item()),
+                    "mean_all_q_intersection": float(all_intersections_t.mean().item()),
+                    "mean_all_q_union": float(all_unions_t.mean().item()),
                 }
             )
 
@@ -259,6 +350,7 @@ def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
         summary_rows.append(
             {
                 "head": "all",
+                "kv_head": "all",
                 "mass_level": float(level),
                 "tag": tag,
                 "queries": len(pos_list) * n_heads,
@@ -274,7 +366,16 @@ def summarize_alpha(alpha, heads, pos_list, seq_len, mass_levels):
             }
         )
 
-    return query_rows, key_rows, summary_rows, required_k, hit_count, visible_per_key
+    return (
+        query_rows,
+        key_rows,
+        summary_rows,
+        overlap_rows,
+        required_k,
+        hit_count,
+        visible_per_key,
+        important_mask,
+    )
 
 
 def save_tsv(path, rows, columns):
@@ -370,6 +471,18 @@ def analyze_layer(args, ctx, layer, heads, pos_list, mass_levels, primary, model
         heads=heads,
         pos_list=pos_list,
         device=ctx.device,
+        model_config=ctx.model_config,
+    )
+    q_to_kv = query_to_kv_heads(
+        heads=heads,
+        num_query_heads=int(ctx.model_config.num_attention_heads),
+        num_kv_heads=int(
+            getattr(
+                ctx.model_config,
+                "num_key_value_heads",
+                ctx.model_config.num_attention_heads,
+            )
+        ),
     )
 
     print("Summarizing per-query sparsity and per-key importance hits...")
@@ -377,37 +490,49 @@ def analyze_layer(args, ctx, layer, heads, pos_list, mass_levels, primary, model
         query_rows,
         key_rows,
         summary_rows,
+        overlap_rows,
         required_k,
         hit_count,
         visible_per_key,
+        important_mask,
     ) = summarize_alpha(
         alpha=alpha,
         heads=heads,
         pos_list=pos_list,
         seq_len=input_seq_len,
         mass_levels=mass_levels,
+        q_to_kv=q_to_kv,
     )
 
     output_dir = resolve_output_dir(args, layer)
     query_path = os.path.join(output_dir, "query_required_k.tsv")
     key_path = os.path.join(output_dir, "key_importance_hits.tsv")
     summary_path = os.path.join(output_dir, "summary.tsv")
+    overlap_path = os.path.join(output_dir, "gqa_q_overlap.tsv")
     k_plot_path = os.path.join(output_dir, "query_required_k.png")
     hit_plot_path = os.path.join(output_dir, f"key_hits_{mass_tag(primary)}.png")
     tensor_path = os.path.join(output_dir, "attention_importance_tensors.pt")
 
-    query_columns = ["head", "query_pos", "n_keys", "entropy", "max_alpha"]
+    query_columns = ["head", "kv_head", "query_pos", "n_keys", "entropy", "max_alpha"]
     for level in mass_levels:
         tag = mass_tag(level)
         query_columns += [f"k_at_{tag}", f"frac_at_{tag}"]
 
-    key_columns = ["head", "key_pos", "visible_queries", "max_alpha", "mean_alpha_when_visible"]
+    key_columns = [
+        "head",
+        "kv_head",
+        "key_pos",
+        "visible_queries",
+        "max_alpha",
+        "mean_alpha_when_visible",
+    ]
     for level in mass_levels:
         tag = mass_tag(level)
         key_columns += [f"hit_queries_{tag}", f"hit_ratio_{tag}"]
 
     summary_columns = [
         "head",
+        "kv_head",
         "mass_level",
         "tag",
         "queries",
@@ -421,10 +546,26 @@ def analyze_layer(args, ctx, layer, heads, pos_list, mass_levels, primary, model
         "kv_covered",
         "mean_hit_queries_per_visible_key",
     ]
+    overlap_columns = [
+        "kv_head",
+        "q_heads",
+        "mass_level",
+        "tag",
+        "queries",
+        "num_q_heads",
+        "mean_pair_jaccard",
+        "median_pair_jaccard",
+        "p95_pair_jaccard",
+        "mean_pair_overlap_min",
+        "mean_all_q_jaccard",
+        "mean_all_q_intersection",
+        "mean_all_q_union",
+    ]
 
     save_tsv(query_path, query_rows, query_columns)
     save_tsv(key_path, key_rows, key_columns)
     save_tsv(summary_path, summary_rows, summary_columns)
+    save_tsv(overlap_path, overlap_rows, overlap_columns)
     plot_required_k(k_plot_path, heads, pos_list, mass_levels, required_k, args.plot_dpi)
     plot_key_hits(
         hit_plot_path,
@@ -440,9 +581,11 @@ def analyze_layer(args, ctx, layer, heads, pos_list, mass_levels, primary, model
             "pos_list": pos_list,
             "mass_levels": mass_levels,
             "primary_mass_level": primary,
+            "q_to_kv": q_to_kv,
             "required_k": required_k,
             "hit_count": hit_count,
             "visible_per_key": visible_per_key,
+            "important_mask": important_mask,
         },
         tensor_path,
     )
@@ -458,6 +601,7 @@ def analyze_layer(args, ctx, layer, heads, pos_list, mass_levels, primary, model
     print(f"Saved per-query table to {query_path}")
     print(f"Saved per-key table to {key_path}")
     print(f"Saved summary to {summary_path}")
+    print(f"Saved GQA overlap table to {overlap_path}")
     print(f"Saved plots to {k_plot_path} and {hit_plot_path}")
     print(f"Saved tensors to {tensor_path}")
 

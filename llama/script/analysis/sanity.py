@@ -25,11 +25,57 @@ def expand_kv_to_query_heads(kv, num_query_heads, model_config=None):
     return kv.repeat_interleave(num_query_heads // num_kv_heads, dim=0)
 
 
+def kv_group_size(num_query_heads, num_kv_heads):
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"Cannot map {num_kv_heads} K/V heads to {num_query_heads} query heads."
+        )
+    return num_query_heads // num_kv_heads
+
+
+def kv_head_indices_for_query_heads(head_idx, model_config=None, num_kv_heads=None):
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+    if model_config is None:
+        if num_kv_heads is None:
+            return list(head_idx)
+        num_query_heads = max(head_idx) + 1 if head_idx else num_kv_heads
+    else:
+        num_query_heads = int(getattr(model_config, "num_attention_heads"))
+        if num_kv_heads is None:
+            num_kv_heads = int(getattr(model_config, "num_key_value_heads", num_query_heads))
+    group_size = kv_group_size(num_query_heads, int(num_kv_heads))
+    return [int(head) // group_size for head in head_idx]
+
+
+def grouped_query_heads(head_idx, model_config=None, num_kv_heads=None):
+    if isinstance(head_idx, int):
+        head_idx = [head_idx]
+    kv_indices = kv_head_indices_for_query_heads(head_idx, model_config, num_kv_heads)
+    groups = []
+    current = {}
+    for out_idx, (query_head, kv_head) in enumerate(zip(head_idx, kv_indices)):
+        current.setdefault(int(kv_head), {"out_indices": [], "query_heads": []})
+        current[int(kv_head)]["out_indices"].append(out_idx)
+        current[int(kv_head)]["query_heads"].append(int(query_head))
+    for kv_head in sorted(current):
+        groups.append(
+            (
+                kv_head,
+                current[kv_head]["out_indices"],
+                current[kv_head]["query_heads"],
+            )
+        )
+    return groups
+
+
 def select_kv_for_query_heads(kv, head_idx, model_config=None):
-    num_query_heads = getattr(model_config, "num_attention_heads", None)
-    if num_query_heads is None:
-        num_query_heads = max(head_idx) + 1 if head_idx else kv.shape[0]
-    return expand_kv_to_query_heads(kv, int(num_query_heads), model_config)[head_idx]
+    kv_indices = kv_head_indices_for_query_heads(
+        head_idx,
+        model_config,
+        num_kv_heads=kv.shape[0],
+    )
+    return kv[kv_indices]
 
 def compute_metrics(ref_tail_logits, student_tail_logits, labels, unbiased=False):
     # [*, vocab]

@@ -33,7 +33,7 @@ from .runner_utils import (
 )
 from .sanity import (
     compute_metrics,
-    expand_kv_to_query_heads,
+    grouped_query_heads,
     get_tail_labels,
     move_model_inputs_to_device,
 )
@@ -190,6 +190,7 @@ def _quest_outputs_for_queries(
     metadata,
     page_size,
     page_budget,
+    share_selection_across_heads=False,
 ):
     n_heads, n_query, head_dim = q_pos.shape
     n_pages = metadata["page_starts"].numel()
@@ -213,10 +214,17 @@ def _quest_outputs_for_queries(
     page_scores = page_scores.masked_fill(~page_exists.unsqueeze(0), float("-inf"))
 
     top_k = min(page_budget, n_pages)
-    top_page_idx = torch.topk(page_scores, k=top_k, dim=-1).indices
-    selected_pages = torch.zeros_like(page_scores, dtype=torch.bool)
+    scores_for_select = (
+        page_scores.mean(dim=0, keepdim=True)
+        if share_selection_across_heads
+        else page_scores
+    )
+    top_page_idx = torch.topk(scores_for_select, k=top_k, dim=-1).indices
+    selected_pages = torch.zeros_like(scores_for_select, dtype=torch.bool)
     selected_pages.scatter_(dim=-1, index=top_page_idx, value=True)
-    selected_pages &= page_exists.unsqueeze(0)
+    if share_selection_across_heads:
+        selected_pages = selected_pages.expand(n_heads, -1, -1)
+    selected_pages = selected_pages & page_exists.unsqueeze(0)
 
     token_visible = (
         metadata["valid_token"][None, :, :]
@@ -257,18 +265,33 @@ def build_quest_patch(
 
     n_heads = q_all.shape[0]
     n_pos = len(pos_list)
-    k_all = expand_kv_to_query_heads(k_all, n_heads, ctx.model_config)
-    v_all = expand_kv_to_query_heads(v_all, n_heads, ctx.model_config)
-
-    metadata = _build_page_metadata(k_all, v_all, page_size)
     pos_tensor = torch.tensor(pos_list, device=ctx.device, dtype=torch.long)
-    output, stats = _quest_outputs_for_queries(
-        q_pos=q_all[:, pos_tensor, :].float(),
-        pos_tensor=pos_tensor,
-        metadata=metadata,
-        page_size=page_size,
-        page_budget=page_budget,
+    output = torch.empty(
+        n_heads,
+        n_pos,
+        q_all.shape[-1],
+        device=ctx.device,
+        dtype=torch.float32,
     )
+    stats = {}
+    for kv_head, _out_indices, query_heads in grouped_query_heads(
+        list(range(n_heads)),
+        ctx.model_config,
+        num_kv_heads=k_all.shape[0],
+    ):
+        k_group = k_all[kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
+        v_group = v_all[kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
+        metadata = _build_page_metadata(k_group, v_group, page_size)
+        group_output, group_stats = _quest_outputs_for_queries(
+            q_pos=q_all[query_heads][:, pos_tensor, :].float(),
+            pos_tensor=pos_tensor,
+            metadata=metadata,
+            page_size=page_size,
+            page_budget=page_budget,
+            share_selection_across_heads=True,
+        )
+        output[query_heads] = group_output
+        _merge_stats(stats, group_stats)
 
     layer = ctx.model.model.layers[layer_idx]
     proj_dtype = layer.self_attn.o_proj.weight.dtype

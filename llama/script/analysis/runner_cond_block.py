@@ -32,7 +32,7 @@ from .runner_utils import (
 )
 from .sanity import (
     compute_metrics,
-    expand_kv_to_query_heads,
+    grouped_query_heads,
     get_tail_labels,
     move_model_inputs_to_device,
 )
@@ -282,6 +282,7 @@ def _batched_hybrid_outputs_for_queries(
     block_size,
     eps,
     delta_mode,
+    share_selection_across_heads=False,
 ):
     n_heads, n_query, head_dim = q_pos.shape
     n_blocks = prefix["block_starts"].numel()
@@ -337,7 +338,11 @@ def _batched_hybrid_outputs_for_queries(
         2.0 * b_all.unsqueeze(-1) * (torch.cosh(delta) - 1.0) / denom.unsqueeze(-1)
         + 2.0 * b_c * torch.tanh(delta / 2.0)
     )
-    selected = (condition > eps) & cluster_exists.unsqueeze(0)
+    if share_selection_across_heads:
+        selected = (condition.mean(dim=0, keepdim=True) > eps) & cluster_exists.unsqueeze(0)
+        selected = selected.expand(n_heads, -1, -1)
+    else:
+        selected = (condition > eps) & cluster_exists.unsqueeze(0)
 
     token_selected = selected.unsqueeze(-1) & token_visible.unsqueeze(0)
     token_logits = block_logits.masked_fill(~token_selected, float("-inf"))
@@ -394,19 +399,35 @@ def build_condition_block_patch(
 
     n_heads = q_all.shape[0]
     n_pos = len(pos_list)
-    k_all = expand_kv_to_query_heads(k_all, n_heads, ctx.model_config)
-    v_all = expand_kv_to_query_heads(v_all, n_heads, ctx.model_config)
-    prefix = _build_block_prefix_tensors(k_all, v_all, block_size)
     pos_tensor = torch.tensor(pos_list, device=ctx.device, dtype=torch.long)
-    q_pos = q_all[:, pos_tensor, :].float()
-    output, budget_stats = _batched_hybrid_outputs_for_queries(
-        q_pos=q_pos,
-        pos_tensor=pos_tensor,
-        prefix=prefix,
-        block_size=block_size,
-        eps=eps,
-        delta_mode=delta_mode,
+    output = torch.empty(
+        n_heads,
+        n_pos,
+        q_all.shape[-1],
+        device=ctx.device,
+        dtype=torch.float32,
     )
+    budget_stats = {}
+    for kv_head, _out_indices, query_heads in grouped_query_heads(
+        list(range(n_heads)),
+        ctx.model_config,
+        num_kv_heads=k_all.shape[0],
+    ):
+        q_pos = q_all[query_heads][:, pos_tensor, :].float()
+        k_group = k_all[kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
+        v_group = v_all[kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
+        prefix = _build_block_prefix_tensors(k_group, v_group, block_size)
+        group_output, group_stats = _batched_hybrid_outputs_for_queries(
+            q_pos=q_pos,
+            pos_tensor=pos_tensor,
+            prefix=prefix,
+            block_size=block_size,
+            eps=eps,
+            delta_mode=delta_mode,
+            share_selection_across_heads=True,
+        )
+        output[query_heads] = group_output
+        _merge_stats(budget_stats, group_stats)
     output = output.to(output_dtype)
 
     layer = ctx.model.model.layers[layer_idx]

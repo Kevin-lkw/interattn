@@ -67,6 +67,10 @@ run_method \
   h2o
 
 run_method \
+  script.analysis.multisample.run_streamllm \
+  streamllm
+
+run_method \
   script.analysis.multisample.run_quest \
   quest
 

@@ -11,6 +11,7 @@ METHODS = [
     ("condition_block", "Condition-block", "o", "#2563eb"),
     ("attention_topk", "Oracle attention top-k", "s", "#dc2626"),
     ("h2o", "H2O", "^", "#16a34a"),
+    ("streamllm", "StreamLLM", "v", "#ea580c"),
     ("quest", "QUEST", "D", "#9333ea"),
 ]
 

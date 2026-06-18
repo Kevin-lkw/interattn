@@ -1,6 +1,6 @@
 # Multi-sample evaluation
 
-The four runners evaluate 100 non-overlapping WikiText-2 test windows by
+The five runners evaluate 100 non-overlapping WikiText-2 test windows by
 default. Window starts are:
 
 ```text
@@ -13,7 +13,7 @@ resumes by skipping samples already present in its `summary.pt`.
 WikiText-2 test contains 335,645 Llama-2 tokens. The default 100-window run
 requires 102,401 tokens, so the dataset has sufficient capacity.
 
-To run all four methods sequentially and produce one combined plot:
+To run all five methods sequentially and produce one combined plot:
 
 ```bash
 GPU_ID=7 bash script/analysis/multisample/run_all.sh
@@ -34,6 +34,9 @@ CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
 
 CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
   python -m script.analysis.multisample.run_h2o --device cuda:0
+
+CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
+  python -m script.analysis.multisample.run_streamllm --device cuda:0
 
 CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
   python -m script.analysis.multisample.run_quest --device cuda:0
@@ -60,4 +63,5 @@ Method defaults:
 - Attention top-k: first 2 layers use full attention.
 - Condition-block: first 2 layers use full attention, block size 10.
 - H2O: all layers are compressed.
+- StreamLLM: all layers are compressed, keeping the first 4 sink tokens plus the recent window.
 - QUEST: first 2 layers use full attention, page size 16.

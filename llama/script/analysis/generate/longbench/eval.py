@@ -99,7 +99,7 @@ def score_rows(dataset, rows, metadata, use_longbench_e):
     metric = DATASET2METRIC[dataset]
 
     for row in rows:
-        prediction = str(row.get("prediction", row.get("pred", "")))
+        prediction = str(row["pred"])
         if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
             prediction = prediction.lstrip("\n").split("\n")[0]
 
@@ -138,15 +138,14 @@ def score_rows(dataset, rows, metadata, use_longbench_e):
 
 
 def parse_run_name(path):
-    match = re.fullmatch(r"(.+)_budget=([^_]+)_maxnew=(\d+)", path.stem)
+    match = re.fullmatch(r"(.+)_budget=([^_]+)(?:_maxnew=\d+)?", path.stem)
     if match is None:
         return {"run": path.stem}
-    method, budget, max_new_tokens = match.groups()
+    method, budget = match.groups()
     return {
         "run": path.stem,
         "method": method,
         "budget": float(budget),
-        "max_new_tokens": int(max_new_tokens),
     }
 
 

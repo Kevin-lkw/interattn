@@ -8,7 +8,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ..runner_utils import set_seed, str_to_torch_dtype
-from .compressors import add_method_args, build_method, generate_with_method
+from .methods import add_method_args, build_method, generate_with_method
 
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
@@ -179,7 +179,7 @@ def record_id(record, args, index):
 def output_path(args, benchmark_name):
     model_name = str(args.model).rstrip("/").split("/")[-1]
     method = build_method(args)
-    filename = f"{method.name}_budget={method.budget:g}_maxnew={method.max_new_tokens}.jsonl"
+    filename = f"{method.name}_budget={method.budget:g}.jsonl"
     out_dir = args.output_root / model_name / benchmark_name
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / filename
@@ -243,12 +243,10 @@ def run_generation_benchmark(
                 "method": method.name,
                 "budget": method.budget,
                 "pred": prediction,
-                "prediction": prediction,
                 "answers": extract_answers(record, args),
                 "all_classes": record.get("all_classes"),
                 "length": record.get("length"),
                 "input_tokens": int(inputs["input_ids"].shape[1]),
-                "max_new_tokens": int(method.max_new_tokens),
             }
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             handle.flush()

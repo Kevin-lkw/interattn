@@ -144,6 +144,8 @@ def run_generation_benchmark(
     benchmark_name,
     prompt_builder=default_prompt_builder,
     records=None,
+    model=None,
+    tokenizer=None,
 ):
     validate_generation_args(args)
     if args.max_new_tokens is None:
@@ -158,7 +160,8 @@ def run_generation_benchmark(
         records = records[: args.limit]
     out_path = output_path(args, benchmark_name)
     done_ids = _load_done_ids(out_path)
-    model, tokenizer = load_model_and_tokenizer(args)
+    if model is None or tokenizer is None:
+        model, tokenizer = load_model_and_tokenizer(args)
 
     with out_path.open("a", encoding="utf-8") as handle:
         for index, record in enumerate(tqdm(records, desc=f"{benchmark_name}:{method.name}", unit="sample")):

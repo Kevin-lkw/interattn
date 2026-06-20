@@ -45,6 +45,22 @@ CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
 Use `--longbench-e` to load the LongBench-E variant for datasets that provide it.
 Passing `--data /path/to/file.jsonl` still works as a local override.
 
+To run the default 16-task set (14 English tasks + `lcc` and `repobench-p`) with
+one compression method, use:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
+  python -m script.analysis.generate.longbench.run_all \
+  --device cuda:0 \
+  --model meta-llama/Llama-3.1-8B \
+  --method kvpress_snapkv \
+  --budget 0.5
+```
+
+The wrapper loads the model once, then shows an outer `tqdm` progress bar across
+datasets while reusing the per-sample progress bars and resume logic from the
+single-dataset runner. Override `--datasets` to run a smaller subset.
+
 ## RULER
 
 ```bash

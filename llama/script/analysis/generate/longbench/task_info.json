@@ -1,0 +1,191 @@
+{
+  "narrativeqa": {
+    "dataset": "narrativeqa",
+    "num_test": 200,
+    "max_new_tokens": 128,
+    "input_length_chars": {
+      "max": 210885,
+      "avg": 108484.05
+    }
+  },
+  "qasper": {
+    "dataset": "qasper",
+    "num_test": 200,
+    "max_new_tokens": 128,
+    "input_length_chars": {
+      "max": 101771,
+      "avg": 24397.33
+    }
+  },
+  "multifieldqa_en": {
+    "dataset": "multifieldqa_en",
+    "num_test": 150,
+    "max_new_tokens": 64,
+    "input_length_chars": {
+      "max": 64362,
+      "avg": 29194.73
+    }
+  },
+  "multifieldqa_zh": {
+    "dataset": "multifieldqa_zh",
+    "num_test": 200,
+    "max_new_tokens": 64,
+    "input_length_chars": {
+      "max": 16808,
+      "avg": 6745.73
+    }
+  },
+  "hotpotqa": {
+    "dataset": "hotpotqa",
+    "num_test": 200,
+    "max_new_tokens": 32,
+    "input_length_chars": {
+      "max": 81665,
+      "avg": 56909.7
+    }
+  },
+  "2wikimqa": {
+    "dataset": "2wikimqa",
+    "num_test": 200,
+    "max_new_tokens": 32,
+    "input_length_chars": {
+      "max": 72821,
+      "avg": 29953.99
+    }
+  },
+  "musique": {
+    "dataset": "musique",
+    "num_test": 200,
+    "max_new_tokens": 32,
+    "input_length_chars": {
+      "max": 82237,
+      "avg": 69762.43
+    }
+  },
+  "dureader": {
+    "dataset": "dureader",
+    "num_test": 200,
+    "max_new_tokens": 128,
+    "input_length_chars": {
+      "max": 27125,
+      "avg": 15697.59
+    }
+  },
+  "gov_report": {
+    "dataset": "gov_report",
+    "num_test": 200,
+    "max_new_tokens": 512,
+    "input_length_chars": {
+      "max": 257273,
+      "avg": 54076.25
+    }
+  },
+  "qmsum": {
+    "dataset": "qmsum",
+    "num_test": 200,
+    "max_new_tokens": 512,
+    "input_length_chars": {
+      "max": 143793,
+      "avg": 57779.08
+    }
+  },
+  "multi_news": {
+    "dataset": "multi_news",
+    "num_test": 200,
+    "max_new_tokens": 512,
+    "input_length_chars": {
+      "max": 63567,
+      "avg": 12224.68
+    }
+  },
+  "vcsum": {
+    "dataset": "vcsum",
+    "num_test": 200,
+    "max_new_tokens": 512,
+    "input_length_chars": {
+      "max": 42116,
+      "avg": 15190.02
+    }
+  },
+  "trec": {
+    "dataset": "trec",
+    "num_test": 200,
+    "max_new_tokens": 64,
+    "input_length_chars": {
+      "max": 50352,
+      "avg": 30087.67
+    }
+  },
+  "triviaqa": {
+    "dataset": "triviaqa",
+    "num_test": 200,
+    "max_new_tokens": 32,
+    "input_length_chars": {
+      "max": 102869,
+      "avg": 50333.72
+    }
+  },
+  "samsum": {
+    "dataset": "samsum",
+    "num_test": 200,
+    "max_new_tokens": 128,
+    "input_length_chars": {
+      "max": 67831,
+      "avg": 34619.46
+    }
+  },
+  "lsht": {
+    "dataset": "lsht",
+    "num_test": 200,
+    "max_new_tokens": 64,
+    "input_length_chars": {
+      "max": 44242,
+      "avg": 22353.62
+    }
+  },
+  "passage_count": {
+    "dataset": "passage_count",
+    "num_test": 200,
+    "max_new_tokens": 32,
+    "input_length_chars": {
+      "max": 126894,
+      "avg": 67271.91
+    }
+  },
+  "passage_retrieval_en": {
+    "dataset": "passage_retrieval_en",
+    "num_test": 200,
+    "max_new_tokens": 32,
+    "input_length_chars": {
+      "max": 68986,
+      "avg": 56224.61
+    }
+  },
+  "passage_retrieval_zh": {
+    "dataset": "passage_retrieval_zh",
+    "num_test": 200,
+    "max_new_tokens": 32,
+    "input_length_chars": {
+      "max": 9053,
+      "avg": 6835.15
+    }
+  },
+  "lcc": {
+    "dataset": "lcc",
+    "num_test": 500,
+    "max_new_tokens": 64,
+    "input_length_chars": {
+      "max": 104118,
+      "avg": 13674.11
+    }
+  },
+  "repobench-p": {
+    "dataset": "repobench-p",
+    "num_test": 500,
+    "max_new_tokens": 64,
+    "input_length_chars": {
+      "max": 214205,
+      "avg": 48129.33
+    }
+  }
+}

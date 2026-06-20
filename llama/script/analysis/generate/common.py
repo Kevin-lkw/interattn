@@ -14,6 +14,7 @@ from .methods import add_method_args, build_method, generate_with_method
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "result" / "generate"
 NO_CHAT_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+LOCAL_PATCH_METHODS = {"attention_topk", "condition_block", "quest"}
 
 
 def add_generation_args(parser):
@@ -60,8 +61,18 @@ def validate_generation_args(args):
             raise ValueError("--budget is not used by condition_block; use --condition-block-size and --condition-eps.")
         if args.condition_block_size is None or args.condition_block_size <= 0:
             raise ValueError("--condition-block-size must be provided and > 0 for condition_block.")
-    elif args.budget is not None and not 0 < float(args.budget) <= 1:
-        raise ValueError("--budget must be in (0, 1]")
+    elif args.method == "quest":
+        has_budget = args.budget is not None
+        has_page_size = args.quest_page_size is not None
+        if has_budget == has_page_size:
+            raise ValueError("quest requires exactly one of --budget or --quest-page-size.")
+        if has_budget and not 0 < float(args.budget) <= 1:
+            raise ValueError("--budget must be in (0, 1]")
+        if has_page_size and args.quest_page_size <= 0:
+            raise ValueError("--quest-page-size must be > 0")
+    else:
+        if args.budget is not None and not 0 < float(args.budget) <= 1:
+            raise ValueError("--budget must be in (0, 1]")
     return args
 
 
@@ -81,6 +92,14 @@ def load_model_and_tokenizer(args):
     }
     if args.method == "h2o" and args.attn_implementation is None:
         args.attn_implementation = "eager"
+    if args.method in LOCAL_PATCH_METHODS:
+        if args.attn_implementation is None:
+            args.attn_implementation = "eager"
+        elif args.attn_implementation != "eager":
+            raise ValueError(
+                f"--method {args.method} requires --attn-implementation eager "
+                "because it captures Q/K/V through the eager attention path."
+            )
     if args.attn_implementation:
         kwargs["attn_implementation"] = args.attn_implementation
     model = AutoModelForCausalLM.from_pretrained(args.model, **kwargs)
@@ -189,6 +208,8 @@ def output_path(args, benchmark_name):
             f"{method.name}_block={method.condition_block_size}"
             f"_eps={method.condition_eps:g}.jsonl"
         )
+    elif method.kind == "quest" and args.budget is None:
+        filename = f"{method.name}_page={method.quest_page_size}.jsonl"
     else:
         filename = f"{method.name}_budget={method.budget:g}.jsonl"
     out_dir = args.output_root / model_name / benchmark_name

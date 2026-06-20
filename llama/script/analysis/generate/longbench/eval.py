@@ -147,6 +147,15 @@ def parse_run_name(path):
             "block_size": int(block_size),
             "eps": float(eps),
         }
+    match = re.fullmatch(r"(quest)_page=([^_]+)(?:_maxnew=\d+)?", path.stem)
+    if match is not None:
+        method, page_size = match.groups()
+        return {
+            "run": path.stem,
+            "method": method,
+            "page_size": int(page_size),
+            "budget": 1.0 / int(page_size),
+        }
     match = re.fullmatch(r"(.+)_budget=([^_]+)(?:_maxnew=\d+)?", path.stem)
     if match is None:
         return {"run": path.stem}

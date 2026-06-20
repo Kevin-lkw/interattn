@@ -30,6 +30,14 @@ For `condition_block`, `--budget` is not used. Set `--condition-block-size`
 and `--condition-eps`; each output JSONL row records the measured
 `condition_block_equiv_budget`.
 
+For `quest`, pass exactly one of `--budget` or `--quest-page-size`. When
+`--budget` is used, the runner sets `quest_page_size=round(1 / budget)` and
+names the output file with the budget.
+
+Local full-forward methods (`attention_topk`, `condition_block`, and `quest`)
+require eager attention so the runner can capture Q/K/V; this is set
+automatically unless you explicitly pass another attention implementation.
+
 ## LongBench
 
 LongBench v1 is loaded directly from the Hugging Face dataset repo

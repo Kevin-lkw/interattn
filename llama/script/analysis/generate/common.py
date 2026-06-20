@@ -55,7 +55,12 @@ def validate_generation_args(args):
         raise ValueError("--limit must be > 0")
     if args.max_new_tokens is not None and args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be > 0")
-    if not 0 < float(args.budget) <= 1:
+    if args.method == "condition_block":
+        if args.budget is not None:
+            raise ValueError("--budget is not used by condition_block; use --condition-block-size and --condition-eps.")
+        if args.condition_block_size is None or args.condition_block_size <= 0:
+            raise ValueError("--condition-block-size must be provided and > 0 for condition_block.")
+    elif args.budget is not None and not 0 < float(args.budget) <= 1:
         raise ValueError("--budget must be in (0, 1]")
     return args
 
@@ -179,7 +184,13 @@ def record_id(record, args, index):
 def output_path(args, benchmark_name):
     model_name = str(args.model).rstrip("/").split("/")[-1]
     method = build_method(args)
-    filename = f"{method.name}_budget={method.budget:g}.jsonl"
+    if method.kind == "condition_block":
+        filename = (
+            f"{method.name}_block={method.condition_block_size}"
+            f"_eps={method.condition_eps:g}.jsonl"
+        )
+    else:
+        filename = f"{method.name}_budget={method.budget:g}.jsonl"
     out_dir = args.output_root / model_name / benchmark_name
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / filename
@@ -225,7 +236,7 @@ def run_generation_benchmark(
                 truncation=False,
             )
             inputs = {key: value.to(args.device) for key, value in inputs.items()}
-            output_ids = generate_with_method(
+            generation_result = generate_with_method(
                 model=model,
                 tokenizer=tokenizer,
                 input_ids=inputs["input_ids"],
@@ -237,17 +248,23 @@ def run_generation_benchmark(
                 device=args.device,
                 dataset=_dataset_name(record),
             )
+            if isinstance(generation_result, tuple):
+                output_ids, generation_metadata = generation_result
+            else:
+                output_ids, generation_metadata = generation_result, {}
             prediction = tokenizer.decode(output_ids[0], skip_special_tokens=True)
             row = {
                 "id": rid,
                 "method": method.name,
-                "budget": method.budget,
                 "pred": prediction,
                 "answers": extract_answers(record, args),
                 "all_classes": record.get("all_classes"),
                 "length": record.get("length"),
                 "input_tokens": int(inputs["input_ids"].shape[1]),
             }
+            if method.budget is not None:
+                row["budget"] = method.budget
+            row.update(generation_metadata)
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             handle.flush()
             done_ids.add(rid)

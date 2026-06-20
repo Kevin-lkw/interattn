@@ -2,7 +2,6 @@ import math
 
 import torch
 
-from ...runner_cond_block import _resolve_block_size
 from ...sanity import grouped_query_heads
 from .patching import run_with_prefill_only_patches
 
@@ -17,10 +16,6 @@ def run_prefill_only_condition_block(
     pos_list,
     model_inputs,
 ):
-    if math.isclose(float(args.budget), 1.0):
-        with torch.no_grad():
-            return ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
-
     def _build_patch(layer_ctx, layer_idx, artifacts):
         return build_prefill_only_condition_block_patch(
             ctx=layer_ctx,
@@ -40,6 +35,8 @@ def run_prefill_only_condition_block(
         model_inputs=model_inputs,
         full_attention_layers=args.full_attention_layers,
         build_patch=_build_patch,
+        collect_stats=True,
+        full_attention_stats=full_attention_stats(ctx, pos_list),
     )
 
 
@@ -48,12 +45,10 @@ def build_condition_args(method, prompt_len):
 
     args = SimpleNamespace(
         seq_len=prompt_len,
-        budget=method.budget,
         block_size=method.condition_block_size,
         full_attention_layers=method.full_attention_layers,
         delta_mode=method.condition_delta_mode,
     )
-    args.block_size = _resolve_block_size(args)
     return args
 
 
@@ -83,6 +78,14 @@ def build_prefill_only_condition_block_patch(
         device=ctx.device,
         dtype=torch.float32,
     )
+    stats = {
+        "rows": 0,
+        "clusters": 0,
+        "selected_clusters": 0,
+        "selected_tokens": 0,
+        "hybrid_tokens": 0,
+        "total_available": 0,
+    }
 
     for kv_head, _out_indices, query_heads in grouped_query_heads(
         list(range(n_heads)),
@@ -113,6 +116,9 @@ def build_prefill_only_condition_block_patch(
                 logits_parts = []
                 value_parts = []
                 block_idx = 0
+                head_hybrid_tokens = 0
+                head_selected_clusters = 0
+                head_selected_tokens = 0
                 for start in range(0, prefix_len, block_size):
                     end = min(start + block_size, prefix_len)
                     k_block = k_group[head_offset, start:end]
@@ -120,12 +126,16 @@ def build_prefill_only_condition_block_patch(
                     if bool(selected_blocks[block_idx].item()):
                         logits_parts.append(torch.mv(k_block, q) / math.sqrt(q.numel()))
                         value_parts.append(v_block)
+                        head_hybrid_tokens += end - start
+                        head_selected_clusters += 1
+                        head_selected_tokens += end - start
                     else:
                         k_bar = k_block.mean(dim=0)
                         v_bar = v_block.mean(dim=0, keepdim=True)
                         score = torch.dot(q, k_bar) / math.sqrt(q.numel())
                         logits_parts.append((math.log(end - start) + score).reshape(1))
                         value_parts.append(v_bar)
+                        head_hybrid_tokens += 1
                     block_idx += 1
 
                 if suffix_end > suffix_start:
@@ -133,10 +143,17 @@ def build_prefill_only_condition_block_patch(
                     v_suffix = v_group[head_offset, suffix_start:suffix_end]
                     logits_parts.append(torch.mv(k_suffix, q) / math.sqrt(q.numel()))
                     value_parts.append(v_suffix)
+                    head_hybrid_tokens += suffix_end - suffix_start
 
                 weights = torch.softmax(torch.cat(logits_parts, dim=0), dim=0)
                 values = torch.cat(value_parts, dim=0)
                 output[query_head, local_pos] = (weights.unsqueeze(-1) * values).sum(dim=0)
+                stats["rows"] += 1
+                stats["clusters"] += int(selected_blocks.numel())
+                stats["selected_clusters"] += int(head_selected_clusters)
+                stats["selected_tokens"] += int(head_selected_tokens)
+                stats["hybrid_tokens"] += int(head_hybrid_tokens)
+                stats["total_available"] += int(pos) + 1
 
     layer = ctx.model.model.layers[layer_idx]
     proj_dtype = layer.self_attn.o_proj.weight.dtype
@@ -146,7 +163,20 @@ def build_prefill_only_condition_block_patch(
         .reshape(n_pos, -1)
         .to(ctx.device, dtype=proj_dtype)
     )
-    return patch_hidden.detach()
+    return patch_hidden.detach(), stats
+
+
+def full_attention_stats(ctx, pos_list):
+    n_heads = int(ctx.model_config.num_attention_heads)
+    total_available = sum(int(pos) + 1 for pos in pos_list) * n_heads
+    return {
+        "rows": n_heads * len(pos_list),
+        "clusters": 0,
+        "selected_clusters": 0,
+        "selected_tokens": total_available,
+        "hybrid_tokens": total_available,
+        "total_available": total_available,
+    }
 
 
 def condition_tensor_for_prompt_blocks(q, k_head, v_head, block_size, delta_mode):

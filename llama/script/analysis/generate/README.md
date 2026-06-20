@@ -26,6 +26,10 @@ semantics aligned with the PPL runners.
 attention; the runner sets `attn_implementation="eager"` automatically when
 `--method h2o` is used unless you explicitly override it.
 
+For `condition_block`, `--budget` is not used. Set `--condition-block-size`
+and `--condition-eps`; each output JSONL row records the measured
+`condition_block_equiv_budget`.
+
 ## LongBench
 
 LongBench v1 is loaded directly from the Hugging Face dataset repo
@@ -53,8 +57,9 @@ CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
   python -m script.analysis.generate.longbench.run_all \
   --device cuda:0 \
   --model meta-llama/Llama-3.1-8B \
-  --method kvpress_snapkv \
-  --budget 0.5
+  --method condition_block \
+  --condition-block-size 8 \
+  --condition-eps 1.0
 ```
 
 The wrapper loads the model once, then shows an outer `tqdm` progress bar across

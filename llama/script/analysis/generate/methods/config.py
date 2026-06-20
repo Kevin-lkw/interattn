@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class GenerationMethod:
     name: str
     kind: str
-    budget: float = 1.0
+    budget: float | None = 1.0
     max_new_tokens: int = 32
     full_attention_layers: int = 0
     condition_eps: float = 1.0
@@ -19,14 +19,19 @@ class GenerationMethod:
 
     @property
     def compression_ratio(self):
+        if self.budget is None:
+            return 0.0
         return max(0.0, min(1.0, 1.0 - float(self.budget)))
 
 
 def build_method(args):
+    budget = None if args.budget is None else float(args.budget)
+    if args.method != "condition_block" and budget is None:
+        budget = 1.0
     return GenerationMethod(
         name=args.method,
         kind=args.method,
-        budget=float(args.budget),
+        budget=budget,
         max_new_tokens=int(args.max_new_tokens),
         full_attention_layers=int(args.full_attention_layers),
         condition_eps=float(args.condition_eps),
@@ -55,7 +60,7 @@ def add_method_args(parser):
             "quest",
         ],
     )
-    parser.add_argument("--budget", type=float, default=1.0)
+    parser.add_argument("--budget", type=float, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--full-attention-layers", type=int, default=0)
     parser.add_argument("--condition-eps", type=float, default=1.0)

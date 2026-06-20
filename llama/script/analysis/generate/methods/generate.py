@@ -39,6 +39,7 @@ def generate_with_full_forward_patches(
     dataset=None,
 ):
     generated = []
+    step_metadata = []
     cur_ids = input_ids
     cur_mask = attention_mask
     prompt_len = int(input_ids.shape[1])
@@ -50,7 +51,7 @@ def generate_with_full_forward_patches(
         if newline_ids:
             stop_token_ids.append(newline_ids[-1])
     for _step in range(method.max_new_tokens):
-        logits = next_logits_with_local_method(
+        step_result = next_logits_with_local_method(
             model=model,
             tokenizer=tokenizer,
             input_ids=cur_ids,
@@ -59,6 +60,11 @@ def generate_with_full_forward_patches(
             method=method,
             device=device,
         )
+        if isinstance(step_result, tuple):
+            logits, metadata = step_result
+            step_metadata.append(metadata)
+        else:
+            logits = step_result
         next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         generated.append(next_id)
         cur_ids = torch.cat([cur_ids, next_id], dim=1)
@@ -68,7 +74,10 @@ def generate_with_full_forward_patches(
             break
     if not generated:
         return torch.empty((input_ids.shape[0], 0), device=input_ids.device, dtype=input_ids.dtype)
-    return torch.cat(generated, dim=1)
+    output_ids = torch.cat(generated, dim=1)
+    if method.kind == "condition_block":
+        return output_ids, summarize_condition_block_metadata(step_metadata)
+    return output_ids
 
 
 def next_logits_with_local_method(
@@ -99,7 +108,7 @@ def next_logits_with_local_method(
     pos_list = [seq_len - 1]
     model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
 
-    if math.isclose(float(method.budget), 1.0):
+    if method.budget is not None and math.isclose(float(method.budget), 1.0):
         with torch.no_grad():
             return model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
 
@@ -140,3 +149,36 @@ def next_logits_with_local_method(
         )
 
     raise ValueError(f"Unknown local generation method: {method.kind}")
+
+
+def summarize_condition_block_metadata(step_metadata):
+    aggregate = {}
+    by_step = []
+    for step_idx, metadata in enumerate(step_metadata):
+        if not metadata:
+            continue
+        step_aggregate = metadata.get("aggregate", {})
+        by_step.append(
+            {
+                "step": step_idx,
+                "equiv_budget": step_aggregate.get("mean_budget_causal"),
+            }
+        )
+        for key, value in step_aggregate.items():
+            if isinstance(value, int):
+                aggregate[key] = int(aggregate.get(key, 0)) + int(value)
+
+    total_available = max(int(aggregate.get("total_available", 0)), 1)
+    rows = max(int(aggregate.get("rows", 0)), 1)
+    hybrid_tokens = int(aggregate.get("hybrid_tokens", 0))
+    equiv_budget = float(hybrid_tokens / total_available)
+    return {
+        "condition_block_equiv_budget": equiv_budget,
+        "condition_block_budget": {
+            **aggregate,
+            "mean_hybrid_tokens": float(hybrid_tokens / rows),
+            "mean_budget_causal": equiv_budget,
+            "mean_budget_visible": equiv_budget,
+            "by_step": by_step,
+        },
+    }

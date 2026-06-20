@@ -6,30 +6,17 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
-try:
-    from .metric import (
-        qa_f1_score,
-        rouge_zh_score,
-        qa_f1_zh_score,
-        rouge_score,
-        classification_score,
-        retrieval_score,
-        retrieval_zh_score,
-        count_score,
-        code_sim_score,
-    )
-except ImportError:
-    from metric import (
-        qa_f1_score,
-        rouge_zh_score,
-        qa_f1_zh_score,
-        rouge_score,
-        classification_score,
-        retrieval_score,
-        retrieval_zh_score,
-        count_score,
-        code_sim_score,
-    )
+from .metric import (
+    qa_f1_score,
+    rouge_zh_score,
+    qa_f1_zh_score,
+    rouge_score,
+    classification_score,
+    retrieval_score,
+    retrieval_zh_score,
+    count_score,
+    code_sim_score,
+)
 
 
 DEFAULT_RESULT_ROOT = Path(__file__).resolve().parents[4] / "result" / "generate"
@@ -61,7 +48,7 @@ DATASET2METRIC = {
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Evaluate local LongBench generations.")
-    parser.add_argument("--model", default="Llama-3.1-8B")
+    parser.add_argument("--model", default="Llama-3.1-8B-Instruct")
     parser.add_argument("--result-root", type=Path, default=DEFAULT_RESULT_ROOT)
     parser.add_argument("--benchmark", default="longbench")
     parser.add_argument("--hf-repo", default="THUDM/LongBench")

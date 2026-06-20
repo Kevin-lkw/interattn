@@ -121,13 +121,13 @@ def build_kvpress_press(method):
     raise ValueError(f"Not a KVPress method: {method.kind}")
 
 
-def generate_with_method(model, tokenizer, input_ids, attention_mask, method, device):
+def generate_with_method(model, tokenizer, input_ids, attention_mask, method, device, dataset=None):
     if method.kind == "full":
-        return _generate_hf(model, tokenizer, input_ids, attention_mask, method)
+        return _generate_hf(model, tokenizer, input_ids, attention_mask, method, dataset)
     if method.kind.startswith("kvpress_") or method.kind == "h2o":
         press = build_kvpress_press(method)
         with press(model):
-            return _generate_hf(model, tokenizer, input_ids, attention_mask, method)
+            return _generate_hf(model, tokenizer, input_ids, attention_mask, method, dataset)
     return _generate_with_full_forward_patches(
         model=model,
         tokenizer=tokenizer,
@@ -135,17 +135,31 @@ def generate_with_method(model, tokenizer, input_ids, attention_mask, method, de
         attention_mask=attention_mask,
         method=method,
         device=device,
+        dataset=dataset,
     )
 
 
-def _generate_hf(model, tokenizer, input_ids, attention_mask, method):
+def _generate_hf(model, tokenizer, input_ids, attention_mask, method, dataset=None):
+    generate_kwargs = {}
+    if dataset == "samsum":
+        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        if newline_ids:
+            generate_kwargs.update(
+                {
+                    "min_length": input_ids.shape[1] + 1,
+                    "eos_token_id": [tokenizer.eos_token_id, newline_ids[-1]],
+                }
+            )
     with torch.no_grad():
         output_ids = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=method.max_new_tokens,
             do_sample=False,
+            num_beams=1,
+            temperature=1.0,
             pad_token_id=tokenizer.eos_token_id,
+            **generate_kwargs,
         )
     return output_ids[:, input_ids.shape[1] :]
 
@@ -158,11 +172,18 @@ def _generate_with_full_forward_patches(
     attention_mask,
     method,
     device,
+    dataset=None,
 ):
     generated = []
     cur_ids = input_ids
     cur_mask = attention_mask
-    eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = []
+    if tokenizer.eos_token_id is not None:
+        stop_token_ids.append(tokenizer.eos_token_id)
+    if dataset == "samsum":
+        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        if newline_ids:
+            stop_token_ids.append(newline_ids[-1])
     for _step in range(method.max_new_tokens):
         logits = _next_logits_with_local_method(
             model=model,
@@ -176,7 +197,7 @@ def _generate_with_full_forward_patches(
         generated.append(next_id)
         cur_ids = torch.cat([cur_ids, next_id], dim=1)
         cur_mask = torch.cat([cur_mask, torch.ones_like(next_id)], dim=1)
-        if eos_token_id is not None and bool((next_id == eos_token_id).all().item()):
+        if stop_token_ids and bool(torch.isin(next_id, torch.tensor(stop_token_ids, device=next_id.device)).all().item()):
             break
     if not generated:
         return torch.empty((input_ids.shape[0], 0), device=input_ids.device, dtype=input_ids.dtype)

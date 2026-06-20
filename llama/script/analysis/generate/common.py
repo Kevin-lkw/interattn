@@ -11,8 +11,9 @@ from ..runner_utils import set_seed, str_to_torch_dtype
 from .compressors import add_method_args, build_method, generate_with_method
 
 
-DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "result" / "generate"
+NO_CHAT_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 
 
 def add_generation_args(parser):
@@ -33,6 +34,11 @@ def add_generation_args(parser):
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-input-tokens", type=int, default=None)
+    parser.add_argument(
+        "--disable-chat-template",
+        action="store_true",
+        help="Do not wrap prompts with the tokenizer chat template.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--attn-implementation", default=None)
     parser.add_argument("--context-field", default="context")
@@ -75,6 +81,46 @@ def load_model_and_tokenizer(args):
     model = AutoModelForCausalLM.from_pretrained(args.model, **kwargs)
     model.eval()
     return model, tokenizer
+
+
+def _dataset_name(record):
+    dataset = str(record.get("dataset", "")).lower()
+    if dataset.endswith("_e"):
+        dataset = dataset[:-2]
+    return dataset
+
+
+def _middle_truncate_prompt(prompt, tokenizer, max_input_tokens):
+    if max_input_tokens is None:
+        return prompt
+    tokenized = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+    if len(tokenized) <= max_input_tokens:
+        return prompt
+    half = max_input_tokens // 2
+    return tokenizer.decode(
+        tokenized[:half],
+        skip_special_tokens=True,
+    ) + tokenizer.decode(
+        tokenized[-half:],
+        skip_special_tokens=True,
+    )
+
+
+def _maybe_apply_chat_template(prompt, tokenizer, args, record):
+    if args.disable_chat_template:
+        return prompt
+    if _dataset_name(record) in NO_CHAT_DATASETS:
+        return prompt
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    raise ValueError(
+        "Chat template is enabled, but the tokenizer does not provide chat_template. "
+        "Pass --disable-chat-template if you intentionally want raw prompts."
+    )
 
 
 def read_records(path, limit=None):
@@ -162,6 +208,8 @@ def run_generation_benchmark(
     done_ids = _load_done_ids(out_path)
     if model is None or tokenizer is None:
         model, tokenizer = load_model_and_tokenizer(args)
+    if args.max_input_tokens is None and getattr(model.config, "max_position_embeddings", None):
+        args.max_input_tokens = int(model.config.max_position_embeddings)
 
     with out_path.open("a", encoding="utf-8") as handle:
         for index, record in enumerate(tqdm(records, desc=f"{benchmark_name}:{method.name}", unit="sample")):
@@ -169,11 +217,12 @@ def run_generation_benchmark(
             if rid in done_ids:
                 continue
             prompt = build_prompt(record, args, prompt_builder)
+            prompt = _middle_truncate_prompt(prompt, tokenizer, args.max_input_tokens)
+            prompt = _maybe_apply_chat_template(prompt, tokenizer, args, record)
             inputs = tokenizer(
                 prompt,
                 return_tensors="pt",
-                truncation=args.max_input_tokens is not None,
-                max_length=args.max_input_tokens,
+                truncation=False,
             )
             inputs = {key: value.to(args.device) for key, value in inputs.items()}
             output_ids = generate_with_method(
@@ -186,14 +235,18 @@ def run_generation_benchmark(
                 ),
                 method=method,
                 device=args.device,
+                dataset=_dataset_name(record),
             )
             prediction = tokenizer.decode(output_ids[0], skip_special_tokens=True)
             row = {
                 "id": rid,
                 "method": method.name,
                 "budget": method.budget,
+                "pred": prediction,
                 "prediction": prediction,
                 "answers": extract_answers(record, args),
+                "all_classes": record.get("all_classes"),
+                "length": record.get("length"),
                 "input_tokens": int(inputs["input_ids"].shape[1]),
                 "max_new_tokens": int(method.max_new_tokens),
             }

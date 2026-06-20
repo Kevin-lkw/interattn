@@ -17,6 +17,7 @@ from .run import (
     load_longbench_records,
     longbench_prompt,
     resolve_dataset_name,
+    resolve_model_config,
 )
 
 
@@ -73,7 +74,7 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
+    args = resolve_model_config(parse_args())
     requested_max_new_tokens = args.max_new_tokens
     args.question_field = "input"
     args.id_field = "_id"

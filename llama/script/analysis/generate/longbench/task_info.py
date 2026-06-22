@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -13,6 +14,16 @@ from .run import (
     longbench_prompt,
     resolve_dataset_name,
 )
+
+
+ZH_DATASETS = {
+    "multifieldqa_zh",
+    "dureader",
+    "vcsum",
+    "lsht",
+    "passage_retrieval_zh",
+}
+HAN_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 
 
 def parse_args():
@@ -64,7 +75,7 @@ def load_jsonl_member(archive, member, dataset):
     return records
 
 
-def input_length_stats(records):
+def input_length_stats(records, dataset):
     lengths = []
     prompt_args = argparse.Namespace(
         context_field="context",
@@ -73,8 +84,12 @@ def input_length_stats(records):
     )
     for record in records:
         prompt = build_generation_prompt(record, prompt_args, longbench_prompt)
-        lengths.append(len(prompt))
+        if dataset in ZH_DATASETS:
+            lengths.append(len(HAN_PATTERN.findall(prompt)))
+        else:
+            lengths.append(len(prompt.split()))
     return {
+        "unit": "han_chars" if dataset in ZH_DATASETS else "words",
         "max": max(lengths),
         "avg": round(sum(lengths) / len(lengths), 2),
     }
@@ -101,7 +116,7 @@ def build_task_info(args):
                 "dataset": dataset,
                 "num_test": len(records),
                 "max_new_tokens": DATASET2MAXLEN[dataset],
-                "input_length_chars": input_length_stats(records),
+                "input_length": input_length_stats(records, dataset),
             }
     return info
 

@@ -38,6 +38,38 @@ Local full-forward methods (`attention_topk`, `condition_block`, and `quest`)
 require eager attention so the runner can capture Q/K/V; this is set
 automatically unless you explicitly pass another attention implementation.
 
+## Prefill vs Decode Profiling
+
+To test whether a 16K-token prefill plus 512 generated tokens can spend most of
+its time in generation, run the cached decode profiler:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
+  python -m script.analysis.generate.profile_prefill_decode \
+  --device cuda:0 \
+  --model meta-llama/Llama-3.1-8B \
+  --prompt-tokens 16384 \
+  --decode-steps 512 \
+  --repeats 3 \
+  --warmup 1
+```
+
+The script times one full-context prefill forward separately from 512 cached
+single-token decode forwards, then prints `decode_pct`. It appends repeat and
+aggregate rows to `llama/result/generate/prefill_decode_profile.jsonl`.
+
+You can sweep context and output lengths in one run:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 conda run --no-capture-output -n nanogpt \
+  python -m script.analysis.generate.profile_prefill_decode \
+  --device cuda:0 \
+  --model meta-llama/Llama-3.1-8B \
+  --prompt-tokens 4096 8192 16384 \
+  --decode-steps 128 512 \
+  --repeats 3
+```
+
 ## LongBench
 
 LongBench v1 is loaded directly from the Hugging Face dataset repo

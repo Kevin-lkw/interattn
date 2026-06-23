@@ -4,7 +4,11 @@ import torch
 
 from ...context import RunContext
 from .attention_topk import run_prefill_only_attention_topk
-from .condition_block import build_condition_args, run_prefill_only_condition_block
+from .condition_block import (
+    build_condition_args,
+    generate_condition_block_cached,
+    run_prefill_only_condition_block,
+)
 from .hf import generate_hf
 from .kvpress import build_kvpress_press
 from .quest import build_quest_args, run_prefill_only_quest
@@ -17,6 +21,16 @@ def generate_with_method(model, tokenizer, input_ids, attention_mask, method, de
         press = build_kvpress_press(method)
         with press(model):
             return generate_hf(model, tokenizer, input_ids, attention_mask, method, dataset)
+    if method.kind == "condition_block":
+        return generate_condition_block_cached(
+            model=model,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            method=method,
+            device=device,
+            dataset=dataset,
+        )
     return generate_with_full_forward_patches(
         model=model,
         tokenizer=tokenizer,

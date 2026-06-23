@@ -67,6 +67,102 @@ def run_prefill_only_condition_block_optim(
     return logits, runner.summarize()
 
 
+def generate_condition_block_cached(
+    *,
+    model,
+    tokenizer,
+    input_ids,
+    attention_mask,
+    method,
+    device,
+    dataset=None,
+):
+    args = build_condition_args(method, int(input_ids.shape[1]))
+    if args.delta_mode != "range_bound":
+        raise ValueError("condition_block generate only supports delta_mode='range_bound'.")
+
+    generated = []
+    step_metadata = []
+    prompt_len = int(input_ids.shape[1])
+    cur_mask = attention_mask
+    total_len = prompt_len
+
+    stop_token_ids = []
+    if tokenizer.eos_token_id is not None:
+        stop_token_ids.append(tokenizer.eos_token_id)
+    if dataset == "samsum":
+        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        if newline_ids:
+            stop_token_ids.append(newline_ids[-1])
+
+    layer_idx_list = list(range(model.config.num_hidden_layers))
+
+    if method.max_new_tokens <= 0:
+        output_ids = torch.empty((input_ids.shape[0], 0), device=input_ids.device, dtype=input_ids.dtype)
+        return output_ids, summarize_condition_block_step_metadata(step_metadata)
+
+    with full_attention_sdpa_context():
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=cur_mask,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+    logits = outputs.logits.float()
+    past_key_values = outputs.past_key_values
+    step_metadata.append(_full_generation_step_metadata(model, [total_len - 1]))
+
+    next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+    generated.append(next_id)
+    cur_mask = torch.cat([cur_mask, torch.ones_like(next_id)], dim=1)
+    step_input_ids = next_id
+    total_len += 1
+
+    stop_ids = torch.tensor(stop_token_ids, device=next_id.device)
+    if stop_token_ids and bool(torch.isin(next_id, stop_ids).all().item()):
+        output_ids = torch.cat(generated, dim=1)
+        return output_ids, summarize_condition_block_step_metadata(step_metadata)
+
+    for _step in range(1, method.max_new_tokens):
+        pos_list = [total_len - 1]
+        runner = ConditionBlockGenerateOptimForward(
+            model=model,
+            model_config=model.config,
+            layer_idx_list=layer_idx_list,
+            full_attention_layers=args.full_attention_layers,
+            block_size=args.block_size,
+            eps=method.condition_eps,
+            prompt_len=prompt_len,
+            pos_list=pos_list,
+        )
+        with condition_block_generate_optim_context(runner):
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=step_input_ids,
+                    attention_mask=cur_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+        logits = outputs.logits.float()
+        past_key_values = outputs.past_key_values
+        step_metadata.append(runner.summarize())
+
+        next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        generated.append(next_id)
+        cur_mask = torch.cat([cur_mask, torch.ones_like(next_id)], dim=1)
+        step_input_ids = next_id
+        total_len += 1
+
+        stop_ids = torch.tensor(stop_token_ids, device=next_id.device)
+        if stop_token_ids and bool(torch.isin(next_id, stop_ids).all().item()):
+            break
+
+    output_ids = torch.cat(generated, dim=1)
+    return output_ids, summarize_condition_block_step_metadata(step_metadata)
+
+
 def build_condition_args(method, prompt_len):
     from types import SimpleNamespace
 
@@ -274,8 +370,23 @@ def _streaming_generate_hybrid_outputs(
     stats_mask,
 ):
     n_heads, n_query, head_dim = q_pos.shape
+    if n_query == 1:
+        return _vectorized_single_query_hybrid_outputs(
+            q_pos=q_pos,
+            pos_tensor=pos_tensor,
+            prompt_prefix=prompt_prefix,
+            k_suffix=k_suffix,
+            v_suffix=v_suffix,
+            block_size=block_size,
+            eps=eps,
+            prompt_len=prompt_len,
+            stats_mask=stats_mask,
+        )
+
     n_prompt_blocks = prompt_prefix["block_starts"].numel()
     scale = head_dim**0.5
+    k_suffix = k_suffix.float()
+    v_suffix = v_suffix.float()
     selected, z_logits, v_bar, size, cluster_exists = _range_bound_selection_and_summaries(
         q_pos=q_pos,
         pos_tensor=pos_tensor,
@@ -365,6 +476,97 @@ def _streaming_generate_hybrid_outputs(
     return output, stats
 
 
+def _vectorized_single_query_hybrid_outputs(
+    *,
+    q_pos,
+    pos_tensor,
+    prompt_prefix,
+    k_suffix,
+    v_suffix,
+    block_size,
+    eps,
+    prompt_len,
+    stats_mask,
+):
+    n_heads, n_query, head_dim = q_pos.shape
+    if n_query != 1:
+        raise ValueError("_vectorized_single_query_hybrid_outputs expects n_query=1.")
+    scale = head_dim**0.5
+    k_suffix = k_suffix.float()
+    v_suffix = v_suffix.float()
+    selected, z_logits, v_bar, size, cluster_exists = _range_bound_selection_and_summaries(
+        q_pos=q_pos,
+        pos_tensor=pos_tensor,
+        prefix=prompt_prefix,
+        block_size=block_size,
+        eps=eps,
+        prompt_len=prompt_len,
+    )
+
+    visible = (
+        prompt_prefix["valid_token"].view(1, -1, block_size)
+        & (prompt_prefix["token_idx"].view(1, -1, block_size) <= pos_tensor.view(-1, 1, 1))
+    )
+    token_active = selected.unsqueeze(-1) & visible.unsqueeze(0)
+    token_logits = torch.einsum("hqd,hbtd->hqbt", q_pos, prompt_prefix["k_block"]) / scale
+    token_logits = token_logits.masked_fill(~token_active, float("-inf"))
+
+    cluster_active = (~selected) & cluster_exists.unsqueeze(0)
+    cluster_logits = z_logits.masked_fill(~cluster_active, float("-inf"))
+
+    max_parts = [
+        token_logits.flatten(2).amax(dim=-1),
+        cluster_logits.amax(dim=-1),
+    ]
+
+    suffix_len = int(k_suffix.shape[1])
+    suffix_logits = None
+    suffix_active = None
+    if suffix_len > 0:
+        suffix_pos = torch.arange(
+            int(prompt_len),
+            int(prompt_len) + suffix_len,
+            device=q_pos.device,
+            dtype=torch.long,
+        )
+        suffix_active = suffix_pos.view(1, -1) <= pos_tensor.view(-1, 1)
+        suffix_active = suffix_active.unsqueeze(0).expand(n_heads, -1, -1)
+        suffix_logits = torch.einsum("hqd,hsd->hqs", q_pos, k_suffix.float()) / scale
+        suffix_logits = suffix_logits.masked_fill(~suffix_active, float("-inf"))
+        max_parts.append(suffix_logits.amax(dim=-1))
+
+    max_logit = torch.stack(max_parts, dim=0).amax(dim=0)
+    token_exp = torch.exp(token_logits - max_logit[:, :, None, None]).masked_fill(
+        ~token_active, 0.0
+    )
+    cluster_exp = torch.exp(cluster_logits - max_logit[:, :, None]).masked_fill(
+        ~cluster_active, 0.0
+    )
+    normalizer = token_exp.flatten(2).sum(dim=-1) + cluster_exp.sum(dim=-1)
+
+    token_num = torch.einsum("hqbt,hbtd->hqd", token_exp, prompt_prefix["v_block"])
+    cluster_num = (cluster_exp.unsqueeze(-1) * v_bar).sum(dim=2)
+    numerator = token_num + cluster_num
+
+    if suffix_logits is not None:
+        suffix_exp = torch.exp(suffix_logits - max_logit[:, :, None]).masked_fill(
+            ~suffix_active, 0.0
+        )
+        normalizer = normalizer + suffix_exp.sum(dim=-1)
+        numerator = numerator + torch.einsum("hqs,hsd->hqd", suffix_exp, v_suffix.float())
+
+    output = numerator / normalizer.clamp_min(1e-30).unsqueeze(-1)
+    stats = _stats_from_selection(
+        selected=selected,
+        size=size,
+        cluster_exists=cluster_exists,
+        pos_tensor=pos_tensor,
+        prompt_len=prompt_len,
+        stats_mask=stats_mask,
+    )
+    return output, stats
+
+
 class ConditionBlockGenerateOptimForward:
     def __init__(
         self,
@@ -437,15 +639,14 @@ class ConditionBlockGenerateOptimForward:
 
         if query.shape[0] != 1:
             raise ValueError("condition_block generate optim currently expects batch_size=1.")
-        if query.shape[2] != key.shape[2]:
-            raise ValueError("condition_block generate optim expects use_cache=False.")
         if attention_mask is not None and attention_mask.shape[-1] != key.shape[2]:
             raise ValueError("Unsupported attention_mask shape for condition_block generate optim.")
 
         _batch_size, n_heads, q_len, head_dim = query.shape
-        if self.prompt_len > q_len:
+        key_len = int(key.shape[2])
+        if self.prompt_len > key_len:
             raise ValueError(
-                f"prompt_len={self.prompt_len} cannot exceed current sequence length {q_len}."
+                f"prompt_len={self.prompt_len} cannot exceed current key length {key_len}."
             )
         output, _ = _sdpa_full_attention_forward(
             module,
@@ -459,8 +660,15 @@ class ConditionBlockGenerateOptimForward:
         )
         output_dtype = output.dtype
         pos_tensor = torch.tensor(self.pos_list, device=query.device, dtype=torch.long)
-        if bool((pos_tensor < 0).any().item()) or bool((pos_tensor >= q_len).any().item()):
-            raise ValueError(f"pos_list={self.pos_list} is out of range for q_len={q_len}.")
+        if bool((pos_tensor < 0).any().item()) or bool((pos_tensor >= key_len).any().item()):
+            raise ValueError(f"pos_list={self.pos_list} is out of range for key_len={key_len}.")
+        query_start = key_len - q_len
+        query_pos = pos_tensor - query_start
+        if bool((query_pos < 0).any().item()) or bool((query_pos >= q_len).any().item()):
+            raise ValueError(
+                f"pos_list={self.pos_list} does not refer to the current query window "
+                f"[{query_start}, {key_len})."
+            )
         stats_mask = torch.ones(pos_tensor.numel(), device=query.device, dtype=torch.bool)
         layer_stats = {}
         for kv_head, _out_indices, query_heads in grouped_query_heads(
@@ -468,7 +676,7 @@ class ConditionBlockGenerateOptimForward:
             self.model_config,
             num_kv_heads=key.shape[1],
         ):
-            q_pos = query[0, query_heads][:, pos_tensor, :].float()
+            q_pos = query[0, query_heads][:, query_pos, :].float()
             k_group = key[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
             v_group = value[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
             prompt_prefix = _build_block_prefix_tensors(
@@ -488,7 +696,7 @@ class ConditionBlockGenerateOptimForward:
                 stats_mask=stats_mask,
             )
             for head_offset, query_head in enumerate(query_heads):
-                output[0, pos_tensor, query_head, :] = group_output[head_offset].to(output_dtype)
+                output[0, query_pos, query_head, :] = group_output[head_offset].to(output_dtype)
             merge_stats(layer_stats, group_stats)
 
         self.stats_by_layer[int(layer_idx)] = layer_stats
@@ -502,6 +710,16 @@ def condition_block_generate_optim_context(runner):
     modeling_llama.eager_attention_forward = runner.hybrid_attention_forward
     try:
         yield runner
+    finally:
+        modeling_llama.eager_attention_forward = original_eager
+
+
+@contextlib.contextmanager
+def full_attention_sdpa_context():
+    original_eager = modeling_llama.eager_attention_forward
+    modeling_llama.eager_attention_forward = _sdpa_full_attention_forward
+    try:
+        yield
     finally:
         modeling_llama.eager_attention_forward = original_eager
 
@@ -520,4 +738,48 @@ def full_attention_stats_for_heads(n_heads, pos_list):
         "selected_tokens": total_available,
         "hybrid_tokens": total_available,
         "total_available": total_available,
+    }
+
+
+def _full_generation_step_metadata(model, pos_list):
+    aggregate = {}
+    by_layer = {}
+    n_heads = int(model.config.num_attention_heads)
+    for layer_idx in range(int(model.config.num_hidden_layers)):
+        stats = full_attention_stats_for_heads(n_heads, pos_list)
+        by_layer[layer_idx] = stats
+        merge_stats(aggregate, stats)
+    return summarize_stats(aggregate, by_layer)
+
+
+def summarize_condition_block_step_metadata(step_metadata):
+    aggregate = {}
+    by_step = []
+    for step_idx, metadata in enumerate(step_metadata):
+        if not metadata:
+            continue
+        step_aggregate = metadata.get("aggregate", {})
+        by_step.append(
+            {
+                "step": step_idx,
+                "equiv_budget": step_aggregate.get("mean_budget_causal"),
+            }
+        )
+        for key, value in step_aggregate.items():
+            if isinstance(value, int):
+                aggregate[key] = int(aggregate.get(key, 0)) + int(value)
+
+    total_available = max(int(aggregate.get("total_available", 0)), 1)
+    rows = max(int(aggregate.get("rows", 0)), 1)
+    hybrid_tokens = int(aggregate.get("hybrid_tokens", 0))
+    equiv_budget = float(hybrid_tokens / total_available)
+    return {
+        "condition_block_equiv_budget": equiv_budget,
+        "condition_block_budget": {
+            **aggregate,
+            "mean_hybrid_tokens": float(hybrid_tokens / rows),
+            "mean_budget_causal": equiv_budget,
+            "mean_budget_visible": equiv_budget,
+            "by_step": by_step,
+        },
     }

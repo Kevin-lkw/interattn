@@ -73,7 +73,7 @@ def add_method_args(parser):
     parser.add_argument("--condition-block-size", type=int, default=None)
     parser.add_argument(
         "--condition-delta-mode",
-        choices=["exact", "range_bound"],
+        choices=["range_bound"],
         default="range_bound",
     )
     parser.add_argument("--quest-page-size", type=int, default=None)

@@ -1,5 +1,6 @@
 import contextlib
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -235,6 +236,43 @@ def _build_block_prefix_tensors(k_all, v_all, block_size):
     }
 
 
+def _build_generate_prompt_block_tensors(k_all, v_all, block_size):
+    k_block, n_blocks = _pad_blocks(k_all.float(), block_size)
+    v_block, _ = _pad_blocks(v_all.float(), block_size)
+    device = k_all.device
+    seq_len = k_all.shape[1]
+
+    token_idx = torch.arange(n_blocks * block_size, device=device).reshape(
+        n_blocks, block_size
+    )
+    valid_token = token_idx < seq_len
+    valid = valid_token.view(1, n_blocks, block_size, 1)
+    size = valid_token.sum(dim=1).long()
+    size_float = size.clamp_min(1).float()
+
+    k_sum = (k_block * valid).sum(dim=2)
+    v_sum = (v_block * valid).sum(dim=2)
+    k_for_max = k_block.masked_fill(~valid, float("-inf"))
+    k_for_min = k_block.masked_fill(~valid, float("inf"))
+    v_norm = torch.norm(v_block, p=2, dim=-1)
+    v_norm = v_norm.masked_fill(~valid_token.view(1, n_blocks, block_size), float("-inf"))
+
+    return {
+        "generate_full_prompt": True,
+        "k_block": k_block,
+        "v_block": v_block,
+        "token_idx": token_idx,
+        "valid_token": valid_token,
+        "k_bar": k_sum / size_float.view(1, n_blocks, 1),
+        "v_bar": v_sum / size_float.view(1, n_blocks, 1),
+        "k_max": k_for_max.amax(dim=2),
+        "k_min": k_for_min.amin(dim=2),
+        "v_norm_max": v_norm.amax(dim=2),
+        "block_starts": torch.arange(n_blocks, device=device) * block_size,
+        "block_valid_counts": size,
+    }
+
+
 def _range_bound_selection_and_summaries(
     *,
     q_pos,
@@ -292,6 +330,57 @@ def _range_bound_selection_and_summaries(
     selected = (condition.mean(dim=0, keepdim=True) > eps) & cluster_exists.unsqueeze(0)
     selected = selected.expand(n_heads, -1, -1)
     return selected, z_logits, v_bar, size, cluster_exists
+
+
+def _range_bound_generate_selection_and_summaries(
+    *,
+    q_pos,
+    prefix,
+    eps,
+):
+    n_heads, n_query, head_dim = q_pos.shape
+    if n_query != 1:
+        raise ValueError("generate prompt block fast path expects n_query=1.")
+    if prefix["k_bar"].shape[0] != 1:
+        raise ValueError("generate prompt block fast path expects one KV head.")
+    scale = head_dim**0.5
+    size = prefix["block_valid_counts"].view(1, -1).long()
+    cluster_exists = size > 0
+    size_float = size.clamp_min(1).float()
+
+    k_bar = prefix["k_bar"][0]
+    v_bar = prefix["v_bar"][0]
+    s_c = torch.einsum("hqd,bd->hqb", q_pos, k_bar) / scale
+
+    k_max = prefix["k_max"][0]
+    k_min = prefix["k_min"][0]
+    q_for_bounds = q_pos[:, :, None, :]
+    upper_score = torch.maximum(
+        q_for_bounds * k_max[None, None],
+        q_for_bounds * k_min[None, None],
+    ).sum(dim=-1) / scale
+    lower_score = torch.minimum(
+        q_for_bounds * k_max[None, None],
+        q_for_bounds * k_min[None, None],
+    ).sum(dim=-1) / scale
+    delta = torch.maximum((upper_score - s_c).abs(), (lower_score - s_c).abs())
+    delta = delta.masked_fill(~cluster_exists.unsqueeze(0), 0.0)
+
+    b_c = prefix["v_norm_max"][0].view(1, 1, -1).expand(n_heads, n_query, -1)
+    b_c = b_c.masked_fill(~cluster_exists.unsqueeze(0), 0.0)
+    b_all = b_c.amax(dim=-1)
+
+    z_logits = torch.log(size_float).unsqueeze(0) + s_c
+    z_logits = z_logits.masked_fill(~cluster_exists.unsqueeze(0), float("-inf"))
+    p_tensor = torch.softmax(z_logits, dim=-1)
+    denom = (p_tensor * torch.cosh(delta)).sum(dim=-1).clamp_min(1e-30)
+    condition = p_tensor * (
+        2.0 * b_all.unsqueeze(-1) * (torch.cosh(delta) - 1.0) / denom.unsqueeze(-1)
+        + 2.0 * b_c * torch.tanh(delta / 2.0)
+    )
+    selected = (condition.mean(dim=0, keepdim=True) > eps) & cluster_exists.unsqueeze(0)
+    selected = selected.expand(n_heads, -1, -1)
+    return selected, z_logits, v_bar.view(1, 1, -1, head_dim), size, cluster_exists
 
 
 def _online_update(current_m, current_l, current_o, logits, values, active):
@@ -494,21 +583,35 @@ def _vectorized_single_query_hybrid_outputs(
     scale = head_dim**0.5
     k_suffix = k_suffix.float()
     v_suffix = v_suffix.float()
-    selected, z_logits, v_bar, size, cluster_exists = _range_bound_selection_and_summaries(
-        q_pos=q_pos,
-        pos_tensor=pos_tensor,
-        prefix=prompt_prefix,
-        block_size=block_size,
-        eps=eps,
-        prompt_len=prompt_len,
-    )
+    if prompt_prefix.get("generate_full_prompt"):
+        selected, z_logits, v_bar, size, cluster_exists = (
+            _range_bound_generate_selection_and_summaries(
+                q_pos=q_pos,
+                prefix=prompt_prefix,
+                eps=eps,
+            )
+        )
+    else:
+        selected, z_logits, v_bar, size, cluster_exists = _range_bound_selection_and_summaries(
+            q_pos=q_pos,
+            pos_tensor=pos_tensor,
+            prefix=prompt_prefix,
+            block_size=block_size,
+            eps=eps,
+            prompt_len=prompt_len,
+        )
 
     visible = (
         prompt_prefix["valid_token"].view(1, -1, block_size)
         & (prompt_prefix["token_idx"].view(1, -1, block_size) <= pos_tensor.view(-1, 1, 1))
     )
     token_active = selected.unsqueeze(-1) & visible.unsqueeze(0)
-    token_logits = torch.einsum("hqd,hbtd->hqbt", q_pos, prompt_prefix["k_block"]) / scale
+    k_block = prompt_prefix["k_block"]
+    v_block = prompt_prefix["v_block"]
+    if k_block.shape[0] == 1:
+        token_logits = torch.einsum("hqd,btd->hqbt", q_pos, k_block[0]) / scale
+    else:
+        token_logits = torch.einsum("hqd,hbtd->hqbt", q_pos, k_block) / scale
     token_logits = token_logits.masked_fill(~token_active, float("-inf"))
 
     cluster_active = (~selected) & cluster_exists.unsqueeze(0)
@@ -531,7 +634,10 @@ def _vectorized_single_query_hybrid_outputs(
         )
         suffix_active = suffix_pos.view(1, -1) <= pos_tensor.view(-1, 1)
         suffix_active = suffix_active.unsqueeze(0).expand(n_heads, -1, -1)
-        suffix_logits = torch.einsum("hqd,hsd->hqs", q_pos, k_suffix.float()) / scale
+        if k_suffix.shape[0] == 1:
+            suffix_logits = torch.einsum("hqd,sd->hqs", q_pos, k_suffix[0]) / scale
+        else:
+            suffix_logits = torch.einsum("hqd,hsd->hqs", q_pos, k_suffix) / scale
         suffix_logits = suffix_logits.masked_fill(~suffix_active, float("-inf"))
         max_parts.append(suffix_logits.amax(dim=-1))
 
@@ -544,7 +650,10 @@ def _vectorized_single_query_hybrid_outputs(
     )
     normalizer = token_exp.flatten(2).sum(dim=-1) + cluster_exp.sum(dim=-1)
 
-    token_num = torch.einsum("hqbt,hbtd->hqd", token_exp, prompt_prefix["v_block"])
+    if v_block.shape[0] == 1:
+        token_num = torch.einsum("hqbt,btd->hqd", token_exp, v_block[0])
+    else:
+        token_num = torch.einsum("hqbt,hbtd->hqd", token_exp, v_block)
     cluster_num = (cluster_exp.unsqueeze(-1) * v_bar).sum(dim=2)
     numerator = token_num + cluster_num
 
@@ -553,7 +662,10 @@ def _vectorized_single_query_hybrid_outputs(
             ~suffix_active, 0.0
         )
         normalizer = normalizer + suffix_exp.sum(dim=-1)
-        numerator = numerator + torch.einsum("hqs,hsd->hqd", suffix_exp, v_suffix.float())
+        if v_suffix.shape[0] == 1:
+            numerator = numerator + torch.einsum("hqs,sd->hqd", suffix_exp, v_suffix[0])
+        else:
+            numerator = numerator + torch.einsum("hqs,hsd->hqd", suffix_exp, v_suffix)
 
     output = numerator / normalizer.clamp_min(1e-30).unsqueeze(-1)
     stats = _stats_from_selection(
@@ -671,19 +783,33 @@ class ConditionBlockGenerateOptimForward:
             )
         stats_mask = torch.ones(pos_tensor.numel(), device=query.device, dtype=torch.bool)
         layer_stats = {}
+        use_generate_prompt_fast_path = (
+            q_len == 1
+            and bool((pos_tensor >= self.prompt_len).all().item())
+            and os.environ.get("CONDITION_BLOCK_DISABLE_GENERATE_FAST_PATH") != "1"
+        )
         for kv_head, _out_indices, query_heads in grouped_query_heads(
             list(range(n_heads)),
             self.model_config,
             num_kv_heads=key.shape[1],
         ):
             q_pos = query[0, query_heads][:, query_pos, :].float()
-            k_group = key[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
-            v_group = value[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
-            prompt_prefix = _build_block_prefix_tensors(
-                k_group[:, : self.prompt_len],
-                v_group[:, : self.prompt_len],
-                self.block_size,
-            )
+            if use_generate_prompt_fast_path:
+                k_group = key[0, kv_head : kv_head + 1]
+                v_group = value[0, kv_head : kv_head + 1]
+                prompt_prefix = _build_generate_prompt_block_tensors(
+                    k_group[:, : self.prompt_len],
+                    v_group[:, : self.prompt_len],
+                    self.block_size,
+                )
+            else:
+                k_group = key[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
+                v_group = value[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
+                prompt_prefix = _build_block_prefix_tensors(
+                    k_group[:, : self.prompt_len],
+                    v_group[:, : self.prompt_len],
+                    self.block_size,
+                )
             group_output, group_stats = _streaming_generate_hybrid_outputs(
                 q_pos=q_pos,
                 pos_tensor=pos_tensor,

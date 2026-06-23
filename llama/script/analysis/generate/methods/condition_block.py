@@ -84,6 +84,9 @@ def run_prefill_only_condition_block_optim(
     pos_list,
     model_inputs,
 ):
+    seq_len = int(model_inputs["input_ids"].shape[1])
+    tail_len = len(pos_list)
+    use_tail_logits = pos_list == list(range(seq_len - tail_len, seq_len))
     runner = ConditionBlockGenerateOptimForward(
         model=ctx.model,
         model_config=ctx.model_config,
@@ -96,7 +99,13 @@ def run_prefill_only_condition_block_optim(
     )
     with condition_block_generate_optim_context(runner):
         with torch.no_grad():
-            logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
+            outputs = ctx.model(
+                **model_inputs,
+                use_cache=False,
+                logits_to_keep=tail_len if use_tail_logits else 0,
+            )
+            logits = outputs.logits if use_tail_logits else outputs.logits[:, pos_list, :]
+            logits = logits.float()
     return logits, runner.summarize()
 
 
@@ -259,13 +268,15 @@ def _sdpa_full_attention_forward(
     **_kwargs,
 ):
     dropout_p = float(dropout) if module.training else 0.0
+    is_full_sequence_causal = query.shape[2] == key.shape[2]
+    sdpa_mask = None if is_full_sequence_causal else attention_mask
     attn_output = F.scaled_dot_product_attention(
         query,
         key,
         value,
-        attn_mask=attention_mask,
+        attn_mask=sdpa_mask,
         dropout_p=dropout_p,
-        is_causal=False,
+        is_causal=is_full_sequence_causal,
         scale=scaling,
         enable_gqa=query.shape[1] != key.shape[1],
     )
@@ -478,24 +489,28 @@ class ConditionBlockGenerateOptimForward:
             raise ValueError(
                 f"prompt_len={self.prompt_len} cannot exceed current sequence length {q_len}."
             )
-        pos_tensor = torch.arange(q_len, device=query.device, dtype=torch.long)
-        stats_mask = torch.zeros(q_len, device=query.device, dtype=torch.bool)
-        stats_mask[torch.tensor(self.pos_list, device=query.device, dtype=torch.long)] = True
-        output = torch.empty(
-            1,
-            q_len,
-            n_heads,
-            head_dim,
-            device=query.device,
-            dtype=torch.float32,
+        output, _ = _sdpa_full_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            scaling=scaling,
+            dropout=dropout,
+            **kwargs,
         )
+        output_dtype = output.dtype
+        pos_tensor = torch.tensor(self.pos_list, device=query.device, dtype=torch.long)
+        if bool((pos_tensor < 0).any().item()) or bool((pos_tensor >= q_len).any().item()):
+            raise ValueError(f"pos_list={self.pos_list} is out of range for q_len={q_len}.")
+        stats_mask = torch.ones(pos_tensor.numel(), device=query.device, dtype=torch.bool)
         layer_stats = {}
         for kv_head, _out_indices, query_heads in grouped_query_heads(
             list(range(n_heads)),
             self.model_config,
             num_kv_heads=key.shape[1],
         ):
-            q_pos = query[0, query_heads].float()
+            q_pos = query[0, query_heads][:, pos_tensor, :].float()
             k_group = key[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
             v_group = value[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
             prompt_prefix = _build_block_prefix_tensors(
@@ -514,12 +529,13 @@ class ConditionBlockGenerateOptimForward:
                 prompt_len=self.prompt_len,
                 stats_mask=stats_mask,
             )
-            output[0, :, query_heads, :] = group_output.permute(1, 0, 2)
+            for head_offset, query_head in enumerate(query_heads):
+                output[0, pos_tensor, query_head, :] = group_output[head_offset].to(output_dtype)
             merge_stats(layer_stats, group_stats)
 
         self.stats_by_layer[int(layer_idx)] = layer_stats
         merge_stats(self.aggregate_stats, layer_stats)
-        return output.to(query.dtype), None
+        return output, None
 
 
 @contextlib.contextmanager

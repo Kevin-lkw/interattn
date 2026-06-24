@@ -97,6 +97,11 @@ def generate_condition_block_cached(
             stop_token_ids.append(newline_ids[-1])
 
     layer_idx_list = list(range(model.config.num_hidden_layers))
+    prompt_prefix_cache = (
+        None
+        if os.environ.get("CONDITION_BLOCK_DISABLE_PROMPT_PREFIX_CACHE") == "1"
+        else {}
+    )
 
     if method.max_new_tokens <= 0:
         output_ids = torch.empty((input_ids.shape[0], 0), device=input_ids.device, dtype=input_ids.dtype)
@@ -136,6 +141,7 @@ def generate_condition_block_cached(
             eps=method.condition_eps,
             prompt_len=prompt_len,
             pos_list=pos_list,
+            prompt_prefix_cache=prompt_prefix_cache,
         )
         with condition_block_generate_optim_context(runner):
             with torch.no_grad():
@@ -691,6 +697,7 @@ class ConditionBlockGenerateOptimForward:
         eps,
         prompt_len,
         pos_list,
+        prompt_prefix_cache=None,
     ):
         self.model_config = model_config
         self.module_to_layer_idx = {
@@ -703,6 +710,7 @@ class ConditionBlockGenerateOptimForward:
         self.eps = float(eps)
         self.prompt_len = int(prompt_len)
         self.pos_list = [int(pos) for pos in pos_list]
+        self.prompt_prefix_cache = prompt_prefix_cache
         self.stats_by_layer = {}
         self.aggregate_stats = {}
 
@@ -760,17 +768,6 @@ class ConditionBlockGenerateOptimForward:
             raise ValueError(
                 f"prompt_len={self.prompt_len} cannot exceed current key length {key_len}."
             )
-        output, _ = _sdpa_full_attention_forward(
-            module,
-            query,
-            key,
-            value,
-            attention_mask,
-            scaling=scaling,
-            dropout=dropout,
-            **kwargs,
-        )
-        output_dtype = output.dtype
         pos_tensor = torch.tensor(self.pos_list, device=query.device, dtype=torch.long)
         if bool((pos_tensor < 0).any().item()) or bool((pos_tensor >= key_len).any().item()):
             raise ValueError(f"pos_list={self.pos_list} is out of range for key_len={key_len}.")
@@ -788,6 +785,30 @@ class ConditionBlockGenerateOptimForward:
             and bool((pos_tensor >= self.prompt_len).all().item())
             and os.environ.get("CONDITION_BLOCK_DISABLE_GENERATE_FAST_PATH") != "1"
         )
+        can_fill_all_query_outputs = (
+            use_generate_prompt_fast_path
+            and pos_tensor.numel() == q_len
+            and bool(torch.equal(query_pos, torch.arange(q_len, device=query.device)))
+        )
+        if can_fill_all_query_outputs:
+            output = torch.empty(
+                (1, q_len, n_heads, head_dim),
+                device=query.device,
+                dtype=query.dtype,
+            )
+            output_dtype = output.dtype
+        else:
+            output, _ = _sdpa_full_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                scaling=scaling,
+                dropout=dropout,
+                **kwargs,
+            )
+            output_dtype = output.dtype
         for kv_head, _out_indices, query_heads in grouped_query_heads(
             list(range(n_heads)),
             self.model_config,
@@ -797,11 +818,18 @@ class ConditionBlockGenerateOptimForward:
             if use_generate_prompt_fast_path:
                 k_group = key[0, kv_head : kv_head + 1]
                 v_group = value[0, kv_head : kv_head + 1]
-                prompt_prefix = _build_generate_prompt_block_tensors(
-                    k_group[:, : self.prompt_len],
-                    v_group[:, : self.prompt_len],
-                    self.block_size,
-                )
+                cache_key = (int(layer_idx), int(kv_head), self.prompt_len, self.block_size)
+                prompt_prefix = None
+                if self.prompt_prefix_cache is not None:
+                    prompt_prefix = self.prompt_prefix_cache.get(cache_key)
+                if prompt_prefix is None:
+                    prompt_prefix = _build_generate_prompt_block_tensors(
+                        k_group[:, : self.prompt_len],
+                        v_group[:, : self.prompt_len],
+                        self.block_size,
+                    )
+                    if self.prompt_prefix_cache is not None:
+                        self.prompt_prefix_cache[cache_key] = prompt_prefix
             else:
                 k_group = key[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)
                 v_group = value[0, kv_head : kv_head + 1].expand(len(query_heads), -1, -1)

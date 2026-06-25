@@ -19,7 +19,7 @@ ENV_PREFIX=(
 if [ "$#" -gt 0 ]; then
   BUDGET_LIST=("$@")
 else
-  BUDGET_LIST=(0.1 0.25 0.5 0.75)
+  BUDGET_LIST=(0.05 0.1 0.25 0.5 0.75)
 fi
 
 read -r -a DATASET_LIST <<< "${DATASETS}"

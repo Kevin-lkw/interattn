@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GPU_ID="${GPU_ID:-6}"
+GPU_ID="${GPU_ID:-7}"
 CONDA_ENV="${CONDA_ENV:-nanogpt}"
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
+BLOCK_SIZE="${BLOCK_SIZE:-32}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-llama/result/generate}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique }"

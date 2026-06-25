@@ -36,6 +36,13 @@ def parse_args():
         help="Defaults to <result-root>/<model>/<benchmark>/<dataset>/eval_plots.",
     )
     parser.add_argument("--plot-dpi", type=int, default=180)
+    parser.add_argument(
+        "--exclude-condition-block-sizes",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Condition-block sizes to omit from summaries and plots.",
+    )
     return parser.parse_args()
 
 
@@ -95,8 +102,14 @@ def run_label(row):
         return "Full attention"
     if method == "kvpress_streamllm":
         return f"StreamLLM {row['budget']:g}"
+    if method == "kvpress_snapkv":
+        return f"SnapKV {row['budget']:g}"
+    if method == "kvpress_adakv_snapkv":
+        return f"AdaKV SnapKV {row['budget']:g}"
     if method == "condition_block":
         return f"CondBlock b{row['block_size']} eps={row['eps']:g}"
+    if method == "quest":
+        return f"QUEST {row['budget']:g}"
     if "budget" in row:
         return f"{method} {row['budget']:g}"
     return row["run"]
@@ -140,9 +153,11 @@ def sort_key(row):
     method_order = {
         "full": 0,
         "kvpress_streamllm": 1,
-        "h2o": 2,
-        "quest": 3,
-        "condition_block": 4,
+        "kvpress_snapkv": 2,
+        "kvpress_adakv_snapkv": 3,
+        "h2o": 4,
+        "quest": 5,
+        "condition_block": 6,
     }
     return (
         method_order.get(row.get("method"), 99),
@@ -183,15 +198,24 @@ def write_csv(path, rows):
             writer.writerow(row)
 
 
-def plot_score_vs_budget(path, rows, dataset, dpi):
+def plot_score_vs_budget(path, rows, dataset, dpi, xscale="linear"):
     rows = [row for row in rows if row.get("score") is not None]
     fig, ax = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
     colors = {
         "full": "#111827",
         "kvpress_streamllm": "#4C78A8",
+        "kvpress_snapkv": "#F58518",
+        "kvpress_adakv_snapkv": "#B279A2",
         "h2o": "#F58518",
         "quest": "#54A24B",
         "condition_block": "#E45756",
+    }
+    labels = {
+        "kvpress_streamllm": "StreamLLM",
+        "kvpress_snapkv": "SnapKV",
+        "kvpress_adakv_snapkv": "AdaKV SnapKV",
+        "h2o": "H2O",
+        "quest": "QUEST",
     }
 
     condition_rows = [row for row in rows if row.get("method") == "condition_block"]
@@ -215,7 +239,12 @@ def plot_score_vs_budget(path, rows, dataset, dpi):
             label=f"CondBlock block={block_size}",
         )
 
-    for method in ["full", "kvpress_streamllm", "h2o", "quest"]:
+    line_methods = [
+        method
+        for method in sorted({row.get("method") for row in rows})
+        if method not in {"condition_block", "full"}
+    ]
+    for method in line_methods:
         points = [
             row
             for row in rows
@@ -223,28 +252,46 @@ def plot_score_vs_budget(path, rows, dataset, dpi):
         ]
         if not points:
             continue
-        ax.scatter(
+        points = sorted(points, key=lambda row: row["effective_decode_budget"])
+        ax.plot(
             [row["effective_decode_budget"] for row in points],
             [row["score"] for row in points],
-            s=48,
+            marker="o",
+            linewidth=1.6,
             color=colors.get(method, "#777777"),
-            label=method,
-            zorder=3,
+            label=labels.get(method, method),
         )
-        for row in points:
-            ax.annotate(
-                row["label"],
-                (row["effective_decode_budget"], row["score"]),
-                xytext=(4, 4),
-                textcoords="offset points",
-                fontsize=8,
-            )
 
-    ax.set_title(f"{dataset}: LongBench score vs decode budget")
+    full_rows = [row for row in rows if row.get("method") == "full" and row.get("score") is not None]
+    if full_rows:
+        full_score = full_rows[0]["score"]
+        ax.axhline(
+            full_score,
+            color=colors["full"],
+            linewidth=1.4,
+            linestyle="--",
+            label=f"Full attention ({full_score:.2f})",
+        )
+
+    if xscale == "log":
+        positive_budgets = [
+            float(row["effective_decode_budget"])
+            for row in rows
+            if row.get("effective_decode_budget") is not None
+            and float(row["effective_decode_budget"]) > 0
+            and row.get("method") != "full"
+        ]
+        if positive_budgets:
+            ax.set_xscale("log")
+            ax.set_xlim(left=min(positive_budgets) * 0.8, right=1.05)
+    else:
+        ax.set_xlim(left=0)
+
+    title_suffix = " (log budget)" if xscale == "log" else ""
+    ax.set_title(f"{dataset}: LongBench score vs decode budget{title_suffix}")
     ax.set_xlabel("Effective decode attention budget")
     ax.set_ylabel("Score")
     ax.grid(True, alpha=0.25)
-    ax.set_xlim(left=0)
     ax.legend(fontsize=8)
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
@@ -299,6 +346,16 @@ def plot_condition_eps(path, rows, dataset, dpi):
 def main():
     args = parse_args()
     rows = sorted(evaluate_dataset(args), key=sort_key)
+    if args.exclude_condition_block_sizes:
+        excluded_sizes = set(args.exclude_condition_block_sizes)
+        rows = [
+            row
+            for row in rows
+            if not (
+                row.get("method") == "condition_block"
+                and row.get("block_size") in excluded_sizes
+            )
+        ]
     dataset_name = f"{args.dataset}_e" if args.e else args.dataset
     dataset_dir = args.result_root / args.model / args.benchmark / dataset_name
     output_dir = args.output_dir or dataset_dir / "eval_plots"
@@ -307,16 +364,19 @@ def main():
     json_path = output_dir / "eval_summary.json"
     csv_path = output_dir / "eval_summary.csv"
     budget_plot_path = output_dir / "score_vs_effective_decode_budget.png"
+    log_budget_plot_path = output_dir / "score_vs_effective_decode_budget_log.png"
     eps_plot_path = output_dir / "condition_block_eps.png"
 
     write_json(json_path, rows)
     write_csv(csv_path, rows)
     plot_score_vs_budget(budget_plot_path, rows, dataset_name, args.plot_dpi)
+    plot_score_vs_budget(log_budget_plot_path, rows, dataset_name, args.plot_dpi, xscale="log")
     has_eps_plot = plot_condition_eps(eps_plot_path, rows, dataset_name, args.plot_dpi)
 
     print(f"Saved JSON: {json_path}")
     print(f"Saved CSV: {csv_path}")
     print(f"Saved plot: {budget_plot_path}")
+    print(f"Saved plot: {log_budget_plot_path}")
     if has_eps_plot:
         print(f"Saved plot: {eps_plot_path}")
     print_warnings(rows)

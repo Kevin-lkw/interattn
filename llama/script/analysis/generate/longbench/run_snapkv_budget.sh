@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GPU_ID="${GPU_ID:-5}"
+GPU_ID="${GPU_ID:-4}"
 CONDA_ENV="${CONDA_ENV:-nanogpt}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-llama/result/generate}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique }"
+DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique gov_report qmsum multi_news trec triviaqa samsum passage_count passage_retrieval_en lcc repobench-p}"
 KVPRESS_WINDOW_SIZE="${KVPRESS_WINDOW_SIZE:-64}"
 KVPRESS_KERNEL_SIZE="${KVPRESS_KERNEL_SIZE:-5}"
 

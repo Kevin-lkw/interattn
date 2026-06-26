@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GPU_ID="${GPU_ID:-7}"
+GPU_ID="${GPU_ID:-4}"
 CONDA_ENV="${CONDA_ENV:-nanogpt}"
 BLOCK_SIZE="${BLOCK_SIZE:-32}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-llama/result/generate}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique }"
+DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique gov_report qmsum multi_news trec triviaqa samsum passage_count passage_retrieval_en lcc repobench-p}"
 
 ENV_PREFIX=(
   "CUDA_VISIBLE_DEVICES=${GPU_ID}"

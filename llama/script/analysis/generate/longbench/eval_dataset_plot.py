@@ -43,6 +43,16 @@ def parse_args():
         default=[],
         help="Condition-block sizes to omit from summaries and plots.",
     )
+    parser.add_argument(
+        "--skip-incomplete-runs",
+        action="store_true",
+        help="Skip jsonl files whose row count does not match the dataset size.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Recompute every run even if eval_summary.json has a matching cached result.",
+    )
     return parser.parse_args()
 
 
@@ -115,7 +125,36 @@ def run_label(row):
     return row["run"]
 
 
-def evaluate_dataset(args):
+def load_cached_rows(path):
+    if not path.exists():
+        return {}
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    return {
+        row["run"]: row
+        for row in rows
+        if isinstance(row, dict) and row.get("run") and row.get("score") is not None
+    }
+
+
+def cache_matches(row, pred_path, expected_rows):
+    if row.get("file_size_bytes") != pred_path.stat().st_size:
+        return False
+    if row.get("file_mtime_utc") != datetime.fromtimestamp(
+        pred_path.stat().st_mtime,
+        tz=timezone.utc,
+    ).isoformat():
+        return False
+    if expected_rows is not None and row.get("num_predictions") != expected_rows:
+        return False
+    return True
+
+
+def evaluate_dataset(args, cached_rows=None):
     dataset_name = f"{args.dataset}_e" if args.e else args.dataset
     dataset_dir = args.result_root / args.model / args.benchmark / dataset_name
     if not dataset_dir.exists():
@@ -123,9 +162,27 @@ def evaluate_dataset(args):
 
     metadata = load_metadata(args.hf_repo, args.dataset, args.e)
     rows = []
+    cache_hits = 0
+    cached_rows = cached_rows or {}
+    excluded_condition_block_sizes = set(args.exclude_condition_block_sizes)
     for pred_path in sorted(dataset_dir.glob("*.jsonl")):
-        pred_rows = read_jsonl(pred_path)
         run_info = parse_run_name(pred_path)
+        if (
+            run_info.get("method") == "condition_block"
+            and run_info.get("block_size") in excluded_condition_block_sizes
+        ):
+            continue
+
+        expected_rows = len(metadata) if args.skip_incomplete_runs else None
+        cached = cached_rows.get(run_info["run"])
+        if cached and cache_matches(cached, pred_path, expected_rows):
+            rows.append(cached)
+            cache_hits += 1
+            continue
+
+        pred_rows = read_jsonl(pred_path)
+        if args.skip_incomplete_runs and len(pred_rows) != len(metadata):
+            continue
         run_info["dataset"] = dataset_name
         run_info["file_mtime_utc"] = datetime.fromtimestamp(
             pred_path.stat().st_mtime,
@@ -146,7 +203,7 @@ def evaluate_dataset(args):
         )
         run_info["label"] = run_label(run_info)
         rows.append(run_info)
-    return rows
+    return rows, cache_hits
 
 
 def sort_key(row):
@@ -345,17 +402,6 @@ def plot_condition_eps(path, rows, dataset, dpi):
 
 def main():
     args = parse_args()
-    rows = sorted(evaluate_dataset(args), key=sort_key)
-    if args.exclude_condition_block_sizes:
-        excluded_sizes = set(args.exclude_condition_block_sizes)
-        rows = [
-            row
-            for row in rows
-            if not (
-                row.get("method") == "condition_block"
-                and row.get("block_size") in excluded_sizes
-            )
-        ]
     dataset_name = f"{args.dataset}_e" if args.e else args.dataset
     dataset_dir = args.result_root / args.model / args.benchmark / dataset_name
     output_dir = args.output_dir or dataset_dir / "eval_plots"
@@ -366,6 +412,10 @@ def main():
     budget_plot_path = output_dir / "score_vs_effective_decode_budget.png"
     log_budget_plot_path = output_dir / "score_vs_effective_decode_budget_log.png"
     eps_plot_path = output_dir / "condition_block_eps.png"
+
+    cached_rows = {} if args.no_cache else load_cached_rows(json_path)
+    rows, cache_hits = evaluate_dataset(args, cached_rows)
+    rows = sorted(rows, key=sort_key)
 
     write_json(json_path, rows)
     write_csv(csv_path, rows)
@@ -379,6 +429,8 @@ def main():
     print(f"Saved plot: {log_budget_plot_path}")
     if has_eps_plot:
         print(f"Saved plot: {eps_plot_path}")
+    if cache_hits:
+        print(f"Reused cached eval rows: {cache_hits}")
     print_warnings(rows)
     print("")
     print("Top rows:")

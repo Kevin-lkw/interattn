@@ -8,6 +8,7 @@ from tqdm import tqdm
 from ..common import (
     add_generation_args,
     load_model_and_tokenizer,
+    pending_generation_records,
     run_generation_benchmark,
     validate_generation_args,
 )
@@ -80,14 +81,40 @@ def main():
     args.id_field = "_id"
     validate_generation_args(copy(args))
 
-    model, tokenizer = load_model_and_tokenizer(args)
+    pending_jobs = []
     for dataset in tqdm(args.datasets, desc="LongBench datasets", unit="dataset"):
         dataset_args = copy(args)
         dataset_args.dataset = dataset
         dataset_args.max_new_tokens = requested_max_new_tokens or DATASET2MAXLEN[dataset]
-
-        records = None if dataset_args.data is not None else load_longbench_records(dataset_args)
         benchmark_name = f"longbench/{resolve_dataset_name(dataset, dataset_args.longbench_e)}"
+        try:
+            records = None if dataset_args.data is not None else load_longbench_records(dataset_args)
+            records, out_path, _done_ids, pending_records = pending_generation_records(
+                dataset_args,
+                benchmark_name=benchmark_name,
+                records=records,
+            )
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            tqdm.write(f"Failed {benchmark_name}: {type(exc).__name__}: {exc}")
+            traceback.print_exc(limit=20)
+            continue
+        if not pending_records:
+            tqdm.write(f"All predictions already exist; skipping {benchmark_name}: {out_path}")
+            continue
+        pending_jobs.append((dataset_args, benchmark_name, records))
+
+    if not pending_jobs:
+        print("All requested predictions already exist; skipping model load.")
+        return
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    for dataset_args, benchmark_name, records in tqdm(
+        pending_jobs,
+        desc="LongBench pending datasets",
+        unit="dataset",
+    ):
         try:
             run_generation_benchmark(
                 dataset_args,

@@ -217,6 +217,23 @@ def output_path(args, benchmark_name):
     return out_dir / filename
 
 
+def pending_generation_records(args, benchmark_name, records=None):
+    if records is None:
+        if args.data is None:
+            raise ValueError("--data is required unless the benchmark runner provides records.")
+        records = read_records(args.data, args.limit)
+    elif args.limit is not None:
+        records = records[: args.limit]
+    out_path = output_path(args, benchmark_name)
+    done_ids = _load_done_ids(out_path)
+    pending_records = [
+        (index, record)
+        for index, record in enumerate(records)
+        if record_id(record, args, index) not in done_ids
+    ]
+    return records, out_path, done_ids, pending_records
+
+
 def run_generation_benchmark(
     args,
     benchmark_name,
@@ -230,21 +247,26 @@ def run_generation_benchmark(
         args.max_new_tokens = 32
     set_seed(args.seed)
     method = build_method(args)
-    if records is None:
-        if args.data is None:
-            raise ValueError("--data is required unless the benchmark runner provides records.")
-        records = read_records(args.data, args.limit)
-    elif args.limit is not None:
-        records = records[: args.limit]
-    out_path = output_path(args, benchmark_name)
-    done_ids = _load_done_ids(out_path)
+    records, out_path, done_ids, pending_records = pending_generation_records(
+        args,
+        benchmark_name,
+        records,
+    )
+    if not pending_records:
+        print(f"All predictions already exist; skipping model load: {out_path}")
+        return out_path
     if model is None or tokenizer is None:
         model, tokenizer = load_model_and_tokenizer(args)
     if args.max_input_tokens is None and getattr(model.config, "max_position_embeddings", None):
         args.max_input_tokens = int(model.config.max_position_embeddings)
 
     with out_path.open("a", encoding="utf-8") as handle:
-        for index, record in enumerate(tqdm(records, desc=f"{benchmark_name}:{method.name}", unit="sample")):
+        for index, record in tqdm(
+            pending_records,
+            desc=f"{benchmark_name}:{method.name}",
+            unit="sample",
+            total=len(pending_records),
+        ):
             rid = record_id(record, args, index)
             if rid in done_ids:
                 continue

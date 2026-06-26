@@ -17,6 +17,29 @@ from .plot_quest_external import (
 from .run import DATASET2PROMPT
 
 
+DEFAULT_DATASETS = [
+    "narrativeqa",
+    "qasper",
+    "multifieldqa_en",
+    "hotpotqa",
+    "2wikimqa",
+    "musique",
+    "gov_report",
+    "qmsum",
+    "multi_news",
+    "trec",
+    "triviaqa",
+    "samsum",
+    "passage_count",
+    "passage_retrieval_en",
+    "lcc",
+    "repobench-p",
+]
+
+NO_CHAT_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+REQUIRED_TOKEN_BUDGETS = {512, 1024, 2048, 4096}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Import external QUEST LongBench predictions into the local result tree."
@@ -31,8 +54,13 @@ def parse_args():
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa"],
+        default=DEFAULT_DATASETS,
         choices=sorted(DATASET2METRIC),
+    )
+    parser.add_argument(
+        "--require-complete-datasets",
+        action="store_true",
+        help="Only import datasets with full plus 512/1024/2048/4096 complete QUEST files.",
     )
     parser.add_argument(
         "--include-full",
@@ -54,7 +82,8 @@ def load_records_and_lengths(args, tokenizer, dataset):
         record = dict(raw_record)
         record_id = str(record.get("_id", record.get("id", index)))
         prompt = DATASET2PROMPT[dataset].format(**record)
-        prompt = apply_llama3_chat_template(tokenizer, prompt)
+        if dataset not in NO_CHAT_DATASETS:
+            prompt = apply_llama3_chat_template(tokenizer, prompt)
         records.append(record_id)
         lengths.append(quest_context_length(tokenizer, prompt, dataset))
     return records, lengths
@@ -108,49 +137,78 @@ def remove_previous_imports(dataset_dir):
 def main():
     args = parse_args()
     root = args.result_root / args.model / args.benchmark
-    result = json.loads(args.quest_result_json.read_text(encoding="utf-8"))
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model, use_fast=False)
     metadata_cache = {}
     imported = []
+    skipped = []
+    available = {}
 
     for dataset in args.datasets:
         dataset_dir = root / dataset
         remove_previous_imports(dataset_dir)
 
-    for filename in sorted(result):
-        dataset, token_budget = parse_quest_filename(filename)
+    for source_path in sorted(args.quest_pred_dir.glob("*.jsonl")):
+        dataset, token_budget = parse_quest_filename(source_path.name)
         if dataset not in args.datasets:
             continue
-        if token_budget is None and not args.include_full:
-            continue
+        available.setdefault(dataset, {})[token_budget] = source_path
 
-        source_path = args.quest_pred_dir / filename
-        if not source_path.exists():
-            raise FileNotFoundError(f"Missing QUEST prediction file: {source_path}")
+    if args.require_complete_datasets:
+        complete = set()
+        for dataset, files in available.items():
+            if None not in files:
+                skipped.append((dataset, "missing full"))
+                continue
+            token_budgets = {budget for budget in files if budget is not None}
+            missing = REQUIRED_TOKEN_BUDGETS - token_budgets
+            if missing:
+                skipped.append(
+                    (dataset, "missing budgets " + ",".join(map(str, sorted(missing))))
+                )
+                continue
+            complete.add(dataset)
+        available = {dataset: files for dataset, files in available.items() if dataset in complete}
 
+    for dataset, files in sorted(available.items()):
         if dataset not in metadata_cache:
             metadata_cache[dataset] = load_records_and_lengths(args, tokenizer, dataset)
         record_ids, input_lengths = metadata_cache[dataset]
 
-        if token_budget is None:
-            run_budget = 1.0
-        else:
-            run_budget = budget_stats(token_budget, input_lengths)["effective_decode_budget"]
+        for token_budget, source_path in sorted(
+            files.items(), key=lambda item: (-1 if item[0] is None else item[0])
+        ):
+            if token_budget is None and not args.include_full:
+                continue
 
-        destination = (
-            root
-            / dataset
-            / f"quest_budget={output_budget_name(run_budget)}.jsonl"
-        )
-        rows = imported_rows(
-            read_jsonl(source_path),
-            record_ids,
-            input_lengths,
-            token_budget,
-            run_budget,
-        )
-        write_jsonl(destination, rows)
-        imported.append((dataset, filename, destination, run_budget, len(rows)))
+            source_rows = read_jsonl(source_path)
+            if len(source_rows) != len(record_ids):
+                skipped.append(
+                    (
+                        dataset,
+                        f"{source_path.name} row count {len(source_rows)} != expected {len(record_ids)}",
+                    )
+                )
+                continue
+
+            if token_budget is None:
+                run_budget = 1.0
+            else:
+                run_budget = budget_stats(token_budget, input_lengths)["effective_decode_budget"]
+
+            destination = (
+                root
+                / dataset
+                / f"quest_budget={output_budget_name(run_budget)}.jsonl"
+            )
+            rows = imported_rows(
+                source_rows,
+                record_ids,
+                input_lengths,
+                token_budget,
+                run_budget,
+            )
+            write_jsonl(destination, rows)
+            imported.append((dataset, source_path.name, destination, run_budget, len(rows)))
 
     for dataset, filename, destination, run_budget, count in imported:
         print(
@@ -158,6 +216,8 @@ def main():
             f"(budget={run_budget:.6g}, rows={count})"
         )
     print(f"Imported {len(imported)} QUEST files into: {root}")
+    for dataset, reason in skipped:
+        print(f"Skipped {dataset}: {reason}")
 
 
 if __name__ == "__main__":

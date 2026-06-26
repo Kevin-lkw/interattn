@@ -5,7 +5,7 @@ GPU_ID="${GPU_ID:-6}"
 CONDA_ENV="${CONDA_ENV:-nanogpt}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-llama/result/generate}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique }"
+DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique gov_report qmsum multi_news trec triviaqa samsum passage_count passage_retrieval_en lcc repobench-p}"
 KVPRESS_SINK_TOKENS="${KVPRESS_SINK_TOKENS:-4}"
 
 METHOD="kvpress_streamllm"

@@ -32,7 +32,7 @@ def build_method(args):
             quest_page_size = max(1, int(round(1.0 / budget)))
         elif quest_page_size is not None:
             budget = 1.0 / int(quest_page_size)
-    elif args.method != "condition_block" and budget is None:
+    elif args.method not in {"condition_block", "condition_block_triton"} and budget is None:
         budget = 1.0
     return GenerationMethod(
         name=args.method,
@@ -63,6 +63,7 @@ def add_method_args(parser):
             "attention_topk",
             "h2o",
             "condition_block",
+            "condition_block_triton",
             "quest",
         ],
     )

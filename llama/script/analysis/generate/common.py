@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -14,7 +15,12 @@ from .methods import add_method_args, build_method, generate_with_method
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "result" / "generate"
 NO_CHAT_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
-LOCAL_PATCH_METHODS = {"attention_topk", "condition_block", "quest"}
+LOCAL_PATCH_METHODS = {
+    "attention_topk",
+    "condition_block",
+    "condition_block_triton",
+    "quest",
+}
 
 
 def add_generation_args(parser):
@@ -56,7 +62,7 @@ def validate_generation_args(args):
         raise ValueError("--limit must be > 0")
     if args.max_new_tokens is not None and args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be > 0")
-    if args.method == "condition_block":
+    if args.method in {"condition_block", "condition_block_triton"}:
         if args.budget is not None:
             raise ValueError("--budget is not used by condition_block; use --condition-block-size and --condition-eps.")
         if args.condition_block_size is None or args.condition_block_size <= 0:
@@ -203,7 +209,7 @@ def record_id(record, args, index):
 def output_path(args, benchmark_name):
     model_name = str(args.model).rstrip("/").split("/")[-1]
     method = build_method(args)
-    if method.kind == "condition_block":
+    if method.kind in {"condition_block", "condition_block_triton"}:
         filename = (
             f"{method.name}_block={method.condition_block_size}"
             f"_eps={method.condition_eps:g}.jsonl"
@@ -279,6 +285,9 @@ def run_generation_benchmark(
                 truncation=False,
             )
             inputs = {key: value.to(args.device) for key, value in inputs.items()}
+            if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                torch.cuda.synchronize(args.device)
+            generation_start = time.perf_counter()
             generation_result = generate_with_method(
                 model=model,
                 tokenizer=tokenizer,
@@ -291,6 +300,9 @@ def run_generation_benchmark(
                 device=args.device,
                 dataset=_dataset_name(record),
             )
+            if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                torch.cuda.synchronize(args.device)
+            generation_seconds = time.perf_counter() - generation_start
             if isinstance(generation_result, tuple):
                 output_ids, generation_metadata = generation_result
             else:
@@ -304,6 +316,8 @@ def run_generation_benchmark(
                 "all_classes": record.get("all_classes"),
                 "length": record.get("length"),
                 "input_tokens": int(inputs["input_ids"].shape[1]),
+                "output_tokens": int(output_ids.shape[1]),
+                "generation_seconds": generation_seconds,
             }
             if method.budget is not None:
                 row["budget"] = method.budget

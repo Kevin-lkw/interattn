@@ -31,6 +31,20 @@ def generate_with_method(model, tokenizer, input_ids, attention_mask, method, de
             device=device,
             dataset=dataset,
         )
+    if method.kind == "condition_block_triton":
+        from .condition_block_triton import (
+            generate_condition_block_cached as generate_condition_block_triton_cached,
+        )
+
+        return generate_condition_block_triton_cached(
+            model=model,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            method=method,
+            device=device,
+            dataset=dataset,
+        )
     return generate_with_full_forward_patches(
         model=model,
         tokenizer=tokenizer,

@@ -15,6 +15,7 @@ can use KVPress directly during prefill.
 - `attention_topk`
 - `h2o`
 - `condition_block`
+- `condition_block_triton`
 - `quest`
 
 KVPress methods use the installed `kvpress` package. Local methods share a
@@ -29,6 +30,11 @@ attention; the runner sets `attn_implementation="eager"` automatically when
 For `condition_block`, `--budget` is not used. Set `--condition-block-size`
 and `--condition-eps`; each output JSONL row records the measured
 `condition_block_equiv_budget`.
+
+`condition_block_triton` keeps the same selection semantics but uses a
+decode-only Tensor-Core kernel. Unexpanded blocks contribute one representative;
+only selected 16-token blocks load token-level K/V. Block size 16 is the tuned
+path. Set `CONDITION_BLOCK_SKIP_STATS=1` for timing runs to avoid metadata syncs.
 
 For `quest`, pass exactly one of `--budget` or `--quest-page-size`. When
 `--budget` is used, the runner sets `quest_page_size=round(1 / budget)` and

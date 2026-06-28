@@ -138,7 +138,10 @@ def score_rows(dataset, rows, metadata, use_longbench_e):
 
 
 def parse_run_name(path):
-    match = re.fullmatch(r"(condition_block)_block=([^_]+)_eps=([^_]+)(?:_maxnew=\d+)?", path.stem)
+    match = re.fullmatch(
+        r"(condition_block(?:_triton)?)_block=([^_]+)_eps=([^_]+)(?:_maxnew=\d+)?",
+        path.stem,
+    )
     if match is not None:
         method, block_size, eps = match.groups()
         return {

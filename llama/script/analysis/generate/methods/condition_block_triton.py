@@ -490,15 +490,13 @@ def _condition_block_selection_kernel(
         b_start += BLOCK_B
 
 
-def _select_prompt_blocks_triton(q_grouped, prefix, eps):
+def _run_condition_block_selection_stats(q_grouped, prefix):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     if n_query != 1:
-        return _select_prompt_blocks_eager(q_grouped, prefix, eps)
+        raise ValueError("Triton selection stats expects q_len=1.")
     n_blocks = int(prefix["block_valid_counts"].numel())
     rows = int(n_kv_heads * group_size)
     q = q_grouped.reshape(rows, head_dim).contiguous()
-    selected = torch.empty((rows, n_blocks), device=q.device, dtype=torch.bool)
-    z_logits = torch.empty((rows, n_blocks), device=q.device, dtype=torch.float32)
     selection_chunk = 16
     n_chunks = triton.cdiv(n_blocks, selection_chunk)
     s_cache = torch.empty((rows, n_blocks), device=q.device, dtype=torch.float32)
@@ -540,6 +538,20 @@ def _select_prompt_blocks_triton(q_grouped, prefix, eps):
         BLOCK_C=triton.next_power_of_2(n_chunks),
         num_warps=4,
     )
+    return q, s_cache, delta_cache, global_stats, n_blocks, n_chunks
+
+
+def _select_prompt_blocks_triton(q_grouped, prefix, eps):
+    n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
+    if n_query != 1:
+        return _select_prompt_blocks_eager(q_grouped, prefix, eps)
+    q, s_cache, delta_cache, global_stats, n_blocks, n_chunks = (
+        _run_condition_block_selection_stats(q_grouped, prefix)
+    )
+    rows = int(n_kv_heads * group_size)
+    selection_chunk = 16
+    selected = torch.empty((rows, n_blocks), device=q.device, dtype=torch.bool)
+    z_logits = torch.empty((rows, n_blocks), device=q.device, dtype=torch.float32)
     _condition_block_selection_finalize_kernel[(n_kv_heads, n_chunks)](
         s_cache,
         delta_cache,
@@ -570,7 +582,10 @@ def _select_prompt_blocks_triton(q_grouped, prefix, eps):
     return selected, z_logits, v_bar, size, cluster_exists
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_blocks", "n_chunks"],
+    do_not_specialize_on_alignment=["n_blocks", "n_chunks"],
+)
 def _condition_block_selection_stats_kernel(
     q_ptr,
     k_bar_ptr,
@@ -583,8 +598,8 @@ def _condition_block_selection_stats_kernel(
     z_l_ptr,
     c_m_ptr,
     c_l_ptr,
-    n_blocks: tl.constexpr,
-    n_chunks: tl.constexpr,
+    n_blocks,
+    n_chunks,
     group_size: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
@@ -632,7 +647,10 @@ def _condition_block_selection_stats_kernel(
     tl.store(c_l_ptr + partial_off, c_l, mask=g_mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_chunks"],
+    do_not_specialize_on_alignment=["n_chunks"],
+)
 def _condition_block_selection_reduce_kernel(
     z_m_ptr,
     z_l_ptr,
@@ -642,7 +660,7 @@ def _condition_block_selection_reduce_kernel(
     global_z_l_ptr,
     global_c_m_ptr,
     global_c_l_ptr,
-    n_chunks: tl.constexpr,
+    n_chunks,
     BLOCK_C: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -662,7 +680,10 @@ def _condition_block_selection_reduce_kernel(
     tl.store(global_c_l_ptr + row, global_c_l)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_blocks", "n_chunks"],
+    do_not_specialize_on_alignment=["n_blocks", "n_chunks"],
+)
 def _condition_block_selection_finalize_kernel(
     s_cache_ptr,
     delta_cache_ptr,
@@ -675,8 +696,8 @@ def _condition_block_selection_finalize_kernel(
     c_l_ptr,
     selected_ptr,
     z_out_ptr,
-    n_blocks: tl.constexpr,
-    n_chunks: tl.constexpr,
+    n_blocks,
+    n_chunks,
     group_size: tl.constexpr,
     eps: tl.constexpr,
     BLOCK_G: tl.constexpr,
@@ -711,6 +732,231 @@ def _condition_block_selection_finalize_kernel(
     tl.store(z_out_ptr + row[:, None] * n_blocks + b[None, :], z, mask=g_mask[:, None] & b_mask[None, :])
 
 
+@triton.jit(
+    do_not_specialize=["n_blocks", "suffix_len", "n_chunks"],
+    do_not_specialize_on_alignment=["n_blocks", "suffix_len", "n_chunks"],
+)
+def _condition_block_finalize_attention_kernel(
+    q_ptr,
+    k_block_ptr,
+    v_block_ptr,
+    v_bar_ptr,
+    s_cache_ptr,
+    delta_cache_ptr,
+    v_norm_ptr,
+    v_norm_all_ptr,
+    counts_ptr,
+    z_m_ptr,
+    z_l_ptr,
+    c_m_ptr,
+    c_l_ptr,
+    k_suffix_ptr,
+    v_suffix_ptr,
+    selected_out_ptr,
+    partial_acc_ptr,
+    partial_m_ptr,
+    partial_l_ptr,
+    n_blocks,
+    suffix_len,
+    group_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    n_chunks,
+    eps: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STORE_SELECTED: tl.constexpr,
+):
+    """Finalize routing and immediately consume it for hybrid attention."""
+    kv_head = tl.program_id(0)
+    chunk = tl.program_id(1)
+    m_off = tl.arange(0, BLOCK_M)
+    n_off = tl.arange(0, BLOCK_N)
+    d_off = tl.arange(0, BLOCK_D)
+    m_mask = m_off < group_size
+    block_idx = chunk * BLOCK_N + n_off
+    block_mask = block_idx < n_blocks
+    d_mask = d_off < head_dim
+    row = kv_head * group_size + m_off
+    mask_2d = m_mask[:, None] & block_mask[None, :]
+
+    q = tl.load(
+        q_ptr + row[:, None] * head_dim + d_off[None, :],
+        mask=m_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+    count = tl.load(counts_ptr + block_idx, mask=block_mask, other=0)
+    active_block = block_mask & (count > 0)
+    active_2d = m_mask[:, None] & active_block[None, :]
+    s = tl.load(
+        s_cache_ptr + row[:, None] * n_blocks + block_idx[None, :],
+        mask=active_2d,
+        other=0.0,
+    ).to(tl.float32)
+    delta = tl.load(
+        delta_cache_ptr + row[:, None] * n_blocks + block_idx[None, :],
+        mask=active_2d,
+        other=0.0,
+    ).to(tl.float32)
+    z = s + tl.log(tl.maximum(count, 1).to(tl.float32))[None, :]
+    z_m = tl.load(z_m_ptr + row, mask=m_mask, other=0.0)
+    z_l = tl.load(z_l_ptr + row, mask=m_mask, other=1.0)
+    c_m = tl.load(c_m_ptr + row, mask=m_mask, other=0.0)
+    c_l = tl.load(c_l_ptr + row, mask=m_mask, other=1.0)
+    cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
+    tanh_half = 2.0 / (1.0 + tl.exp(-delta)) - 1.0
+    b_c = tl.load(
+        v_norm_ptr + kv_head * n_blocks + block_idx,
+        mask=active_block,
+        other=0.0,
+    ).to(tl.float32)
+    b_all = tl.load(v_norm_all_ptr + kv_head).to(tl.float32)
+    term1 = (
+        2.0
+        * b_all
+        * tl.exp(z - c_m[:, None])
+        * (cosh_delta - 1.0)
+        / c_l[:, None]
+    )
+    term2 = (
+        2.0
+        * b_c[None, :]
+        * tl.exp(z - z_m[:, None])
+        * tanh_half
+        / z_l[:, None]
+    )
+    condition = tl.where(active_2d, term1 + term2, 0.0)
+    selected = ((tl.sum(condition, axis=0) / group_size) > eps) & active_block
+    if STORE_SELECTED:
+        tl.store(
+            selected_out_ptr + row[:, None] * n_blocks + block_idx[None, :],
+            selected[None, :],
+            mask=mask_2d,
+        )
+
+    softmax_m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    softmax_l = tl.zeros((BLOCK_M,), tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+
+    # Unselected blocks contribute their representative directly from the
+    # selection score already resident in registers/cache.
+    active_rep = active_block & (~selected)
+    rep_scores = tl.where(
+        m_mask[:, None] & active_rep[None, :], z, -float("inf")
+    )
+    has_rep = tl.sum(active_rep.to(tl.int32), axis=0) > 0
+    rep_m = tl.max(rep_scores, axis=1)
+    new_m = tl.where(has_rep & m_mask, rep_m, softmax_m)
+    alpha = tl.where(has_rep & m_mask, tl.exp(softmax_m - new_m), 1.0)
+    beta = tl.where(
+        m_mask[:, None] & active_rep[None, :],
+        tl.exp(rep_scores - new_m[:, None]),
+        0.0,
+    )
+    rep_off = (
+        (kv_head * n_blocks + block_idx[:, None]) * head_dim + d_off[None, :]
+    )
+    v_rep = tl.load(
+        v_bar_ptr + rep_off,
+        mask=active_rep[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+    acc = acc * alpha[:, None] + tl.dot(
+        beta.to(tl.bfloat16), v_rep, out_dtype=tl.float32
+    )
+    softmax_l = softmax_l * alpha + tl.sum(beta, axis=1)
+    softmax_m = new_m
+
+    # Selected pages are loaded token-wise only after the routing decision.
+    for local_block in tl.static_range(0, BLOCK_N):
+        page_selected = tl.sum(
+            (selected & (n_off == local_block)).to(tl.int32), axis=0
+        ) > 0
+        if page_selected:
+            page = chunk * BLOCK_N + local_block
+            page_count = tl.load(counts_ptr + page)
+            token_active = n_off < page_count
+            token_off = (
+                ((kv_head * n_blocks + page) * BLOCK_N + n_off[:, None])
+                * head_dim
+                + d_off[None, :]
+            )
+            k = tl.load(
+                k_block_ptr + token_off,
+                mask=token_active[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.bfloat16)
+            scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+            scores = tl.where(
+                m_mask[:, None] & token_active[None, :], scores, -float("inf")
+            )
+            tile_m = tl.max(scores, axis=1)
+            new_m = tl.where(m_mask, tl.maximum(softmax_m, tile_m), softmax_m)
+            alpha = tl.where(m_mask, tl.exp(softmax_m - new_m), 1.0)
+            beta = tl.where(
+                m_mask[:, None] & token_active[None, :],
+                tl.exp(scores - new_m[:, None]),
+                0.0,
+            )
+            v = tl.load(
+                v_block_ptr + token_off,
+                mask=token_active[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.bfloat16)
+            acc = acc * alpha[:, None] + tl.dot(
+                beta.to(tl.bfloat16), v, out_dtype=tl.float32
+            )
+            softmax_l = softmax_l * alpha + tl.sum(beta, axis=1)
+            softmax_m = new_m
+    if chunk == n_chunks - 1:
+        suffix_start = 0
+        while suffix_start < suffix_len:
+            suffix_idx = suffix_start + n_off
+            suffix_active = suffix_idx < suffix_len
+            suffix_off = (
+                (kv_head * suffix_len + suffix_idx[:, None]) * head_dim
+                + d_off[None, :]
+            )
+            k = tl.load(
+                k_suffix_ptr + suffix_off,
+                mask=suffix_active[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.bfloat16)
+            scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+            scores = tl.where(
+                m_mask[:, None] & suffix_active[None, :], scores, -float("inf")
+            )
+            tile_m = tl.max(scores, axis=1)
+            new_m = tl.where(m_mask, tl.maximum(softmax_m, tile_m), softmax_m)
+            alpha = tl.where(m_mask, tl.exp(softmax_m - new_m), 1.0)
+            beta = tl.where(
+                m_mask[:, None] & suffix_active[None, :],
+                tl.exp(scores - new_m[:, None]),
+                0.0,
+            )
+            v = tl.load(
+                v_suffix_ptr + suffix_off,
+                mask=suffix_active[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.bfloat16)
+            acc = acc * alpha[:, None] + tl.dot(
+                beta.to(tl.bfloat16), v, out_dtype=tl.float32
+            )
+            softmax_l = softmax_l * alpha + tl.sum(beta, axis=1)
+            softmax_m = new_m
+            suffix_start += BLOCK_N
+
+    partial_off = row * n_chunks + chunk
+    tl.store(partial_m_ptr + partial_off, softmax_m, mask=m_mask)
+    tl.store(partial_l_ptr + partial_off, softmax_l, mask=m_mask)
+    tl.store(
+        partial_acc_ptr + partial_off[:, None] * head_dim + d_off[None, :],
+        acc,
+        mask=m_mask[:, None] & d_mask[None, :],
+    )
+
+
 def _condition_block_decode_output(
     *,
     q_grouped,
@@ -724,13 +970,36 @@ def _condition_block_decode_output(
     attention_dtype,
 ):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
-    selected, z_logits, v_bar, size, cluster_exists = _select_prompt_blocks(
-        q_grouped,
-        prompt_prefix,
-        eps,
+    collect_stats = os.environ.get("CONDITION_BLOCK_SKIP_STATS") != "1"
+    use_fused_triton = (
+        q_grouped.is_cuda
+        and n_query == 1
+        and int(block_size) == 16
+        and os.environ.get("CONDITION_BLOCK_DENSE_STAGE2") != "1"
+        and os.environ.get("CONDITION_BLOCK_COMPACT_SDPA_STAGE2") != "1"
+        and os.environ.get("CONDITION_BLOCK_LEGACY_STAGE2") != "1"
     )
+    if use_fused_triton:
+        output, selected = _condition_block_decode_output_fused_triton(
+            q_grouped=q_grouped,
+            prompt_prefix=prompt_prefix,
+            k_suffix=k_suffix,
+            v_suffix=v_suffix,
+            eps=eps,
+            store_selected=collect_stats,
+        )
+        size = prompt_prefix["block_valid_counts"].view(1, -1)
+        cluster_exists = size > 0
+    else:
+        selected, z_logits, v_bar, size, cluster_exists = _select_prompt_blocks(
+            q_grouped,
+            prompt_prefix,
+            eps,
+        )
 
-    if os.environ.get("CONDITION_BLOCK_DENSE_STAGE2") == "1":
+    if use_fused_triton:
+        pass
+    elif os.environ.get("CONDITION_BLOCK_DENSE_STAGE2") == "1":
         output = _condition_block_decode_output_dense(
             q_grouped=q_grouped,
             pos_tensor=pos_tensor,
@@ -768,7 +1037,7 @@ def _condition_block_decode_output(
         )
 
     stats = None
-    if os.environ.get("CONDITION_BLOCK_SKIP_STATS") != "1":
+    if collect_stats:
         stats = _condition_stats(
             selected=selected,
             size=size,
@@ -777,6 +1046,82 @@ def _condition_block_decode_output(
             prompt_len=prompt_len,
         )
     return output, stats
+
+
+def _condition_block_decode_output_fused_triton(
+    *,
+    q_grouped,
+    prompt_prefix,
+    k_suffix,
+    v_suffix,
+    eps,
+    store_selected,
+):
+    n_kv_heads, group_size, _n_query, head_dim = q_grouped.shape
+    q, s_cache, delta_cache, global_stats, n_blocks, n_chunks = (
+        _run_condition_block_selection_stats(q_grouped, prompt_prefix)
+    )
+    rows = int(n_kv_heads * group_size)
+    suffix_len = int(k_suffix.shape[1])
+    partial_acc = torch.empty(
+        (rows, n_chunks, head_dim), device=q.device, dtype=torch.float32
+    )
+    partial_m = torch.empty((rows, n_chunks), device=q.device, dtype=torch.float32)
+    partial_l = torch.empty_like(partial_m)
+    selected_rows = torch.empty(
+        (rows, n_blocks) if store_selected else (1,),
+        device=q.device,
+        dtype=torch.bool,
+    )
+    _condition_block_finalize_attention_kernel[(n_kv_heads, n_chunks)](
+        q,
+        prompt_prefix["k_block_attn"].contiguous(),
+        prompt_prefix["v_block_attn"].contiguous(),
+        prompt_prefix["v_bar"].contiguous(),
+        s_cache,
+        delta_cache,
+        prompt_prefix["v_norm_max"].contiguous(),
+        prompt_prefix["v_norm_all"].contiguous(),
+        prompt_prefix["block_valid_counts"].contiguous(),
+        global_stats[0],
+        global_stats[1],
+        global_stats[2],
+        global_stats[3],
+        k_suffix.contiguous(),
+        v_suffix.contiguous(),
+        selected_rows,
+        partial_acc,
+        partial_m,
+        partial_l,
+        n_blocks,
+        suffix_len,
+        group_size,
+        head_dim,
+        n_chunks,
+        float(eps),
+        head_dim**-0.5,
+        BLOCK_M=16,
+        BLOCK_N=16,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        STORE_SELECTED=bool(store_selected),
+        num_warps=4,
+    )
+    out = torch.empty((rows, head_dim), device=q.device, dtype=torch.float32)
+    _condition_block_stage2_reduce_kernel[(rows,)](
+        partial_acc,
+        partial_m,
+        partial_l,
+        out,
+        n_chunks,
+        head_dim,
+        BLOCK_C=triton.next_power_of_2(n_chunks),
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+    selected = None
+    if store_selected:
+        selected = selected_rows.reshape(n_kv_heads, group_size, 1, n_blocks)
+    return out.reshape(n_kv_heads, group_size, 1, head_dim), selected
 
 
 @triton.jit
@@ -1529,13 +1874,16 @@ def _condition_block_stage2_tensorcore_kernel(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_chunks"],
+    do_not_specialize_on_alignment=["n_chunks"],
+)
 def _condition_block_stage2_reduce_kernel(
     partial_acc_ptr,
     partial_m_ptr,
     partial_l_ptr,
     out_ptr,
-    n_chunks: tl.constexpr,
+    n_chunks,
     head_dim: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_D: tl.constexpr,

@@ -94,45 +94,53 @@ Triton:              21.92
 
 ## Profile：时间花在哪里
 
-测试：GovReport 第一条，输入 10,733 tokens，生成 32 tokens，32 层；kernel 已预热，关闭 stats。
+测试：GovReport 第一条，输入 10,733 tokens，生成 32 tokens，32 层；kernel 已预热，关闭 stats。下表为当前 3.20 s/sample 稳定版重新 profile 的结果。
 
-| 区域 | 调用次数 | CUDA 总时间 | 平均每次 | CPU 总时间 |
-|---|---:|---:|---:|---:|
-| Build clusters/summaries | 32 | 10.2 ms | 0.320 ms | 10.9 ms |
-| Condition stats + reduce | 992 | 34.2 ms | 0.034 ms | 96.5 ms |
-| Fused condition + attention 总区域 | 992 | 61.8 ms | 0.062 ms | 200.0 ms |
+| 区域 | 调用次数 | CUDA self time | CUDA 占比 |
+|---|---:|---:|---:|
+| 模型 GEMM/GEMV (`aten::mm`) | 7,200 | 709.0 ms | 64.7% |
+| Prefill FlashAttention | 32 | 97.7 ms | 8.9% |
+| Command Buffer Full 等待 | 215 | 108.5 ms | 9.9% |
+| `aten::cat` 总计 | 4,225 | 63.6 ms | 5.8% |
+| 其中 DynamicCache K/V append | 1,984 | 47.5 ms | 4.3% |
+| Condition stats + reduce | 992 × 2 | 23.5 ms | 2.1% |
+| Sparse attention + reduce | 992 × 2 | 23.5 ms | 2.1% |
 
 结论：
 
 - **分 cluster 不是主要瓶颈**：每层只在首次 decode 构建一次，总计约 10 ms。
-- 融合前 condition + sparse attention 的 CUDA 区域约为 154.8 ms；融合后完整区域约为 61.8 ms。
+- 当前 condition 与 sparse attention 四个 Triton kernel 合计约 47 ms，仅占 CUDA 时间 4.3%；继续只优化 sparse kernel 的端到端上限已经很低。
 - 关闭 stats 的 GovReport 稳态时间由 3.86 降至 3.66 s/sample，端到端提升约 5%。
 - runner/workspace 复用进一步将 3.66 降至 3.58 s/sample，提升约 2.2%。
 - 去掉 Q/output cast 与 suffix contiguous copy 后由 3.58 降至 3.20 s/sample，再提升约 10.7%；5/5 预测与优化前一致。
-- 局部 attention 已不再是最大的 CUDA 成本，模型 MLP/GEMM 约占 CUDA 时间的 64%。
+- 局部 attention 已不再是主要瓶颈，模型投影与 MLP GEMM/GEMV 占 CUDA 时间约 65%。
 
-整个 profile 的 wall time由约 1.55 降至 1.46 s；粗略 GPU busy 比例由约 71% 提高到 76%。CUDA launch 数从约 48,918 降到 46,934，但仍出现约 109 ms 的 `Command Buffer Full` 等待。因此剩余问题仍主要是模型级细碎 kernel 和 Python/eager 调度，而不是 cluster summary 计算量。
+当前 profile 的 CPU self time 约 0.98 s、CUDA self time 约 1.10 s，仍出现约 109 ms 的 `Command Buffer Full`。因此剩余问题主要是模型 GEMV/MLP、逐层 elementwise kernel、KV cache append 和模型级 eager 调度，而不是 cluster summary 或 sparse attention 计算量。
 
 ## 当前瓶颈
 
-1. **Kernel launch 太多**
-   - 融合后每层仍需要 selection stats、selection reduce、fused attention partition、attention reduce。
-   - 单 batch、`q_len=1` 时计算规模小，launch 和调度成本占比很高。
+1. **模型 GEMM/GEMV 是第一瓶颈**
+   - Q/K/V/O projection 和 MLP 占 CUDA 时间约 65%。
+   - batch=1、`q_len=1` 时大量操作退化为小 GEMV，GPU 很难完全吃满。
 
-2. **Transformers eager hook 开销**
-   - 每个 token、每层都经过 Python attention hook、shape 处理和临时 workspace 分配。
-   - full SDPA 是高度融合的单 kernel 路径，更容易保持 GPU 连续执行。
+2. **模型级 eager/elementwise 调度**
+   - RMSNorm、RoPE、residual、SiLU/multiply 等仍是大量独立 kernel。
+   - `Command Buffer Full` 约占 10%，说明只 graph 四个 attention kernel 的粒度太小。
 
-3. **StaticCache 单独使用会回退**
+3. **DynamicCache 每 token 复制 K/V**
+   - 1,984 次 K/V `cat` 正好对应 `31 decode steps × 32 layers × K/V`，CUDA 约 47.5 ms。
+   - 这是明确但上限约 4–5% 的次级优化点。
+
+4. **StaticCache 单独使用会回退**
    - 可通过 `CONDITION_BLOCK_STATIC_CACHE=1` 启用；8-token sanity 完全一致，长生成可能因数值顺序产生轨迹分叉。
    - 无 CUDA Graph 时当前实测由 3.20 回退到 3.60 s/sample，因此默认仍使用 DynamicCache。
    - StaticCache 的价值是固定指针，为后续 graph capture 服务，而不是单独加速。
 
-4. **短中上下文尚未越过 crossover**
+5. **短中上下文尚未越过 crossover**
    - 4K–16K 时 full SDPA 已非常快，稀疏路径的固定开销大于节省的 K/V 带宽。
    - 约 64K 时单层 hybrid attention 才明显快于 full SDPA。
 
-5. **Generated suffix 仍然精确计算**
+6. **Generated suffix 仍然精确计算**
    - suffix 随生成长度线性增长。
    - GovReport 等长生成任务后期会逐渐削弱 prompt 压缩收益。
 
@@ -140,15 +148,31 @@ Triton:              21.92
 
 按优先级排序：
 
-1. **Compiled custom op + Static KV cache + CUDA Graph**
-   - 将完整 sparse attention 注册为一个 custom op。
-   - 使用固定 KV 地址和预分配 workspace，减少 Python、allocator 和多 kernel replay 开销。
-   - 这是端到端超过 full attention 最关键的方向。
-   - suffix kernel 已支持任意 KV stride；capture 前还需要把 `pos/suffix_len` 从 Python shape 改为 device scalar，并固定 Q input 地址。
+1. **先做模型级融合，而不是继续压 sparse kernel**
+   - 将 condition-block attention 注册为 `torch.library.custom_op`，替代运行时 monkeypatch，使 Dynamo 能把它视为单个可编译算子。
+   - 编译完整 decoder layer/step，融合 RMSNorm、RoPE、residual、SiLU/multiply 等 elementwise 路径。
+   - 优先试 fused QKV projection 和 fused MLP gate/up projection；这直接针对约 65% 的 GEMM/GEMV 主耗时，并减少每层 launch 数。
 
-2. **复用 workspace**
-   - 按 layer/sample 预分配 selection 和 attention partial buffers。
-   - 避免每层、每 token 创建临时 tensor。
+### 已撤回实验：per-layer CUDA Graph
+
+实验曾使用固定 Q staging buffer 和 device-side `suffix_len`，把每层的 selection
+与 sparse attention 四个 Triton kernel 捕获为一个 graph。GovReport 5×128 sanity
+与普通 StaticCache 5/5 一致，但速度为：
+
+```text
+DynamicCache 稳定版：       3.20 s/sample
+StaticCache：               3.60 s/sample
+StaticCache + layer graph： 3.68 s/sample
+```
+
+结论：只捕获 attention 子图粒度太小，graph replay、Q staging 和每样本 32 次
+首次捕获抵消了 launch 收益。相关实现已撤回，仅保留结果。若以后继续 CUDA
+Graph，必须捕获完整 decoder step，而不是 per-layer attention 子图。
+
+2. **实现动态视图的预分配 KV cache**
+   - 预分配底层 K/V storage，但每步只向模型暴露 `:visible_len` view。
+   - 目标是消除 DynamicCache 的 K/V `cat`，同时避免 HF StaticCache 处理完整 capacity 的回退。
+   - 预期收益上限约 4–5%，应作为独立小实验验证。
 
 3. **压缩较旧的 generated suffix**
    - 保留最近窗口 token 精确 attention。

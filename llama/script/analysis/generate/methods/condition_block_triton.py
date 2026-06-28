@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from transformers import StaticCache
 from transformers.models.llama import modeling_llama
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
@@ -51,16 +52,6 @@ def generate_condition_block_cached(
         output_ids = torch.empty((1, 0), device=input_ids.device, dtype=input_ids.dtype)
         return output_ids, summarize_condition_block_step_metadata([])
 
-    if os.environ.get("CONDITION_BLOCK_HF_GENERATE_LOOP") == "1":
-        return _generate_condition_block_with_hf_loop(
-            model=model,
-            tokenizer=tokenizer,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            method=method,
-            dataset=dataset,
-        )
-
     stop_token_ids = _stop_token_ids(tokenizer, dataset)
     stop_ids_tensor = (
         torch.tensor(stop_token_ids, device=input_ids.device, dtype=input_ids.dtype)
@@ -74,6 +65,12 @@ def generate_condition_block_cached(
     collect_stats = os.environ.get("CONDITION_BLOCK_SKIP_STATS") != "1"
     cur_mask = attention_mask
     total_len = prompt_len
+    past_key_values = None
+    if os.environ.get("CONDITION_BLOCK_STATIC_CACHE") == "1":
+        past_key_values = StaticCache(
+            config=model.config,
+            max_cache_len=prompt_len + max_new_tokens,
+        )
 
     # Use Transformers' native SDPA interface for the long prompt. This keeps
     # prefill identical to the optimized full-attention baseline; the custom
@@ -83,6 +80,7 @@ def generate_condition_block_cached(
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=cur_mask,
+                past_key_values=past_key_values,
                 use_cache=True,
                 logits_to_keep=1,
             )
@@ -101,19 +99,20 @@ def generate_condition_block_cached(
     step_input_ids = next_id
     total_len += 1
 
-    for _step in range(1, max_new_tokens):
-        runner = ConditionBlockDecodeRunner(
-            model=model,
-            model_config=model.config,
-            layer_idx_list=layer_idx_list,
-            full_attention_layers=method.full_attention_layers,
-            block_size=method.condition_block_size,
-            eps=method.condition_eps,
-            prompt_len=prompt_len,
-            pos=total_len - 1,
-            prompt_prefix_cache=prompt_prefix_cache,
-        )
-        with condition_block_decode_context(runner):
+    runner = ConditionBlockDecodeRunner(
+        model=model,
+        model_config=model.config,
+        layer_idx_list=layer_idx_list,
+        full_attention_layers=method.full_attention_layers,
+        block_size=method.condition_block_size,
+        eps=method.condition_eps,
+        prompt_len=prompt_len,
+        pos=total_len - 1,
+        prompt_prefix_cache=prompt_prefix_cache,
+    )
+    with condition_block_decode_context(runner):
+        for _step in range(1, max_new_tokens):
+            runner.reset_step(total_len - 1)
             with torch.no_grad():
                 outputs = model(
                     input_ids=step_input_ids,
@@ -123,19 +122,19 @@ def generate_condition_block_cached(
                     logits_to_keep=1,
                 )
 
-        logits = outputs.logits.float()
-        past_key_values = outputs.past_key_values
-        if collect_stats:
-            step_metadata.append(runner.summarize())
+            logits = outputs.logits.float()
+            past_key_values = outputs.past_key_values
+            if collect_stats:
+                step_metadata.append(runner.summarize())
 
-        next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-        generated.append(next_id)
-        if _should_stop(next_id, stop_ids_tensor):
-            break
+            next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            generated.append(next_id)
+            if _should_stop(next_id, stop_ids_tensor):
+                break
 
-        cur_mask = torch.cat([cur_mask, torch.ones_like(next_id)], dim=1)
-        step_input_ids = next_id
-        total_len += 1
+            cur_mask = torch.cat([cur_mask, torch.ones_like(next_id)], dim=1)
+            step_input_ids = next_id
+            total_len += 1
 
     return torch.cat(generated, dim=1), summarize_condition_block_step_metadata(step_metadata)
 
@@ -490,7 +489,22 @@ def _condition_block_selection_kernel(
         b_start += BLOCK_B
 
 
-def _run_condition_block_selection_stats(q_grouped, prefix):
+def _workspace_empty(workspace, key, shape, *, device, dtype):
+    if workspace is None:
+        return torch.empty(shape, device=device, dtype=dtype)
+    tensor = workspace.get(key)
+    if (
+        tensor is None
+        or tuple(tensor.shape) != tuple(shape)
+        or tensor.device != device
+        or tensor.dtype != dtype
+    ):
+        tensor = torch.empty(shape, device=device, dtype=dtype)
+        workspace[key] = tensor
+    return tensor
+
+
+def _run_condition_block_selection_stats(q_grouped, prefix, workspace=None):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     if n_query != 1:
         raise ValueError("Triton selection stats expects q_len=1.")
@@ -499,9 +513,27 @@ def _run_condition_block_selection_stats(q_grouped, prefix):
     q = q_grouped.reshape(rows, head_dim).contiguous()
     selection_chunk = 16
     n_chunks = triton.cdiv(n_blocks, selection_chunk)
-    s_cache = torch.empty((rows, n_blocks), device=q.device, dtype=torch.float32)
-    delta_cache = torch.empty_like(s_cache)
-    partial = torch.empty((4, rows, n_chunks), device=q.device, dtype=torch.float32)
+    s_cache = _workspace_empty(
+        workspace,
+        "selection_s",
+        (rows, n_blocks),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    delta_cache = _workspace_empty(
+        workspace,
+        "selection_delta",
+        (rows, n_blocks),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    partial = _workspace_empty(
+        workspace,
+        "selection_partial",
+        (4, rows, n_chunks),
+        device=q.device,
+        dtype=torch.float32,
+    )
     _condition_block_selection_stats_kernel[(n_kv_heads, n_chunks)](
         q,
         prefix["k_bar"].contiguous(),
@@ -524,7 +556,13 @@ def _run_condition_block_selection_stats(q_grouped, prefix):
         BLOCK_D=triton.next_power_of_2(head_dim),
         num_warps=4,
     )
-    global_stats = torch.empty((4, rows), device=q.device, dtype=torch.float32)
+    global_stats = _workspace_empty(
+        workspace,
+        "selection_global",
+        (4, rows),
+        device=q.device,
+        dtype=torch.float32,
+    )
     _condition_block_selection_reduce_kernel[(rows,)](
         partial[0],
         partial[1],
@@ -733,8 +771,24 @@ def _condition_block_selection_finalize_kernel(
 
 
 @triton.jit(
-    do_not_specialize=["n_blocks", "suffix_len", "n_chunks"],
-    do_not_specialize_on_alignment=["n_blocks", "suffix_len", "n_chunks"],
+    do_not_specialize=[
+        "n_blocks",
+        "suffix_len",
+        "n_chunks",
+        "k_suffix_head_stride",
+        "k_suffix_token_stride",
+        "v_suffix_head_stride",
+        "v_suffix_token_stride",
+    ],
+    do_not_specialize_on_alignment=[
+        "n_blocks",
+        "suffix_len",
+        "n_chunks",
+        "k_suffix_head_stride",
+        "k_suffix_token_stride",
+        "v_suffix_head_stride",
+        "v_suffix_token_stride",
+    ],
 )
 def _condition_block_finalize_attention_kernel(
     q_ptr,
@@ -758,6 +812,10 @@ def _condition_block_finalize_attention_kernel(
     partial_l_ptr,
     n_blocks,
     suffix_len,
+    k_suffix_head_stride,
+    k_suffix_token_stride,
+    v_suffix_head_stride,
+    v_suffix_token_stride,
     group_size: tl.constexpr,
     head_dim: tl.constexpr,
     n_chunks,
@@ -914,12 +972,13 @@ def _condition_block_finalize_attention_kernel(
         while suffix_start < suffix_len:
             suffix_idx = suffix_start + n_off
             suffix_active = suffix_idx < suffix_len
-            suffix_off = (
-                (kv_head * suffix_len + suffix_idx[:, None]) * head_dim
+            k_suffix_off = (
+                kv_head * k_suffix_head_stride
+                + suffix_idx[:, None] * k_suffix_token_stride
                 + d_off[None, :]
             )
             k = tl.load(
-                k_suffix_ptr + suffix_off,
+                k_suffix_ptr + k_suffix_off,
                 mask=suffix_active[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(tl.bfloat16)
@@ -935,8 +994,13 @@ def _condition_block_finalize_attention_kernel(
                 tl.exp(scores - new_m[:, None]),
                 0.0,
             )
+            v_suffix_off = (
+                kv_head * v_suffix_head_stride
+                + suffix_idx[:, None] * v_suffix_token_stride
+                + d_off[None, :]
+            )
             v = tl.load(
-                v_suffix_ptr + suffix_off,
+                v_suffix_ptr + v_suffix_off,
                 mask=suffix_active[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(tl.bfloat16)
@@ -968,6 +1032,7 @@ def _condition_block_decode_output(
     eps,
     prompt_len,
     attention_dtype,
+    workspace=None,
 ):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     collect_stats = os.environ.get("CONDITION_BLOCK_SKIP_STATS") != "1"
@@ -987,10 +1052,16 @@ def _condition_block_decode_output(
             v_suffix=v_suffix,
             eps=eps,
             store_selected=collect_stats,
+            output_dtype=attention_dtype,
+            workspace=workspace,
         )
         size = prompt_prefix["block_valid_counts"].view(1, -1)
         cluster_exists = size > 0
     else:
+        # The legacy PyTorch paths historically operate on FP32 Q.  The fused
+        # Triton path loads BF16 Q directly and converts in registers, avoiding
+        # a standalone cast kernel on every layer and decode step.
+        q_grouped = q_grouped.float()
         selected, z_logits, v_bar, size, cluster_exists = _select_prompt_blocks(
             q_grouped,
             prompt_prefix,
@@ -1056,19 +1127,39 @@ def _condition_block_decode_output_fused_triton(
     v_suffix,
     eps,
     store_selected,
+    output_dtype,
+    workspace=None,
 ):
     n_kv_heads, group_size, _n_query, head_dim = q_grouped.shape
     q, s_cache, delta_cache, global_stats, n_blocks, n_chunks = (
-        _run_condition_block_selection_stats(q_grouped, prompt_prefix)
+        _run_condition_block_selection_stats(q_grouped, prompt_prefix, workspace)
     )
     rows = int(n_kv_heads * group_size)
     suffix_len = int(k_suffix.shape[1])
-    partial_acc = torch.empty(
-        (rows, n_chunks, head_dim), device=q.device, dtype=torch.float32
+    partial_acc = _workspace_empty(
+        workspace,
+        "attention_partial_acc",
+        (rows, n_chunks, head_dim),
+        device=q.device,
+        dtype=torch.float32,
     )
-    partial_m = torch.empty((rows, n_chunks), device=q.device, dtype=torch.float32)
-    partial_l = torch.empty_like(partial_m)
-    selected_rows = torch.empty(
+    partial_m = _workspace_empty(
+        workspace,
+        "attention_partial_m",
+        (rows, n_chunks),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    partial_l = _workspace_empty(
+        workspace,
+        "attention_partial_l",
+        (rows, n_chunks),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    selected_rows = _workspace_empty(
+        workspace,
+        "selected_rows" if store_selected else "selected_dummy",
         (rows, n_blocks) if store_selected else (1,),
         device=q.device,
         dtype=torch.bool,
@@ -1087,14 +1178,18 @@ def _condition_block_decode_output_fused_triton(
         global_stats[1],
         global_stats[2],
         global_stats[3],
-        k_suffix.contiguous(),
-        v_suffix.contiguous(),
+        k_suffix,
+        v_suffix,
         selected_rows,
         partial_acc,
         partial_m,
         partial_l,
         n_blocks,
         suffix_len,
+        k_suffix.stride(0),
+        k_suffix.stride(1),
+        v_suffix.stride(0),
+        v_suffix.stride(1),
         group_size,
         head_dim,
         n_chunks,
@@ -1106,7 +1201,13 @@ def _condition_block_decode_output_fused_triton(
         STORE_SELECTED=bool(store_selected),
         num_warps=4,
     )
-    out = torch.empty((rows, head_dim), device=q.device, dtype=torch.float32)
+    out = _workspace_empty(
+        workspace,
+        "attention_output",
+        (rows, head_dim),
+        device=q.device,
+        dtype=output_dtype,
+    )
     _condition_block_stage2_reduce_kernel[(rows,)](
         partial_acc,
         partial_m,
@@ -2153,6 +2254,7 @@ class ConditionBlockDecodeRunner:
         self.prompt_len = int(prompt_len)
         self.pos = int(pos)
         self.prompt_prefix_cache = prompt_prefix_cache
+        self.workspace_by_layer = {}
         self.stats_by_layer = {}
         self.aggregate_stats = {}
         self.skip_stats = os.environ.get("CONDITION_BLOCK_SKIP_STATS") == "1"
@@ -2162,6 +2264,11 @@ class ConditionBlockDecodeRunner:
 
     def summarize(self):
         return summarize_stats(self.aggregate_stats, self.stats_by_layer)
+
+    def reset_step(self, pos):
+        self.pos = int(pos)
+        self.stats_by_layer.clear()
+        self.aggregate_stats.clear()
 
     def hybrid_attention_forward(
         self,
@@ -2192,8 +2299,6 @@ class ConditionBlockDecodeRunner:
                 dropout=dropout,
                 **kwargs,
             )
-        self.pos = int(key.shape[2]) - 1
-
         if layer_idx is None or not self.should_compress(layer_idx):
             if layer_idx in self.layer_idx_set and not self.skip_stats:
                 stats = full_attention_stats_for_heads(query.shape[1], [self.pos])
@@ -2220,9 +2325,12 @@ class ConditionBlockDecodeRunner:
         if n_heads % n_kv_heads != 0:
             raise ValueError("condition_block fast path expects grouped query attention.")
 
-        q_grouped = query[0, :, :, :].float().reshape(n_kv_heads, n_heads // n_kv_heads, q_len, head_dim)
-        k_all = key[0]
-        v_all = value[0]
+        q_grouped = query[0].reshape(
+            n_kv_heads, n_heads // n_kv_heads, q_len, head_dim
+        )
+        visible_len = self.pos + 1
+        k_all = key[0, :, :visible_len]
+        v_all = value[0, :, :visible_len]
         cache_key = (int(layer_idx), self.prompt_len, self.block_size)
         prompt_prefix = self.prompt_prefix_cache.get(cache_key)
         if prompt_prefix is None:
@@ -2235,7 +2343,11 @@ class ConditionBlockDecodeRunner:
 
         output, stats = _condition_block_decode_output(
             q_grouped=q_grouped,
-            pos_tensor=torch.tensor([self.pos], device=query.device, dtype=torch.long),
+            pos_tensor=(
+                None
+                if self.skip_stats
+                else torch.tensor([self.pos], device=query.device, dtype=torch.long)
+            ),
             prompt_prefix=prompt_prefix,
             k_suffix=k_all[:, self.prompt_len :],
             v_suffix=v_all[:, self.prompt_len :],
@@ -2243,6 +2355,7 @@ class ConditionBlockDecodeRunner:
             eps=self.eps,
             prompt_len=self.prompt_len,
             attention_dtype=query.dtype,
+            workspace=self.workspace_by_layer.setdefault(int(layer_idx), {}),
         )
         output = output.reshape(n_heads, q_len, head_dim).permute(1, 0, 2).unsqueeze(0)
 

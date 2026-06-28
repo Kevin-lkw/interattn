@@ -6,11 +6,15 @@ CONDA_ENV="${CONDA_ENV:-nanogpt}"
 BLOCK_SIZE="${BLOCK_SIZE:-32}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-llama/result/generate}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+COLLECT_STATS="${COLLECT_STATS:-1}"
 DATASETS="${DATASETS:-narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique gov_report qmsum multi_news trec triviaqa samsum passage_count passage_retrieval_en lcc repobench-p}"
 
 ENV_PREFIX=(
   "CUDA_VISIBLE_DEVICES=${GPU_ID}"
 )
+if [ "${COLLECT_STATS}" = "0" ]; then
+  ENV_PREFIX+=("CONDITION_BLOCK_SKIP_STATS=1")
+fi
 
 if [ "$#" -gt 0 ]; then
   EPS_LIST=("$@")
@@ -24,7 +28,7 @@ for DATASET in "${DATASET_LIST[@]}"; do
   echo "=== condition_block_triton dataset=${DATASET}, eps_count=${#EPS_LIST[@]} ==="
   for EPS in "${EPS_LIST[@]}"; do
     RUN_OUTPUT_ROOT="${OUTPUT_ROOT}"
-    echo "=== condition_block_triton dataset=${DATASET}, eps=${EPS}, block_size=${BLOCK_SIZE}, gpu=${GPU_ID}, output=${RUN_OUTPUT_ROOT} ==="
+    echo "=== condition_block_triton dataset=${DATASET}, eps=${EPS}, block_size=${BLOCK_SIZE}, gpu=${GPU_ID}, collect_stats=${COLLECT_STATS}, output=${RUN_OUTPUT_ROOT} ==="
     env "${ENV_PREFIX[@]}" /usr/bin/time -f "WALL_TIME %E" \
       conda run --no-capture-output -n "${CONDA_ENV}" \
       python -m llama.script.analysis.generate.longbench.run_all \

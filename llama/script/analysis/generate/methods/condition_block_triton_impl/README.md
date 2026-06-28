@@ -12,3 +12,7 @@ Fast path 支持 `block_size=16/32`。底层 Tensor Core tile 固定为 16 token
 - 32-token selected page 使用两次 MMA tile，并在 kernel 内做 online-softmax 合并。
 
 顶层 `condition_block_triton.py` 只保留兼容导出，现有 CLI/import 不需要修改。
+
+Stats 默认开启，用于输出等效 budget。实现中 stats 计数延迟到样本结束后
+materialize，避免 decode 每层每步 `.item()` 同步；纯测速可设置
+`CONDITION_BLOCK_SKIP_STATS=1` 关闭。

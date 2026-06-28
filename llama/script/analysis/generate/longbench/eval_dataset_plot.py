@@ -19,6 +19,9 @@ from .eval import (
 )
 
 
+CONDITION_BLOCK_METHODS = {"condition_block", "condition_block_triton"}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate one LongBench dataset and plot method comparisons."
@@ -99,7 +102,7 @@ def infer_condition_budgets(rows):
 
 def infer_effective_budget(run_info, rows):
     method = run_info.get("method")
-    if method == "condition_block":
+    if method in CONDITION_BLOCK_METHODS:
         return infer_condition_budgets(rows)["effective_budget"]
     if method == "full":
         return 1.0
@@ -116,8 +119,9 @@ def run_label(row):
         return f"SnapKV {row['budget']:g}"
     if method == "kvpress_adakv_snapkv":
         return f"AdaKV SnapKV {row['budget']:g}"
-    if method == "condition_block":
-        return f"CondBlock b{row['block_size']} eps={row['eps']:g}"
+    if method in CONDITION_BLOCK_METHODS:
+        prefix = "CondBlock Triton" if method == "condition_block_triton" else "CondBlock"
+        return f"{prefix} b{row['block_size']} eps={row['eps']:g}"
     if method == "quest":
         return f"QUEST {row['budget']:g}"
     if "budget" in row:
@@ -168,7 +172,7 @@ def evaluate_dataset(args, cached_rows=None):
     for pred_path in sorted(dataset_dir.glob("*.jsonl")):
         run_info = parse_run_name(pred_path)
         if (
-            run_info.get("method") == "condition_block"
+            run_info.get("method") in CONDITION_BLOCK_METHODS
             and run_info.get("block_size") in excluded_condition_block_sizes
         ):
             continue
@@ -191,7 +195,7 @@ def evaluate_dataset(args, cached_rows=None):
         run_info["file_size_bytes"] = pred_path.stat().st_size
         run_info["num_predictions"] = len(pred_rows)
         run_info["score"] = score_rows(args.dataset, pred_rows, metadata, args.e)
-        if run_info.get("method") == "condition_block":
+        if run_info.get("method") in CONDITION_BLOCK_METHODS:
             run_info.update(infer_condition_budgets(pred_rows))
         else:
             run_info["effective_budget"] = infer_effective_budget(run_info, pred_rows)
@@ -215,6 +219,7 @@ def sort_key(row):
         "h2o": 4,
         "quest": 5,
         "condition_block": 6,
+        "condition_block_triton": 7,
     }
     return (
         method_order.get(row.get("method"), 99),
@@ -266,6 +271,7 @@ def plot_score_vs_budget(path, rows, dataset, dpi, xscale="linear"):
         "h2o": "#F58518",
         "quest": "#54A24B",
         "condition_block": "#E45756",
+        "condition_block_triton": "#17A589",
     }
     labels = {
         "kvpress_streamllm": "StreamLLM",
@@ -275,11 +281,11 @@ def plot_score_vs_budget(path, rows, dataset, dpi, xscale="linear"):
         "quest": "QUEST",
     }
 
-    condition_rows = [row for row in rows if row.get("method") == "condition_block"]
+    condition_rows = [row for row in rows if row.get("method") in CONDITION_BLOCK_METHODS]
     grouped = {}
     for row in condition_rows:
-        grouped.setdefault(row.get("block_size"), []).append(row)
-    for block_size, block_rows in sorted(grouped.items()):
+        grouped.setdefault((row.get("method"), row.get("block_size")), []).append(row)
+    for (method, block_size), block_rows in sorted(grouped.items()):
         points = sorted(
             [row for row in block_rows if row.get("effective_decode_budget") is not None],
             key=lambda row: row["effective_decode_budget"],
@@ -291,15 +297,19 @@ def plot_score_vs_budget(path, rows, dataset, dpi, xscale="linear"):
             [row["score"] for row in points],
             marker="o",
             linewidth=1.6,
-            color=colors["condition_block"],
+            color=colors[method],
             alpha=0.95 if block_size == 16 else 0.55,
-            label=f"CondBlock block={block_size}",
+            label=(
+                f"CondBlock Triton block={block_size}"
+                if method == "condition_block_triton"
+                else f"CondBlock block={block_size}"
+            ),
         )
 
     line_methods = [
         method
         for method in sorted({row.get("method") for row in rows})
-        if method not in {"condition_block", "full"}
+        if method not in CONDITION_BLOCK_METHODS | {"full"}
     ]
     for method in line_methods:
         points = [
@@ -358,7 +368,7 @@ def plot_condition_eps(path, rows, dataset, dpi):
     condition_rows = [
         row
         for row in rows
-        if row.get("method") == "condition_block" and row.get("score") is not None
+        if row.get("method") in CONDITION_BLOCK_METHODS and row.get("score") is not None
     ]
     if not condition_rows:
         return False
@@ -366,16 +376,20 @@ def plot_condition_eps(path, rows, dataset, dpi):
     fig, ax = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
     grouped = {}
     for row in condition_rows:
-        grouped.setdefault(row.get("block_size"), []).append(row)
+        grouped.setdefault((row.get("method"), row.get("block_size")), []).append(row)
 
-    for block_size, block_rows in sorted(grouped.items()):
+    for (method, block_size), block_rows in sorted(grouped.items()):
         points = sorted(block_rows, key=lambda row: row.get("eps", 0.0))
         ax.plot(
             [row["eps"] for row in points],
             [row["score"] for row in points],
             marker="o",
             linewidth=1.6,
-            label=f"block={block_size}",
+            label=(
+                f"Triton block={block_size}"
+                if method == "condition_block_triton"
+                else f"block={block_size}"
+            ),
         )
         for row in points:
             budget = row.get("effective_decode_budget")
@@ -437,7 +451,7 @@ def main():
     scored_rows = [row for row in rows if row.get("score") is not None]
     for row in sorted(scored_rows, key=lambda item: item["score"], reverse=True)[:8]:
         budget = row.get("effective_budget")
-        if row.get("method") == "condition_block":
+        if row.get("method") in CONDITION_BLOCK_METHODS:
             budget = row.get("effective_decode_budget")
         budget_text = "n/a" if budget is None else f"{budget:.4f}"
         print(f"{row['score']:6.2f}  budget={budget_text}  n={row['num_predictions']:4d}  {row['label']}")

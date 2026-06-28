@@ -780,7 +780,6 @@ def _condition_block_selection_finalize_kernel(
 def _condition_block_decode_output(
     *,
     q_grouped,
-    pos_tensor,
     prompt_prefix,
     k_suffix,
     v_suffix,
@@ -828,6 +827,11 @@ def _condition_block_decode_output(
     if use_fused_triton:
         pass
     elif os.environ.get("CONDITION_BLOCK_DENSE_STAGE2") == "1":
+        pos_tensor = torch.tensor(
+            [int(prompt_len) + int(k_suffix.shape[1]) - 1],
+            device=q_grouped.device,
+            dtype=torch.long,
+        )
         output = _condition_block_decode_output_dense(
             q_grouped=q_grouped,
             pos_tensor=pos_tensor,
@@ -842,6 +846,11 @@ def _condition_block_decode_output(
             cluster_exists=cluster_exists,
         )
     elif os.environ.get("CONDITION_BLOCK_COMPACT_SDPA_STAGE2") == "1":
+        pos_tensor = torch.tensor(
+            [int(prompt_len) + int(k_suffix.shape[1]) - 1],
+            device=q_grouped.device,
+            dtype=torch.long,
+        )
         output = _condition_block_decode_output_compact_sdpa(
             q_grouped=q_grouped,
             pos_tensor=pos_tensor,
@@ -870,8 +879,8 @@ def _condition_block_decode_output(
             selected=selected,
             size=size,
             cluster_exists=cluster_exists,
-            pos_tensor=pos_tensor,
             prompt_len=prompt_len,
+            suffix_len=int(k_suffix.shape[1]),
         )
     return output, stats
 
@@ -1064,7 +1073,7 @@ class ConditionBlockDecodeRunner:
         return int(layer_idx) in self.layer_idx_set and int(layer_idx) >= self.full_attention_layers
 
     def summarize(self):
-        return summarize_stats(self.aggregate_stats, self.stats_by_layer)
+        return _summarize_stats_lazy(self.aggregate_stats, self.stats_by_layer)
 
     def reset_step(self, pos):
         self.pos = int(pos)
@@ -1104,7 +1113,7 @@ class ConditionBlockDecodeRunner:
             if layer_idx in self.layer_idx_set and not self.skip_stats:
                 stats = full_attention_stats_for_heads(query.shape[1], [self.pos])
                 self.stats_by_layer[int(layer_idx)] = stats
-                merge_stats(self.aggregate_stats, stats)
+                _merge_stats_lazy(self.aggregate_stats, stats)
             return _sdpa_full_attention_forward(
                 module,
                 query,
@@ -1144,11 +1153,6 @@ class ConditionBlockDecodeRunner:
 
         output, stats = _condition_block_decode_output(
             q_grouped=q_grouped,
-            pos_tensor=(
-                None
-                if self.skip_stats
-                else torch.tensor([self.pos], device=query.device, dtype=torch.long)
-            ),
             prompt_prefix=prompt_prefix,
             k_suffix=k_all[:, self.prompt_len :],
             v_suffix=v_all[:, self.prompt_len :],
@@ -1162,7 +1166,7 @@ class ConditionBlockDecodeRunner:
 
         if stats is not None:
             self.stats_by_layer[int(layer_idx)] = stats
-            merge_stats(self.aggregate_stats, stats)
+            _merge_stats_lazy(self.aggregate_stats, stats)
         return output.to(query.dtype), None
 
 
@@ -1196,23 +1200,60 @@ def model_attention_implementation(model, implementation):
         model.config._attn_implementation = original
 
 
-def _condition_stats(*, selected, size, cluster_exists, pos_tensor, prompt_len):
+def _merge_stats_lazy(total, add):
+    for key, value in add.items():
+        if key in total:
+            total[key] = total[key] + value
+        else:
+            total[key] = value
+
+
+def _to_python_number(value):
+    if torch.is_tensor(value):
+        value = value.detach().cpu()
+        if value.numel() != 1:
+            raise ValueError("Expected scalar tensor in condition-block stats.")
+        return int(value.item())
+    return int(value)
+
+
+def _stats_ratio(numerator, denominator):
+    num = _to_python_number(numerator)
+    den = max(_to_python_number(denominator), 1)
+    return float(num / den)
+
+
+def _materialize_stats(stats):
+    return {key: _to_python_number(value) for key, value in stats.items()}
+
+
+def _summarize_stats_lazy(aggregate_stats, stats_by_layer):
+    # This function is called once per decode step. Keep it synchronization-free:
+    # raw scalar tensors are materialized only after generation finishes in
+    # summarize_condition_block_step_metadata().
+    return {
+        "aggregate": dict(aggregate_stats),
+        "by_layer": {
+            int(layer_idx): dict(stats) for layer_idx, stats in stats_by_layer.items()
+        },
+    }
+
+
+def _condition_stats(*, selected, size, cluster_exists, prompt_len, suffix_len):
     n_kv_heads, group_size, n_query = selected.shape[:3]
-    selected_tokens = (selected.long() * size.view(1, 1, n_query, -1)).sum()
+    size_view = size.view(1, 1, n_query, -1)
+    selected_tokens = (selected.long() * size_view).sum()
     cluster_active = (~selected) & cluster_exists.view(1, 1, n_query, -1)
-    suffix_tokens = (
-        (pos_tensor - int(prompt_len) + 1).clamp_min(0).long().sum()
-        * n_kv_heads
-        * group_size
-    )
+    suffix_tokens = int(max(int(suffix_len), 0) * n_kv_heads * group_size)
     n_rows = int(n_kv_heads * group_size * n_query)
+    total_available = int((int(prompt_len) + max(int(suffix_len), 0)) * n_rows)
     return {
         "rows": n_rows,
-        "clusters": int((cluster_exists.sum() * n_kv_heads * group_size).item()),
-        "selected_clusters": int(selected.sum().item()),
-        "selected_tokens": int(selected_tokens.item()),
-        "hybrid_tokens": int((selected_tokens + cluster_active.sum() + suffix_tokens).item()),
-        "total_available": int(((pos_tensor.long() + 1).sum() * n_kv_heads * group_size).item()),
+        "clusters": cluster_exists.sum() * n_kv_heads * group_size,
+        "selected_clusters": selected.sum(),
+        "selected_tokens": selected_tokens,
+        "hybrid_tokens": selected_tokens + cluster_active.sum() + suffix_tokens,
+        "total_available": total_available,
     }
 
 
@@ -1253,24 +1294,28 @@ def summarize_condition_block_step_metadata(step_metadata):
         if not metadata:
             continue
         step_aggregate = metadata.get("aggregate", {})
+        step_hybrid = step_aggregate.get("hybrid_tokens", 0)
+        step_total = step_aggregate.get("total_available", 0)
         by_step.append(
             {
                 "step": step_idx,
-                "equiv_budget": step_aggregate.get("mean_budget_causal"),
+                "equiv_budget": _stats_ratio(step_hybrid, step_total),
             }
         )
         for key, value in step_aggregate.items():
-            if isinstance(value, int):
-                aggregate[key] = int(aggregate.get(key, 0)) + int(value)
+            if key.startswith("mean_"):
+                continue
+            _merge_stats_lazy(aggregate, {key: value})
 
-    total_available = max(int(aggregate.get("total_available", 0)), 1)
-    rows = max(int(aggregate.get("rows", 0)), 1)
-    hybrid_tokens = int(aggregate.get("hybrid_tokens", 0))
+    materialized = _materialize_stats(aggregate)
+    total_available = max(int(materialized.get("total_available", 0)), 1)
+    rows = max(int(materialized.get("rows", 0)), 1)
+    hybrid_tokens = int(materialized.get("hybrid_tokens", 0))
     equiv_budget = float(hybrid_tokens / total_available)
     return {
         "condition_block_equiv_budget": equiv_budget,
         "condition_block_budget": {
-            **aggregate,
+            **materialized,
             "mean_hybrid_tokens": float(hybrid_tokens / rows),
             "mean_budget_causal": equiv_budget,
             "mean_budget_visible": equiv_budget,

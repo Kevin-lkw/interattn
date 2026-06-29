@@ -231,7 +231,7 @@ def pending_generation_records(args, benchmark_name, records=None):
     elif args.limit is not None:
         records = records[: args.limit]
     out_path = output_path(args, benchmark_name)
-    done_ids = _load_done_ids(out_path)
+    done_ids = load_done_ids(out_path)
     pending_records = [
         (index, record)
         for index, record in enumerate(records)
@@ -332,7 +332,7 @@ def run_generation_benchmark(
     return out_path
 
 
-def _load_done_ids(path):
+def load_done_ids(path):
     if not path.exists():
         return set()
     done = set()
@@ -345,3 +345,6 @@ def _load_done_ids(path):
             if "id" in row:
                 done.add(str(row["id"]))
     return done
+
+
+_load_done_ids = load_done_ids

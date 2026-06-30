@@ -90,12 +90,14 @@ def ksim_condition_parts(q_pos, pos_tensor, prefix, delta_mode):
     k_bar = k_sum / counts_safe[..., None]
     v_bar = v_sum / counts_safe[..., None]
 
-    s_c = torch.einsum("hqd,qcd->hqc", q_pos.float(), k_bar) / scale
-    token_logits = torch.einsum("hqd,td->hqt", q_pos.float(), prefix["k_tokens"]) / scale
+    q_float = q_pos.float()
+    s_c = torch.einsum("hqd,qcd->hqc", q_float, k_bar) / scale
+    token_logits = None
     token_visible = prefix["token_idx"][None, :] <= pos_tensor[:, None]
     token_cluster = prefix["assignments"]
 
     if delta_mode == "exact":
+        token_logits = torch.einsum("hqd,td->hqt", q_float, prefix["k_tokens"]) / scale
         centered = (token_logits - s_c[:, :, token_cluster]).abs()
         delta_vals = torch.full_like(s_c, float("-inf"))
         for cluster_idx in range(int(prefix["n_clusters"])):
@@ -107,7 +109,7 @@ def ksim_condition_parts(q_pos, pos_tensor, prefix, delta_mode):
     elif delta_mode == "range_bound":
         k_max = prefix["k_prefix_max"][pos_tensor]
         k_min = prefix["k_prefix_min"][pos_tensor]
-        q_for_bounds = q_pos[:, :, None, :]
+        q_for_bounds = q_float[:, :, None, :]
         upper_score = torch.maximum(q_for_bounds * k_max, q_for_bounds * k_min).sum(
             dim=-1
         ) / scale
@@ -178,7 +180,14 @@ def condition_ksim_outputs_for_queries(
         & parts["token_visible"].unsqueeze(0)
     )
     if token_active.any():
-        token_logits = parts["token_logits"].masked_fill(~token_active, float("-inf"))
+        if parts["token_logits"] is None:
+            token_logits_raw = (
+                torch.einsum("hqd,td->hqt", q_pos.float(), prefix["k_tokens"])
+                / math.sqrt(head_dim)
+            )
+        else:
+            token_logits_raw = parts["token_logits"]
+        token_logits = token_logits_raw.masked_fill(~token_active, float("-inf"))
         max_parts.append(token_logits.amax(dim=-1))
     else:
         token_logits = None

@@ -4,7 +4,11 @@ import torch
 import torch.nn.functional as F
 from transformers.models.llama import modeling_llama
 
-from ...condition_ksim_cluster import resolve_num_clusters, spherical_kmeans_assign
+from ...condition_ksim_cluster import (
+    batched_spherical_kmeans_assign,
+    resolve_num_clusters,
+    spherical_kmeans_assign,
+)
 from .condition_block import (
     _full_generation_step_metadata,
     _should_stop,
@@ -20,16 +24,20 @@ def _build_prompt_condition_ksim_prefix(
     *,
     cluster_size,
     kmeans_iters,
+    assignments=None,
 ):
     if k_head.ndim != 2 or v_head.ndim != 2:
         raise ValueError("k_head and v_head must have shape [prompt_len, head_dim].")
     prompt_len, head_dim = k_head.shape
     n_clusters = resolve_num_clusters(prompt_len, cluster_size)
-    assignments = spherical_kmeans_assign(
-        k_head,
-        cluster_size=cluster_size,
-        kmeans_iters=kmeans_iters,
-    )
+    if assignments is None:
+        assignments = spherical_kmeans_assign(
+            k_head,
+            cluster_size=cluster_size,
+            kmeans_iters=kmeans_iters,
+        )
+    else:
+        assignments = assignments.to(device=k_head.device, dtype=torch.long)
     device = k_head.device
     k_float = k_head.float()
     v_float = v_head.float()
@@ -47,16 +55,16 @@ def _build_prompt_condition_ksim_prefix(
     k_max = torch.full((n_clusters, head_dim), float("-inf"), device=device, dtype=torch.float32)
     k_min = torch.full((n_clusters, head_dim), float("inf"), device=device, dtype=torch.float32)
     v_norm_max = torch.full((n_clusters,), float("-inf"), device=device, dtype=torch.float32)
-    # Prompt generation builds this once per layer/head; a tiny loop over clusters
-    # keeps memory bounded for LongBench-length prompts.
-    for cluster_idx in range(n_clusters):
-        mask = assignments == cluster_idx
-        if not mask.any():
-            continue
-        k_cluster = k_float[mask]
-        k_max[cluster_idx] = k_cluster.amax(dim=0)
-        k_min[cluster_idx] = k_cluster.amin(dim=0)
-        v_norm_max[cluster_idx] = torch.norm(v_float[mask], p=2, dim=-1).amax()
+    scatter_idx = assignments[:, None].expand(-1, head_dim)
+    k_max.scatter_reduce_(0, scatter_idx, k_float, reduce="amax", include_self=True)
+    k_min.scatter_reduce_(0, scatter_idx, k_float, reduce="amin", include_self=True)
+    v_norm_max.scatter_reduce_(
+        0,
+        assignments,
+        torch.norm(v_float, p=2, dim=-1),
+        reduce="amax",
+        include_self=True,
+    )
 
     return {
         "cluster_size": int(cluster_size),
@@ -73,6 +81,30 @@ def _build_prompt_condition_ksim_prefix(
     }
 
 
+def _build_prompt_condition_ksim_prefixes(
+    k_all,
+    v_all,
+    *,
+    cluster_size,
+    kmeans_iters,
+):
+    assignments_all = batched_spherical_kmeans_assign(
+        k_all,
+        cluster_size=cluster_size,
+        kmeans_iters=kmeans_iters,
+    )
+    return [
+        _build_prompt_condition_ksim_prefix(
+            k_all[kv_head],
+            v_all[kv_head],
+            cluster_size=cluster_size,
+            kmeans_iters=kmeans_iters,
+            assignments=assignments_all[kv_head],
+        )
+        for kv_head in range(int(k_all.shape[0]))
+    ]
+
+
 def _prompt_ksim_condition_parts(q_pos, prefix, delta_mode):
     n_heads, n_query, head_dim = q_pos.shape
     scale = head_dim**0.5
@@ -81,11 +113,13 @@ def _prompt_ksim_condition_parts(q_pos, prefix, delta_mode):
     counts_safe = counts.clamp_min(1.0)
     k_bar = prefix["k_sum"] / counts_safe[:, None]
     v_bar = prefix["v_sum"] / counts_safe[:, None]
-    s_c = torch.einsum("hqd,cd->hqc", q_pos.float(), k_bar) / scale
-    token_logits = torch.einsum("hqd,td->hqt", q_pos.float(), prefix["k_tokens"]) / scale
+    q_float = q_pos.float()
+    s_c = torch.einsum("hqd,cd->hqc", q_float, k_bar) / scale
     token_cluster = prefix["assignments"]
+    token_logits = None
 
     if delta_mode == "exact":
+        token_logits = torch.einsum("hqd,td->hqt", q_float, prefix["k_tokens"]) / scale
         centered = (token_logits - s_c[:, :, token_cluster]).abs()
         delta_vals = torch.full_like(s_c, float("-inf"))
         for cluster_idx in range(int(prefix["n_clusters"])):
@@ -94,7 +128,7 @@ def _prompt_ksim_condition_parts(q_pos, prefix, delta_mode):
             delta_vals[:, :, cluster_idx] = values
         delta = delta_vals.masked_fill(~cluster_exists.view(1, 1, -1), 0.0)
     elif delta_mode == "range_bound":
-        q_for_bounds = q_pos[:, :, None, :]
+        q_for_bounds = q_float[:, :, None, :]
         upper_score = torch.maximum(
             q_for_bounds * prefix["k_max"],
             q_for_bounds * prefix["k_min"],
@@ -191,7 +225,14 @@ def _condition_ksim_decode_one_kv_head(
     token_active = failed_cluster[:, :, parts["token_cluster"]]
     token_logits = None
     if token_active.any():
-        token_logits = parts["token_logits"].masked_fill(~token_active, float("-inf"))
+        if parts["token_logits"] is None:
+            token_logits_raw = (
+                torch.einsum("hqd,td->hqt", q_pos.float(), prompt_prefix["k_tokens"])
+                / scale
+            )
+        else:
+            token_logits_raw = parts["token_logits"]
+        token_logits = token_logits_raw.masked_fill(~token_active, float("-inf"))
         max_parts.append(token_logits.amax(dim=-1))
 
     suffix_len = int(k_suffix.shape[0])
@@ -379,15 +420,12 @@ class ConditionKSimClusterDecodeRunner:
         )
         prompt_prefixes = self.prompt_prefix_cache.get(cache_key)
         if prompt_prefixes is None:
-            prompt_prefixes = [
-                _build_prompt_condition_ksim_prefix(
-                    k_all[kv_head, : self.prompt_len],
-                    v_all[kv_head, : self.prompt_len],
-                    cluster_size=self.cluster_size,
-                    kmeans_iters=self.kmeans_iters,
-                )
-                for kv_head in range(n_kv_heads)
-            ]
+            prompt_prefixes = _build_prompt_condition_ksim_prefixes(
+                k_all[:, : self.prompt_len],
+                v_all[:, : self.prompt_len],
+                cluster_size=self.cluster_size,
+                kmeans_iters=self.kmeans_iters,
+            )
             self.prompt_prefix_cache[cache_key] = prompt_prefixes
 
         output, stats = _condition_ksim_decode_output(

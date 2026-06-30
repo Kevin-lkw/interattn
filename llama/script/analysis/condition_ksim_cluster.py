@@ -88,6 +88,99 @@ def spherical_kmeans_assign(
     return assignments.long()
 
 
+def batched_spherical_kmeans_assign(
+    k_tokens,
+    *,
+    cluster_size,
+    kmeans_iters=4,
+    max_clusters=None,
+    assign_chunk_size=4096,
+):
+    """Return token -> cluster assignments for multiple KV heads.
+
+    k_tokens has shape [n_heads, seq_len, head_dim].  Each head is clustered
+    independently, but the assignment and center-update matmuls are batched.
+    """
+
+    if k_tokens.ndim != 3:
+        raise ValueError("k_tokens must have shape [n_heads, seq_len, head_dim]")
+    n_heads, seq_len, _head_dim = k_tokens.shape
+    n_heads = int(n_heads)
+    seq_len = int(seq_len)
+    n_clusters = resolve_num_clusters(seq_len, cluster_size, max_clusters=max_clusters)
+    if n_clusters == seq_len:
+        return torch.arange(seq_len, device=k_tokens.device, dtype=torch.long).expand(
+            n_heads,
+            -1,
+        )
+
+    x = F.normalize(k_tokens.float(), p=2, dim=-1, eps=1e-6)
+    init_idx = torch.linspace(
+        0,
+        seq_len - 1,
+        steps=n_clusters,
+        device=k_tokens.device,
+    ).round().long()
+    centers = x[:, init_idx].clone()
+    head_offsets = (
+        torch.arange(n_heads, device=k_tokens.device, dtype=torch.long) * n_clusters
+    ).view(n_heads, 1)
+    assignments = None
+    for _ in range(max(int(kmeans_iters), 1)):
+        chunks = []
+        for start in range(0, seq_len, int(assign_chunk_size)):
+            scores = torch.einsum(
+                "gtd,gcd->gtc",
+                x[:, start : start + int(assign_chunk_size)],
+                centers,
+            )
+            chunks.append(scores.argmax(dim=-1))
+        assignments = torch.cat(chunks, dim=1)
+
+        flat_assign = (assignments + head_offsets).reshape(-1)
+        new_centers = torch.zeros(
+            n_heads * n_clusters,
+            x.shape[-1],
+            device=k_tokens.device,
+            dtype=torch.float32,
+        )
+        counts = torch.zeros(
+            n_heads * n_clusters,
+            device=k_tokens.device,
+            dtype=torch.float32,
+        )
+        new_centers.index_add_(0, flat_assign, x.reshape(-1, x.shape[-1]))
+        counts.index_add_(
+            0,
+            flat_assign,
+            torch.ones(n_heads * seq_len, device=k_tokens.device, dtype=torch.float32),
+        )
+        new_centers = new_centers.view(n_heads, n_clusters, -1)
+        counts = counts.view(n_heads, n_clusters)
+        nonempty = counts > 0
+        centers = torch.where(
+            nonempty[..., None],
+            F.normalize(
+                new_centers / counts.clamp_min(1.0)[..., None],
+                p=2,
+                dim=-1,
+                eps=1e-6,
+            ),
+            centers,
+        )
+    if assignments is None:
+        chunks = []
+        for start in range(0, seq_len, int(assign_chunk_size)):
+            scores = torch.einsum(
+                "gtd,gcd->gtc",
+                x[:, start : start + int(assign_chunk_size)],
+                centers,
+            )
+            chunks.append(scores.argmax(dim=-1))
+        assignments = torch.cat(chunks, dim=1)
+    return assignments.long()
+
+
 def build_ksim_prefix_tensors(
     k_head,
     v_head,

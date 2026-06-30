@@ -94,6 +94,12 @@ def generate_condition_block_cached(
 
     logits = outputs.logits.float()
     past_key_values = outputs.past_key_values
+    if os.environ.get("CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE") == "1":
+        past_key_values = _static_cache_from_prefill(
+            model.config,
+            past_key_values,
+            max_cache_len=prompt_len + max_new_tokens,
+        )
     if collect_stats:
         step_metadata.append(_full_generation_step_metadata(model, [total_len - 1]))
 
@@ -121,12 +127,16 @@ def generate_condition_block_cached(
         for _step in range(1, max_new_tokens):
             runner.reset_step(total_len - 1)
             with torch.no_grad():
+                cache_position = None
+                if os.environ.get("CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE") == "1":
+                    cache_position = torch.tensor([total_len - 1], device=input_ids.device, dtype=torch.long)
                 outputs = model(
                     input_ids=step_input_ids,
                     attention_mask=cur_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
                     logits_to_keep=1,
+                    cache_position=cache_position,
                 )
 
             logits = outputs.logits.float()
@@ -144,6 +154,19 @@ def generate_condition_block_cached(
             total_len += 1
 
     return torch.cat(generated, dim=1), summarize_condition_block_step_metadata(step_metadata)
+
+
+def _static_cache_from_prefill(config, prefill_cache, max_cache_len):
+    static_cache = StaticCache(config=config, max_cache_len=int(max_cache_len))
+    for layer_idx, source_layer in enumerate(prefill_cache.layers):
+        key_states = source_layer.keys
+        value_states = source_layer.values
+        target_layer = static_cache.layers[layer_idx]
+        target_layer.lazy_initialization(key_states[:, :, :1], value_states[:, :, :1])
+        seq_len = int(key_states.shape[2])
+        target_layer.keys[:, :, :seq_len].copy_(key_states)
+        target_layer.values[:, :, :seq_len].copy_(value_states)
+    return static_cache
 
 
 def _generate_condition_block_with_hf_loop(

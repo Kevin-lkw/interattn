@@ -82,3 +82,99 @@ CONDITION_BLOCK_COMPILE_SELECTION=1 \
 CONDITION_BLOCK_TRITON_CHUNK_BLOCKS=64 \
 CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE=1
 ```
+
+## Decode-only and dummy-selection profiling
+
+为了避免 prefill 掩盖 decode 阶段差异，`longbench_v2_latency.py` 增加了：
+
+```bash
+--decode-only-timing
+--profile-decode-only
+```
+
+实现方式是不改变原 generate 路径，只在第一次 `model.forward` 返回后开始计时
+/ profiler。第一次 forward 对应 long-context prefill，因此输出里的
+`decode_only_seconds` 可以近似表示只生成后续 token 的耗时。
+
+示例：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/scratch1/liankewei/interattn \
+CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE=1 \
+python -m llama.script.analysis.generate.longbench_v2_latency \
+  --device cuda:0 \
+  --methods full condition_block_triton \
+  --contexts 32768 65536 131072 \
+  --max-new-tokens 128 \
+  --samples 1 --warmup 1 \
+  --condition-block-size 32 \
+  --condition-eps 0.1 \
+  --skip-stats \
+  --compile-selection \
+  --fixed-decode \
+  --decode-only-timing \
+  --output /tmp/lb2_decode_only_32k_128k.jsonl
+```
+
+Decode-only latency, `max_new_tokens=128`, `block_size=32`, `eps=0.1`：
+
+```text
+context   full decode   Triton decode   Triton vs full
+32K       2.802s        2.979s          0.94x
+64K       4.021s        3.955s          1.02x
+128K      6.301s        5.697s          1.11x
+```
+
+32K decode-only profiler breakdown shows why 32K is not yet favorable:
+
+```text
+full:
+  model_gemm_gemv        55.4%
+  kv_cache_copy_index    25.9%
+  flash_sdpa_attention   13.0%
+
+Triton:
+  model_gemm_gemv        61.6%
+  kv_cache_copy_index    27.6%
+  condition_selection     4.0%
+  sparse_finalize_attn    1.8%
+  sparse_reduce           0.1%
+```
+
+At 32K, full SDPA decode attention is already small enough that the extra
+condition-selection and custom sparse-path overhead can erase the saved
+attention work.
+
+Two synthetic/diagnostic scripts were added:
+
+- `condition_block_stage_latency.py`: synthetic microbench for selection,
+  dummy selected sparse attention, and full SDPA decode attention.
+- `condition_block_dummy_e2e_latency.py`: end-to-end generate with production
+  selection replaced by a fixed dummy selected-block ratio.
+
+Dummy-selection 32K decode-only result, `max_new_tokens=128`：
+
+```text
+config              decode-only   vs production
+production          3.010s        1.00x
+dummy 0% selected   2.804s        1.073x
+dummy 10% selected  3.142s        0.958x
+dummy 25% selected  3.179s        0.947x
+```
+
+Interpretation:
+
+- dummy selection skips query-dependent condition work:
+  `q @ k_bar`, `q @ k_max/k_min`, delta, condition score, selected-mask
+  decision;
+- it still computes attention over unselected representatives and selected
+  block tokens;
+- at 32K, even making selection free only improves decode by about 7% in the
+  best 0%-selected case;
+- with 10%/25% selected blocks, selected-token attention cost outweighs the
+  removed selection cost.
+
+Conclusion: for 32K single-batch decode, selection is not the dominant bottleneck.
+The largest profiler buckets are model GEMM/GEMV and KV/cache copy/index. Sparse
+attention becomes useful at longer contexts, where full decode attention grows
+linearly while representative attention grows much more slowly.

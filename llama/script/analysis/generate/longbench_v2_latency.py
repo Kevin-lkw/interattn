@@ -30,6 +30,7 @@ class LatencyRow:
     record_length: str | None
     phase: str
     metadata: dict
+    decode_only_seconds: float | None = None
     profile: dict | None = None
 
 
@@ -58,6 +59,20 @@ def parse_args():
     parser.add_argument("--split", default="train")
     parser.add_argument("--record-offset", type=int, default=0)
     parser.add_argument("--profile", action="store_true", help="Collect torch profiler CUDA breakdown for measured samples.")
+    parser.add_argument(
+        "--profile-decode-only",
+        action="store_true",
+        help="With --profile and --decode-only-timing, start the profiler after the prefill forward returns.",
+    )
+    parser.add_argument(
+        "--decode-only-timing",
+        action="store_true",
+        help=(
+            "Also report wall-clock time after the first model forward returns. "
+            "For generate-style runs, the first forward is the long-context prefill, "
+            "so this approximates decode-only latency without changing the generate path."
+        ),
+    )
     parser.add_argument(
         "--fixed-decode",
         action="store_true",
@@ -184,7 +199,7 @@ def summarize_profiler(prof):
     }
 
 
-def run_generate(model, tokenizer, method, args, input_ids, attention_mask):
+def run_generate(model, tokenizer, method, args, input_ids, attention_mask, decode_profiler=None):
     if torch.cuda.is_available() and str(args.device).startswith("cuda"):
         torch.cuda.synchronize()
     start = time.perf_counter()
@@ -196,6 +211,22 @@ def run_generate(model, tokenizer, method, args, input_ids, attention_mask):
         model.config.eos_token_id = None
         if method.kind in {"condition_block", "condition_block_triton"}:
             tokenizer.eos_token_id = None
+    orig_forward = model.forward
+    decode_timing = {"started": False, "start": None}
+
+    if args.decode_only_timing:
+        def timed_forward(*forward_args, **forward_kwargs):
+            outputs = orig_forward(*forward_args, **forward_kwargs)
+            if not decode_timing["started"]:
+                if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                decode_timing["started"] = True
+                decode_timing["start"] = time.perf_counter()
+                if decode_profiler is not None:
+                    decode_profiler.start()
+            return outputs
+
+        model.forward = timed_forward
     try:
         if args.fixed_decode and method.kind == "full":
             with torch.no_grad():
@@ -221,15 +252,23 @@ def run_generate(model, tokenizer, method, args, input_ids, attention_mask):
                 dataset="longbench_v2",
             )
     finally:
+        model.forward = orig_forward
         if args.fixed_decode:
             model.generation_config.eos_token_id = orig_generation_eos
             model.config.eos_token_id = orig_config_eos
             tokenizer.eos_token_id = orig_tokenizer_eos
     if torch.cuda.is_available() and str(args.device).startswith("cuda"):
         torch.cuda.synchronize()
+    if decode_profiler is not None and decode_timing["started"]:
+        decode_profiler.stop()
     seconds = time.perf_counter() - start
     output_ids, metadata = result if isinstance(result, tuple) else (result, {})
-    return output_ids, metadata, seconds
+    decode_only_seconds = None
+    if args.decode_only_timing and decode_timing["start"] is not None:
+        decode_only_seconds = time.perf_counter() - float(decode_timing["start"])
+        metadata = dict(metadata)
+        metadata["decode_only_seconds"] = decode_only_seconds
+    return output_ids, metadata, seconds, decode_only_seconds
 
 
 def main():
@@ -283,14 +322,34 @@ def main():
                     phase = "warmup" if phase_i < args.warmup else "measured"
                     prof_summary = None
                     if args.profile and phase == "measured":
-                        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False, with_stack=False) as prof:
-                            output_ids, metadata, seconds = run_generate(
-                                model, tokenizer, method, args, input_ids, attention_mask
+                        if args.profile_decode_only:
+                            if not args.decode_only_timing:
+                                raise ValueError("--profile-decode-only requires --decode-only-timing.")
+                            prof = profile(
+                                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                                record_shapes=False,
+                                with_stack=False,
+                            )
+                            output_ids, metadata, seconds, decode_only_seconds = run_generate(
+                                model,
+                                tokenizer,
+                                method,
+                                args,
+                                input_ids,
+                                attention_mask,
+                                decode_profiler=prof,
                             )
                             prof.step()
-                        prof_summary = summarize_profiler(prof)
+                            prof_summary = summarize_profiler(prof)
+                        else:
+                            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False, with_stack=False) as prof:
+                                output_ids, metadata, seconds, decode_only_seconds = run_generate(
+                                    model, tokenizer, method, args, input_ids, attention_mask
+                                )
+                                prof.step()
+                            prof_summary = summarize_profiler(prof)
                     else:
-                        output_ids, metadata, seconds = run_generate(
+                        output_ids, metadata, seconds, decode_only_seconds = run_generate(
                             model, tokenizer, method, args, input_ids, attention_mask
                         )
 
@@ -304,6 +363,7 @@ def main():
                         record_length=record.get("length"),
                         phase=phase,
                         metadata=metadata,
+                        decode_only_seconds=decode_only_seconds,
                         profile=prof_summary,
                     )
                     payload = asdict(row)

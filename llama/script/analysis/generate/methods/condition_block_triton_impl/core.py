@@ -234,9 +234,25 @@ def _pad_blocks(x, block_size):
     return x.reshape(n_heads, n_blocks, block_size, *x.shape[2:]), n_blocks
 
 
+def _ensure_paged_layout(x, block_size):
+    """Keep the (head, block, token, dim) view kernel-addressable via strides.
+
+    The fused kernel reads token pages as ``head * head_stride + token * head_dim``,
+    which only requires the inner three dims to be laid out like a contiguous
+    tensor. Cache slices satisfy this as views; anything else is materialized
+    once here instead of being cloned by ``.contiguous()`` on every decode step.
+    """
+    head_dim = int(x.shape[-1])
+    if x.stride(3) == 1 and x.stride(2) == head_dim and x.stride(1) == block_size * head_dim:
+        return x
+    return x.contiguous()
+
+
 def _build_prompt_blocks(k_all, v_all, block_size):
     k_block_attn, n_blocks = _pad_blocks(k_all, block_size)
     v_block_attn, _ = _pad_blocks(v_all, block_size)
+    k_block_attn = _ensure_paged_layout(k_block_attn, block_size)
+    v_block_attn = _ensure_paged_layout(v_block_attn, block_size)
     device = k_all.device
     seq_len = int(k_all.shape[1])
 
@@ -954,10 +970,12 @@ def _condition_block_decode_output_fused_triton(
         device=q.device,
         dtype=torch.bool,
     )
+    k_block = prompt_prefix["k_block_attn"]
+    v_block = prompt_prefix["v_block_attn"]
     _condition_block_finalize_attention_kernel[(n_kv_heads, n_chunks)](
         q,
-        prompt_prefix["k_block_attn"].contiguous(),
-        prompt_prefix["v_block_attn"].contiguous(),
+        k_block,
+        v_block,
         prompt_prefix["v_bar"].contiguous(),
         s_cache,
         delta_cache,
@@ -976,6 +994,8 @@ def _condition_block_decode_output_fused_triton(
         partial_l,
         n_blocks,
         suffix_len,
+        k_block.stride(0),
+        v_block.stride(0),
         k_suffix.stride(0),
         k_suffix.stride(1),
         v_suffix.stride(0),

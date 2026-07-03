@@ -239,6 +239,16 @@ def parse_args():
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument(
+        "--summary-dtype",
+        default="float32",
+        choices=["float32", "bfloat16"],
+        help=(
+            "Dtype of the per-block summaries (k_bar/k_max/k_min/v_bar) that are "
+            "re-read from HBM at every decode step. The kernels convert to FP32 in "
+            "registers, so bfloat16 halves summary IO without touching kernel code."
+        ),
+    )
     parser.add_argument("--contexts", nargs="+", type=int, default=[32768, 65536, 131072])
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--suffix-tokens", type=int, default=0)
@@ -268,7 +278,9 @@ def cuda_time_ms(fn, warmup, iters):
     return float(start.elapsed_time(end)) / float(iters)
 
 
-def build_synthetic_prefix(*, n_kv_heads, context_tokens, block_size, head_dim, dtype, device):
+def build_synthetic_prefix(
+    *, n_kv_heads, context_tokens, block_size, head_dim, dtype, device, summary_dtype=torch.float32
+):
     n_blocks = math.ceil(context_tokens / block_size)
     total_tokens = n_blocks * block_size
     k_block = torch.randn(
@@ -295,10 +307,10 @@ def build_synthetic_prefix(*, n_kv_heads, context_tokens, block_size, head_dim, 
     return {
         "k_block_attn": k_block,
         "v_block_attn": v_block,
-        "k_bar": k_bar,
-        "v_bar": v_bar,
-        "k_max": k_for_max.amax(dim=2).float(),
-        "k_min": k_for_min.amin(dim=2).float(),
+        "k_bar": k_bar.to(summary_dtype),
+        "v_bar": v_bar.to(summary_dtype),
+        "k_max": k_for_max.amax(dim=2).float().to(summary_dtype),
+        "k_min": k_for_min.amin(dim=2).float().to(summary_dtype),
         "v_norm_max": v_norm.amax(dim=2),
         "v_norm_all": v_norm.amax(dim=2).amax(dim=-1),
         "block_valid_counts": counts,
@@ -412,6 +424,8 @@ def main():
     group_size = args.q_heads // args.kv_heads
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    summary_dtype = torch.bfloat16 if args.summary_dtype == "bfloat16" else torch.float32
+
     with args.output.open("w", encoding="utf-8") as handle:
         for context_tokens in args.contexts:
             prefix = build_synthetic_prefix(
@@ -421,6 +435,7 @@ def main():
                 head_dim=args.head_dim,
                 dtype=dtype,
                 device=device,
+                summary_dtype=summary_dtype,
             )
             q_grouped = torch.randn(
                 (args.kv_heads, group_size, 1, args.head_dim),
@@ -439,6 +454,7 @@ def main():
             row = {
                 "context_tokens": int(context_tokens),
                 "block_size": int(args.block_size),
+                "summary_dtype": args.summary_dtype,
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_stats_reduce",
@@ -454,6 +470,7 @@ def main():
             row = {
                 "context_tokens": int(context_tokens),
                 "block_size": int(args.block_size),
+                "summary_dtype": args.summary_dtype,
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_materialize",
@@ -473,6 +490,7 @@ def main():
             row = {
                 "context_tokens": int(context_tokens),
                 "block_size": int(args.block_size),
+                "summary_dtype": args.summary_dtype,
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "production_fused_selection_attention",

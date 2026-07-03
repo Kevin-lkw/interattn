@@ -120,9 +120,9 @@ Decode-only latency, `max_new_tokens=128`, `block_size=32`, `eps=0.1`：
 
 ```text
 context   full decode   Triton decode   Triton vs full
-32K       2.802s        2.979s          0.94x
-64K       4.021s        3.955s          1.02x
-128K      6.301s        5.697s          1.11x
+32K       2.828s        2.979s          0.95x
+64K       4.020s        3.956s          1.02x
+128K      6.301s        5.704s          1.10x
 ```
 
 32K decode-only profiler breakdown shows why 32K is not yet favorable:
@@ -130,15 +130,15 @@ context   full decode   Triton decode   Triton vs full
 ```text
 full:
   model_gemm_gemv        55.4%
-  kv_cache_copy_index    25.9%
+  kv_cache_copy_index    26.0%
   flash_sdpa_attention   13.0%
 
 Triton:
-  model_gemm_gemv        61.6%
-  kv_cache_copy_index    27.6%
-  condition_selection     4.0%
-  sparse_finalize_attn    1.8%
-  sparse_reduce           0.1%
+  model_gemm_gemv        53.9%
+  kv_cache_copy_index    34.6%
+  condition_selection     2.1%
+  sparse_finalize_attn    2.7%
+  sparse_reduce           0.2%
 ```
 
 At 32K, full SDPA decode attention is already small enough that the extra
@@ -156,10 +156,10 @@ Dummy-selection 32K decode-only result, `max_new_tokens=128`：
 
 ```text
 config              decode-only   vs production
-production          3.010s        1.00x
-dummy 0% selected   2.804s        1.073x
-dummy 10% selected  3.142s        0.958x
-dummy 25% selected  3.179s        0.947x
+production          2.973s        1.00x
+dummy 0% selected   2.800s        1.06x
+dummy 10% selected  3.128s        0.95x
+dummy 25% selected  3.163s        0.94x
 ```
 
 Interpretation:
@@ -178,3 +178,330 @@ Conclusion: for 32K single-batch decode, selection is not the dominant bottlenec
 The largest profiler buckets are model GEMM/GEMV and KV/cache copy/index. Sparse
 attention becomes useful at longer contexts, where full decode attention grows
 linearly while representative attention grows much more slowly.
+
+## IO-bound Optimization Analysis Plan
+
+Decode attention is largely IO-bound: full attention repeatedly reads all
+historical KV from HBM, while condition-block should read representatives for
+unselected blocks and only read token KV for selected blocks. The optimization
+question is therefore not only whether sparse attention computes fewer scores,
+but whether the whole decode path actually reduces HBM traffic enough to beat
+Flash/SDPA plus model-side overhead.
+
+Use the following three-step analysis before choosing the next kernel change.
+All latency comparisons should use `decode_only_seconds`, not total
+`generation_seconds`, unless explicitly studying prefill or end-to-end serving
+latency.
+
+### Step 1: Condition selection efficiency
+
+Measure the query-dependent cluster selection path with
+`condition_block_stage_latency.py`.
+
+Track:
+
+- `selection_stats_reduce`: computes the stats needed by the condition formula.
+- `selection_materialize`: produces the selected-block mask.
+- Full SDPA decode attention as a reference point.
+
+The selection path includes:
+
+```text
+q @ k_bar
+q @ k_max / k_min
+delta
+condition score
+selected mask decision
+```
+
+Representative/cluster centers themselves (`k_bar`, `v_bar`, `k_min`, `k_max`)
+are prompt-side summaries and are cached once per layer. The repeated per-token
+cost is deciding which cached clusters the current query should expand.
+
+Success criteria:
+
+- Determine whether selection grows with context length.
+- Compare selection latency against full SDPA decode attention at 32K/64K/128K.
+- If selection is close to, or larger than, full SDPA attention at a context
+  length, sparse attention will need selection/attention fusion to win there.
+
+### Step 2: Dummy-selection sparse attention upper bound
+
+Use dummy selected-block ratios to isolate the attention kernel after cluster
+selection is already known.
+
+Recommended ratios:
+
+```text
+0%, 5%, 10%, 25%
+```
+
+Use:
+
+- `condition_block_stage_latency.py` for synthetic sparse-attention upper bound.
+- `condition_block_dummy_e2e_latency.py` for generate-path behavior with
+  production selection replaced by fixed dummy masks.
+
+Dummy selection skips:
+
+```text
+q @ k_bar for condition selection
+q @ k_max / k_min
+delta
+condition score
+selected mask decision
+```
+
+Dummy selection still computes:
+
+```text
+representative attention for unselected blocks: q @ k_bar
+token attention for selected blocks: q @ k_token
+exact generated-suffix attention: q @ k_suffix
+model forward, KV cache update, hooks, logits
+```
+
+Success criteria:
+
+- If dummy `0%` selected is still not clearly faster, the bottleneck is not
+  condition selection alone.
+- If dummy `10%` or `25%` selected becomes slower, selected-token KV IO already
+  consumes the benefit of skipping selection.
+- If dummy sparse attention is fast in synthetic microbench but weak in
+  generate, the remaining bottleneck is outside the sparse-attention math.
+
+### Step 3: End-to-end decode-only attribution
+
+Run production decode-only profiling on the original generate path:
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu> PYTHONPATH=/scratch1/liankewei/interattn \
+CONDITION_BLOCK_SKIP_STATS=1 \
+CONDITION_BLOCK_COMPILE_SELECTION=1 \
+CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE=1 \
+python -m llama.script.analysis.generate.longbench_v2_latency \
+  --device cuda:0 \
+  --methods full condition_block_triton \
+  --contexts 32768 65536 131072 \
+  --max-new-tokens 128 \
+  --samples 1 --warmup 1 \
+  --condition-block-size 32 \
+  --condition-eps 0.1 \
+  --skip-stats \
+  --compile-selection \
+  --fixed-decode \
+  --decode-only-timing \
+  --profile \
+  --profile-decode-only \
+  --output /tmp/lb2_decode_profile.jsonl
+```
+
+Also run dummy-selection decode-only profiling:
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu> PYTHONPATH=/scratch1/liankewei/interattn \
+python -m llama.script.analysis.generate.condition_block_dummy_e2e_latency \
+  --device cuda:0 \
+  --contexts 32768 \
+  --max-new-tokens 128 \
+  --samples 1 --warmup 1 \
+  --condition-block-size 32 \
+  --selected-ratios 0 0.1 0.25 \
+  --include-production \
+  --fixed-decode \
+  --decode-only-timing \
+  --profile \
+  --profile-decode-only \
+  --output /tmp/dummy_decode_profile_32k.jsonl
+```
+
+Fixed setting:
+
+```text
+max_new_tokens = 128
+block_size = 32
+eps = 0.1
+stats disabled
+compiled selection enabled
+post-prefill StaticCache enabled
+```
+
+Important profiler buckets:
+
+- `flash_sdpa_attention`: full-attention decode kernel cost.
+- `condition_selection`: query-dependent cluster selection.
+- `sparse_finalize_attention`: representative + selected-token sparse attention.
+- `sparse_reduce`: partial softmax reduce across block chunks.
+- `kv_cache_copy_index`: KV cache update/read/slice/copy/index traffic.
+- `model_gemm_gemv`: model linear layers, MLP, projections, lm head.
+
+Success criteria:
+
+- Compare `full` vs `condition_block_triton` using `decode_only_seconds`.
+- Compare production vs dummy `0%/10%/25%` selected using the same metric.
+- Use profiler percentages only for attribution; profiler wall time is slower
+  than normal execution and should not replace clean latency runs.
+
+### Decision criteria / next optimization target
+
+- If `condition_selection` dominates: optimize selection, reduce metadata reads,
+  or fuse selection more deeply with sparse attention.
+- If `sparse_finalize_attention` dominates: optimize selected page loading,
+  selected-token IO, and paged-attention-style kernels.
+- If `sparse_reduce` dominates: reduce chunk count or fuse/rework partial
+  softmax reduction.
+- If `kv_cache_copy_index` dominates: optimize cache layout, generated-suffix
+  slicing, StaticCache use, and avoid extra contiguous/copy/index operations.
+- If `model_gemm_gemv` dominates: single-batch attention optimization has limited
+  remaining headroom; consider larger batch, CUDA graph / lower eager dispatch,
+  or accept that this context length is close to the decode-path ceiling.
+
+Current data suggests:
+
+- At 32K, full SDPA decode attention is already small; dummy `0%` selected only
+  improves production decode by about 6%.
+- At 64K, Triton decode is roughly break-even.
+- At 128K, Triton decode shows a clearer benefit because full attention KV IO
+  grows linearly with context while representative attention grows much more
+  slowly.
+
+### Latest IO-bound analysis results
+
+Fresh outputs:
+
+```text
+/tmp/cb_io_stage_32k_128k.jsonl
+/tmp/cb_io_decode_32k_128k.jsonl
+/tmp/cb_io_dummy_32k_128k.jsonl
+/tmp/cb_io_decode_profile_32k.jsonl
+```
+
+Stage microbench:
+
+| context | selection materialize | full SDPA attn | dummy sparse 0% | dummy sparse 10% | dummy sparse 25% |
+|---:|---:|---:|---:|---:|---:|
+| 32K | 0.069 ms | 0.080 ms | 0.031 ms | 0.031 ms | 0.031 ms |
+| 64K | 0.068 ms | 0.218 ms | 0.031 ms | 0.031 ms | 0.040 ms |
+| 128K | 0.073 ms | 0.403 ms | 0.031 ms | 0.043 ms | 0.111 ms |
+
+Decode-only full vs Triton:
+
+| context | full decode | Triton decode | Triton vs full |
+|---:|---:|---:|---:|
+| 32K | 2.828s | 2.979s | 0.95x |
+| 64K | 4.020s | 3.956s | 1.02x |
+| 128K | 6.301s | 5.704s | 1.10x |
+
+Dummy-selection decode-only:
+
+| context | production | dummy 0% | dummy 10% | dummy 25% |
+|---:|---:|---:|---:|---:|
+| 32K | 2.973s | 2.800s (1.06x) | 3.128s (0.95x) | 3.163s (0.94x) |
+| 64K | 3.957s | 3.676s (1.08x) | 4.040s (0.98x) | 4.126s (0.96x) |
+| 128K | 5.745s | 5.397s (1.06x) | 5.836s (0.98x) | 6.016s (0.95x) |
+
+Takeaways:
+
+- The synthetic sparse attention upper bound is strong: dummy sparse attention
+  is much cheaper than full SDPA at 64K/128K.
+- In production decode, that win is partly offset by KV/cache traffic and model
+  GEMM/GEMV, which dominate the 32K profile.
+- Dummy `0%` confirms that making selection free only gives a small decode gain;
+  dummy `10%/25%` confirms selected-token IO can quickly eat the selection
+  savings.
+
+## Kernel 级 decode 归因与逐步 clone 修复
+
+`condition_block_decode_attribution.py` 在 bucket profile 之上补三个 bucket
+回答不了的数字：每个 decode step 的 GPU busy vs wall、每步 kernel launch 数、
+以及单 kernel 耗时（只统计 device 侧 event，避免 CPU op 与 kernel 重复计数）。
+wall 时间取自不开 profiler 的干净 run，kernel 时间取自单独的 profiled run。
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu> PYTHONPATH=/scratch1/liankewei/interattn \
+CONDITION_BLOCK_SKIP_STATS=1 CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE=1 \
+python -m llama.script.analysis.generate.condition_block_decode_attribution \
+  --device cuda:0 --methods full condition_block_triton \
+  --contexts 32768 65536 131072 --max-new-tokens 128
+```
+
+输出：`llama/result/generate/cb_attr_{full,triton,triton_fixed}.jsonl`。
+
+### 发现：fused 路径每个 decode step 都 clone 整个 blocked prompt KV
+
+用 `record_shapes` + stack profile 定位到 Triton 路径最大的 copy 是对
+`[8, n_blocks, 32, 128]` 的 `aten::contiguous`，每层每步各两次：
+`k_block_attn` / `v_block_attn` 每层只构建一次并缓存在 `prompt_prefix`，
+但它们是 KV cache buffer 的非连续 view；fused kernel 启动时每步都对它们调用
+`.contiguous()`，等于每步把整个 blocked prompt K/V 各 clone 一遍
+（32K 时每层 2 x 67MB）：32K 单次 98.5us（占 GPU busy 30.7%），64K 195us
+（44.9%）—— 随 context 线性增长，超过了 sparse attention 省下的全部时间。
+
+修复：finalize kernel 增加 `k_block_head_stride` / `v_block_head_stride`，
+直接按 stride 读 cache view 里的 token page（与 suffix 已有的做法一致）；
+`_ensure_paged_layout` 对意外 layout 保留一次性 contiguous 兜底。
+每步零拷贝、零额外显存。
+
+Sanity check：
+
+- kernel 单元检查：非连续 view 与 contiguous copy 两种输入，输出和 selected
+  mask 逐位一致（prompt 长度整除与带 padding 两种情况）；
+- e2e：修复前后生成 token 完全一致（32K/64K post-prefill StaticCache、
+  32K DynamicCache；LongBench-v2，32 tokens）。
+
+### Decode-only latency 修复前后（128 fixed tokens, block 32, eps 0.1）
+
+| context | full (HF DynamicCache) | Triton 修复前 | Triton 修复后 | 修复后 vs full |
+|---:|---:|---:|---:|---:|
+| 32K  | 22.26 ms/step | 23.57 ms/step (0.94x) | 17.37 ms/step | **1.28x** |
+| 64K  | 31.73 ms/step | 30.64 ms/step (1.04x) | 18.04 ms/step | **1.76x** |
+| 128K | 49.57 ms/step | 44.9 ms/step (1.10x)  | 19.70 ms/step | **2.52x** |
+
+修复后 decode step 随 context 基本持平（32K→128K 只从 17.4 涨到 19.7 ms/step），
+这正是该方法应有的 scaling。
+
+Baseline 说明：HF `full` baseline 自身在 DynamicCache `torch.cat` 上消耗越来越
+大（32K/64K/128K 分别占其 GPU busy 的 24%/34%/46%）。若与去掉 cat 的理想 full
+baseline（17.4 / 21.5 / 27.6 ms/step）对比，修复后为 1.00x / 1.19x / 1.40x。
+HF 自带的 `cache_implementation="static"` generate 实测反而慢 3.6 倍，
+不能当作更强的 baseline。
+
+### 修复后归因（Triton fixed）
+
+| per step | 32K | 64K | 128K |
+|---|---:|---:|---:|
+| decode wall | 17.37 ms | 18.04 ms | 19.70 ms |
+| GPU busy（占比） | 14.74 ms (85%) | 15.60 ms (86%) | 17.30 ms (88%) |
+| model_gemm_gemv | 73.4% | 69.2% | 61.9% |
+| condition_selection | 5.7% | 8.3% | 12.9% |
+| sparse_finalize_attention | 7.3% | 7.8% | 8.2% |
+| kv_cache_copy_index | 4.2% | 4.5% | 5.1% |
+| kernel launches | 1456 | 1456 | 1456 |
+
+128K 时每层每步 sparse 路径约 117us（selection stats 68us + finalize 44us +
+reduce 约 4us），对比 full attention 的 flash kernel 399us；sparse 各 kernel
+中只有 selection-stats 仍随 context 明显增长。
+
+生产 selected ratio（stats 开，eps 0.1）：32K/64K/128K 分别只选中
+1.4% / 0.7% / 0.4% 的 block（等效 budget 7.5% / 6.8% / 6.6%），selected page
+的 IO 可以忽略；sparse 路径主要开销在 representative 与 summary 的读取。
+
+### 已排除：BF16 block summaries
+
+`condition_block_stage_latency.py --summary-dtype bfloat16` 把
+`k_bar/k_max/k_min/v_bar` 转成 BF16（kernel 加载后在寄存器转 FP32，无需改
+kernel）。所有 context 下均为 0.95-1.03x —— selection kernel 在这些尺寸下
+不是带宽瓶颈，砍半 summary IO 没有收益。不采用。
+
+### 剩余 decode 优化空间（按优先级）
+
+1. Model GEMV/GEMM 是天花板：约 10.8 ms/step，与 context 无关，有效带宽约
+   1.5 TB/s（约峰值 83%）。再往下要靠权重量化、更大 batch 或 speculative
+   decoding，而不是 attention 侧。
+2. Host/launch 开销：每步 idle 2.4-2.6 ms（12-15%），约 1456 次 kernel
+   launch。下一步最自然的优化是把整个 decode step 做成 CUDA graph。
+3. Sparse 路径融合：把 selection-stats 与 finalize-attention 合并
+   （finalize 本来就从 cache 重读 s/delta），每层可省一次随 context 增长的
+   pass 和一次 launch；收益上限是 condition_selection 的 5.7-12.9%。
+4. 残留：每步一次、随 context 成比例的 copy（32K 102us → 128K 389us，
+   约占 busy 1-2%），疑似 HF 侧 mask/cache 处理；优先级低。

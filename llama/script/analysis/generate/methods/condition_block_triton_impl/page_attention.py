@@ -8,6 +8,8 @@ import triton.language as tl
         "n_blocks",
         "suffix_len",
         "n_chunks",
+        "k_block_head_stride",
+        "v_block_head_stride",
         "k_suffix_head_stride",
         "k_suffix_token_stride",
         "v_suffix_head_stride",
@@ -17,6 +19,8 @@ import triton.language as tl
         "n_blocks",
         "suffix_len",
         "n_chunks",
+        "k_block_head_stride",
+        "v_block_head_stride",
         "k_suffix_head_stride",
         "k_suffix_token_stride",
         "v_suffix_head_stride",
@@ -45,6 +49,8 @@ def _condition_block_finalize_attention_kernel(
     partial_l_ptr,
     n_blocks,
     suffix_len,
+    k_block_head_stride,
+    v_block_head_stride,
     k_suffix_head_stride,
     k_suffix_token_stride,
     v_suffix_head_stride,
@@ -172,13 +178,15 @@ def _condition_block_finalize_attention_kernel(
             for page_start in tl.static_range(0, PAGE_SIZE, BLOCK_N):
                 token_idx = page_start + n_off
                 token_active = token_idx < page_count
+                # Token pages are read through the cache view with an explicit
+                # per-head stride, so the caller never has to materialize a
+                # contiguous copy of the blocked prompt K/V.
                 token_off = (
-                    ((kv_head * n_blocks + page) * PAGE_SIZE + token_idx[:, None])
-                    * head_dim
+                    (page * PAGE_SIZE + token_idx[:, None]) * head_dim
                     + d_off[None, :]
                 )
                 k = tl.load(
-                    k_block_ptr + token_off,
+                    k_block_ptr + kv_head * k_block_head_stride + token_off,
                     mask=token_active[:, None] & d_mask[None, :],
                     other=0.0,
                 ).to(tl.bfloat16)
@@ -197,7 +205,7 @@ def _condition_block_finalize_attention_kernel(
                     0.0,
                 )
                 v = tl.load(
-                    v_block_ptr + token_off,
+                    v_block_ptr + kv_head * v_block_head_stride + token_off,
                     mask=token_active[:, None] & d_mask[None, :],
                     other=0.0,
                 ).to(tl.bfloat16)

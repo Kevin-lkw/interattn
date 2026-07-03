@@ -618,3 +618,64 @@ per-kernel（us/step，旧 → 新 FP32）：stats 2175→1492（128K，效率
 floor 附近，是剩余 attention 开销里最大的一块；进一步压缩需要减少
 summary 读量本身（如 k_max/k_min 换成标量 radius，把 selection 读量
 从 4 vector/block 降到 2，read-bound 上限从 ~14x 提到 ~26x）。
+
+## 下一步优化方向分析
+
+带宽效率优化之后，decode 每步时间的去向（CUDA graph，实测归因）：
+
+| 类别 | 32K | 64K | 128K |
+|---|---:|---:|---:|
+| model GEMV | 10.71 ms（75%） | 10.73 ms（72%） | 10.64 ms（65%） |
+| sparse attention（3 kernel） | 1.69 ms（11.9%） | 2.02 ms（13.5%） | 2.90 ms（17.8%） |
+| pointwise/norm/rope | 0.70 ms | 0.78 ms | 0.92 ms |
+| KV cache copy（index_copy） | 0.58 ms | 0.68 ms | 0.87 ms |
+| other | 0.52 ms | 0.68 ms | 0.95 ms |
+| 每步合计 | 15.12 ms | 15.76 ms | 17.34 ms |
+
+按预期收益排序的候选方向：
+
+### A. 标量 radius selection（attention 侧最优先，方法本身的改进）
+
+现在 selection stats 是 attention 里最大、且随 context 增长最快的 kernel
+（128K 时 1492us/步），它每 block 读 3 个 vector（k_bar/k_max/k_min，
+坐标区间 bound）。改为围绕 k_bar 的球形 bound：prefill 时预计算每 block
+标量半径 `r_b = max_t ||k_t - k_bar||`，decode 时
+
+```
+delta <= ||q|| * r_b * scale
+```
+
+- 读量：3 vector/block → 1 vector + 1 标量（约 3 倍减少）；stats 128K
+  预计 1492 → ~500-600us，attention 合计 2897 → ~2000us
+  （相对 full 的 attention 相加速 4.62x → ~6.5x）；e2e 约 4-5%。
+- 理论上限：selection 读量从 2/B 降到 1/B，read-volume bound 从
+  1/(s+2/32) ≈ 13-15x 提高到 1/budget ≈ 22-28x。
+- 代价：球形 bound 比坐标区间 bound 松（各向同性），同 eps 下会多选
+  block（或需要重新标定 eps）；bound 依然 sound（只会多算不会漏算），
+  但 LongBench 质量需要重新验证。
+- 改动面：`_build_prompt_blocks`（换 summary）、stats kernel、eager
+  参考实现，加一轮质量 sweep。
+- 与已有的 `CONDITION_BLOCK_SUMMARY_DTYPE=bfloat16`（attention 再
+  +10-15%，同样待质量验证）可叠加。
+
+### B. GEMV 墙（e2e 最大的杠杆，但与本方法正交）
+
+GEMV 每步 10.6-10.7 ms、与 context 无关、已跑到权重带宽约 83% 峰值——
+kernel 层面没有空间，只能减少字节数：FP8/INT8 权重量化（GEMV 最多
+~1.8x → e2e 约 1.4-1.55x）、speculative decoding（K 个 token 摊销一次
+权重读取）、batching（多请求共享权重读取）。这是当前唯一能带来
+>1.3x e2e 的方向，但属于模型级工程，不是 attention 方法本身。
+
+### C. Elementwise/copy 尾巴（合计 12-16%）
+
+fused QKV / gate-up projection、编译整个 decoder layer、RoPE 与 cache
+写入融合。上限约 10% e2e，HF 集成工程量大，列为第三优先级
+（顶层 README「后续优化方向」第 1 条仍然有效）。
+
+### D. 32K latency floor（记录为已知限制，不建议继续投入）
+
+32K 时 3 个依赖 kernel 贴着 ~55us/层 的延迟下限，launch 配置无法改善；
+只有更大的结构改动（persistent kernel / 跨层调度）才可能突破，ROI 低。
+
+**结论**：做方法/论文 → 选 A（数学清晰、改动可控、直接提高理论上限）；
+只追求绝对 decode 延迟 → 选 B（量化是仅剩的大杠杆）。

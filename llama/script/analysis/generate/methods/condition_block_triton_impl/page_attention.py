@@ -6,7 +6,6 @@ import triton.language as tl
 @triton.jit(
     do_not_specialize=[
         "n_blocks",
-        "suffix_len",
         "n_chunks",
         "k_block_head_stride",
         "v_block_head_stride",
@@ -17,7 +16,6 @@ import triton.language as tl
     ],
     do_not_specialize_on_alignment=[
         "n_blocks",
-        "suffix_len",
         "n_chunks",
         "k_block_head_stride",
         "v_block_head_stride",
@@ -48,7 +46,7 @@ def _condition_block_finalize_attention_kernel(
     partial_m_ptr,
     partial_l_ptr,
     n_blocks,
-    suffix_len,
+    suffix_len_ptr,
     k_block_head_stride,
     v_block_head_stride,
     k_suffix_head_stride,
@@ -215,6 +213,9 @@ def _condition_block_finalize_attention_kernel(
                 softmax_l = softmax_l * alpha + tl.sum(beta, axis=1)
                 softmax_m = new_m
     if chunk == n_chunks - 1:
+        # The suffix length lives in device memory so a CUDA-graphed decode
+        # step can advance it without re-recording the kernel launch.
+        suffix_len = tl.load(suffix_len_ptr)
         suffix_start = 0
         while suffix_start < suffix_len:
             suffix_idx = suffix_start + n_off

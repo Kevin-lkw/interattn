@@ -52,6 +52,15 @@ def generate_condition_block_cached(
         raise ValueError("condition_block only supports delta_mode='range_bound'.")
     if int(input_ids.shape[0]) != 1:
         raise ValueError("condition_block generate currently expects batch_size=1.")
+    if os.environ.get("CONDITION_BLOCK_CUDA_GRAPH") == "1":
+        return _generate_condition_block_cuda_graph(
+            model=model,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            method=method,
+            dataset=dataset,
+        )
 
     prompt_len = int(input_ids.shape[1])
     max_new_tokens = int(method.max_new_tokens)
@@ -154,6 +163,133 @@ def generate_condition_block_cached(
             total_len += 1
 
     return torch.cat(generated, dim=1), summarize_condition_block_step_metadata(step_metadata)
+
+
+def _generate_condition_block_cuda_graph(
+    *,
+    model,
+    tokenizer,
+    input_ids,
+    attention_mask,
+    method,
+    dataset=None,
+):
+    """Decode with one CUDA-graph replay per generated token.
+
+    Prefill runs unchanged (SDPA + DynamicCache), the prompt KV moves into a
+    StaticCache, a few eager decode steps build the per-layer prompt summaries
+    and warm the Triton kernels, then the whole decode step (forward + argmax
+    + state advance) is captured once and replayed for the remaining tokens.
+    Replays execute no Python, so host/launch overhead drops to a single
+    graph-launch per token.
+
+    Constraints: requires CONDITION_BLOCK_SKIP_STATS=1, full_attention_layers=0
+    and the fused Triton stage2 path. Stop tokens are applied by truncation
+    after generation, which yields exactly the greedy early-stop output.
+    """
+    if os.environ.get("CONDITION_BLOCK_SKIP_STATS") != "1":
+        raise ValueError("CONDITION_BLOCK_CUDA_GRAPH=1 requires CONDITION_BLOCK_SKIP_STATS=1.")
+    if int(method.full_attention_layers) != 0:
+        raise ValueError("CUDA-graph decode supports full_attention_layers=0 only.")
+    if int(method.condition_block_size) not in (16, 32) or any(
+        os.environ.get(flag) == "1"
+        for flag in (
+            "CONDITION_BLOCK_DENSE_STAGE2",
+            "CONDITION_BLOCK_COMPACT_SDPA_STAGE2",
+            "CONDITION_BLOCK_LEGACY_STAGE2",
+        )
+    ):
+        raise ValueError("CUDA-graph decode requires the fused Triton stage2 path.")
+
+    prompt_len = int(input_ids.shape[1])
+    max_new_tokens = int(method.max_new_tokens)
+    if max_new_tokens <= 0:
+        output_ids = torch.empty((1, 0), device=input_ids.device, dtype=input_ids.dtype)
+        return output_ids, summarize_condition_block_step_metadata([])
+
+    with model_attention_implementation(model, "sdpa"):
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+    past_key_values = _static_cache_from_prefill(
+        model.config,
+        outputs.past_key_values,
+        max_cache_len=prompt_len + max_new_tokens,
+    )
+
+    dev = input_ids.device
+    out_tokens = torch.zeros(max_new_tokens, dtype=input_ids.dtype, device=dev)
+    next_id = torch.argmax(outputs.logits.float()[:, -1, :], dim=-1)
+    out_tokens[0] = next_id[0]
+    del outputs
+
+    input_ids_buf = next_id.view(1, 1).clone()
+    cache_pos_buf = torch.tensor([prompt_len], device=dev, dtype=torch.long)
+    step_idx_buf = torch.ones(1, device=dev, dtype=torch.long)
+
+    runner = ConditionBlockDecodeRunner(
+        model=model,
+        model_config=model.config,
+        layer_idx_list=list(range(int(model.config.num_hidden_layers))),
+        full_attention_layers=method.full_attention_layers,
+        block_size=method.condition_block_size,
+        eps=method.condition_eps,
+        prompt_len=prompt_len,
+        pos=prompt_len,
+        prompt_prefix_cache={},
+    )
+    runner.static_suffix = True
+    runner.suffix_len_dev.fill_(1)
+
+    def _decode_step():
+        step_outputs = model(
+            input_ids=input_ids_buf,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            use_cache=True,
+            logits_to_keep=1,
+            cache_position=cache_pos_buf,
+        )
+        step_next = torch.argmax(step_outputs.logits.float()[0, -1], dim=-1)
+        out_tokens.index_copy_(0, step_idx_buf, step_next.view(1))
+        input_ids_buf.copy_(step_next.view(1, 1))
+        cache_pos_buf.add_(1)
+        step_idx_buf.add_(1)
+        runner.suffix_len_dev.add_(1)
+
+    # First eager step builds prompt summaries and JIT-compiles kernels; the
+    # side-stream steps stabilize allocations per the torch.cuda.graphs recipe.
+    warmup_steps = min(3, max_new_tokens - 1)
+    with condition_block_decode_context(runner), _no_causal_mask_context(), torch.no_grad():
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(warmup_steps):
+                _decode_step()
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+        remaining = max_new_tokens - 1 - warmup_steps
+        if remaining > 0:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                _decode_step()
+            for _ in range(remaining):
+                graph.replay()
+    torch.cuda.synchronize()
+
+    tokens = out_tokens.tolist()
+    stop_token_ids = set(_stop_token_ids(tokenizer, dataset))
+    n_keep = len(tokens)
+    for idx, token in enumerate(tokens):
+        if token in stop_token_ids:
+            n_keep = idx + 1
+            break
+    output_ids = out_tokens[:n_keep].view(1, -1).to(dtype=input_ids.dtype)
+    return output_ids, {"condition_block_stats_disabled": True, "cuda_graph_decode": True}
 
 
 def _static_cache_from_prefill(config, prefill_cache, max_cache_len):
@@ -822,6 +958,7 @@ def _condition_block_decode_output(
     prompt_prefix,
     k_suffix,
     v_suffix,
+    suffix_len_dev,
     block_size,
     eps,
     prompt_len,
@@ -844,6 +981,7 @@ def _condition_block_decode_output(
             prompt_prefix=prompt_prefix,
             k_suffix=k_suffix,
             v_suffix=v_suffix,
+            suffix_len_dev=suffix_len_dev,
             eps=eps,
             page_size=int(block_size),
             store_selected=collect_stats,
@@ -930,6 +1068,7 @@ def _condition_block_decode_output_fused_triton(
     prompt_prefix,
     k_suffix,
     v_suffix,
+    suffix_len_dev,
     eps,
     page_size,
     store_selected,
@@ -941,7 +1080,6 @@ def _condition_block_decode_output_fused_triton(
         _run_condition_block_selection_stats(q_grouped, prompt_prefix, workspace)
     )
     rows = int(n_kv_heads * group_size)
-    suffix_len = int(k_suffix.shape[1])
     partial_acc = _workspace_empty(
         workspace,
         "attention_partial_acc",
@@ -993,7 +1131,7 @@ def _condition_block_decode_output_fused_triton(
         partial_m,
         partial_l,
         n_blocks,
-        suffix_len,
+        suffix_len_dev,
         k_block.stride(0),
         v_block.stride(0),
         k_suffix.stride(0),
@@ -1111,6 +1249,16 @@ class ConditionBlockDecodeRunner:
         self.stats_by_layer = {}
         self.aggregate_stats = {}
         self.skip_stats = os.environ.get("CONDITION_BLOCK_SKIP_STATS") == "1"
+        # Device-side suffix length consumed by the fused kernel. The eager
+        # loop refreshes it in reset_step(); the CUDA-graph loop advances it
+        # in-graph so replays never touch Python.
+        self.suffix_len_dev = torch.zeros(
+            (), dtype=torch.int32, device=next(model.parameters()).device
+        )
+        # When True, the hook hands the kernel full-size static-cache views and
+        # trusts suffix_len_dev for validity, keeping all shapes step-invariant
+        # (required for CUDA-graph capture).
+        self.static_suffix = False
 
     def should_compress(self, layer_idx):
         return int(layer_idx) in self.layer_idx_set and int(layer_idx) >= self.full_attention_layers
@@ -1120,6 +1268,7 @@ class ConditionBlockDecodeRunner:
 
     def reset_step(self, pos):
         self.pos = int(pos)
+        self.suffix_len_dev.fill_(max(self.pos + 1 - self.prompt_len, 0))
         self.stats_by_layer.clear()
         self.aggregate_stats.clear()
 
@@ -1181,9 +1330,15 @@ class ConditionBlockDecodeRunner:
         q_grouped = query[0].reshape(
             n_kv_heads, n_heads // n_kv_heads, q_len, head_dim
         )
-        visible_len = self.pos + 1
-        k_all = key[0, :, :visible_len]
-        v_all = value[0, :, :visible_len]
+        if self.static_suffix:
+            # Full static-cache views: shapes never change across steps; the
+            # kernel reads only suffix_len_dev valid suffix tokens.
+            k_all = key[0]
+            v_all = value[0]
+        else:
+            visible_len = self.pos + 1
+            k_all = key[0, :, :visible_len]
+            v_all = value[0, :, :visible_len]
         cache_key = (int(layer_idx), self.prompt_len, self.block_size)
         prompt_prefix = self.prompt_prefix_cache.get(cache_key)
         if prompt_prefix is None:
@@ -1199,6 +1354,7 @@ class ConditionBlockDecodeRunner:
             prompt_prefix=prompt_prefix,
             k_suffix=k_all[:, self.prompt_len :],
             v_suffix=v_all[:, self.prompt_len :],
+            suffix_len_dev=self.suffix_len_dev,
             block_size=self.block_size,
             eps=self.eps,
             prompt_len=self.prompt_len,
@@ -1211,6 +1367,22 @@ class ConditionBlockDecodeRunner:
             self.stats_by_layer[int(layer_idx)] = stats
             _merge_stats_lazy(self.aggregate_stats, stats)
         return output.to(query.dtype), None
+
+
+@contextlib.contextmanager
+def _no_causal_mask_context():
+    """Skip HF causal-mask construction for the graphed decode step.
+
+    All layers run the sparse path, which ignores the mask, and HF's
+    ``eager_mask`` builds it with ``torch.tensor(scalar, device=...)`` — a
+    host-to-device copy that is illegal while a CUDA graph is capturing.
+    """
+    original = modeling_llama.create_causal_mask
+    modeling_llama.create_causal_mask = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        modeling_llama.create_causal_mask = original
 
 
 @contextlib.contextmanager

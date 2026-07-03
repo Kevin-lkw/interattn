@@ -487,6 +487,9 @@ def main():
             torch.cuda.synchronize()
             actual_selected_ratio = float(selected_actual[0, 0, 0].float().mean().item())
             fused_workspace = {}
+            suffix_len_dev = torch.full(
+                (), int(args.suffix_tokens), dtype=torch.int32, device=device
+            )
             row = {
                 "context_tokens": int(context_tokens),
                 "block_size": int(args.block_size),
@@ -502,6 +505,7 @@ def main():
                         prompt_prefix=prefix,
                         k_suffix=k_suffix,
                         v_suffix=v_suffix,
+                        suffix_len_dev=suffix_len_dev,
                         eps=args.eps,
                         page_size=args.block_size,
                         store_selected=False,

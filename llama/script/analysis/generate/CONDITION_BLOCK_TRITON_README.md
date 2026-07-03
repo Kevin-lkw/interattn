@@ -35,7 +35,8 @@
 5. **融合 routing finalize 与 attention**
    - condition 计算完成后立即选择 representative 或 selected page。
    - 不再写回并重新读取 `selected` 和 `z_logits`。
-   - 核心路径由 5 个 Triton kernel 降为 4 个。
+   - 核心路径由 5 个 Triton kernel 降为 4 个（后续 selection-reduce
+     又折叠进 finalize，降为 3 个，见第 10 条）。
    - `n_blocks/n_chunks/suffix_len` 禁止自动 specialization，避免不同输入长度反复编译。
 
 6. **持久 runner 与 workspace 复用**
@@ -59,6 +60,21 @@
    - stats 计数保留为 GPU scalar tensor，在 decode step 内不再 `.item()` 同步。
    - 每条样本生成结束后才统一 materialize 到 Python/JSON。
    - `run_condition_block_triton_eps.sh` 默认 `COLLECT_STATS=1`；只有显式 `COLLECT_STATS=0` 时才设置 `CONDITION_BLOCK_SKIP_STATS=1`。
+
+10. **Kernel 带宽效率（4 kernel → 3 + launch 配置）**
+    - selection-reduce 折叠进 finalize（partial 在 L2，program 内归约，
+      逐位一致），生产路径每层 3 个 kernel：stats → finalize → stage2。
+    - selected page 与 chunk 宽度解耦，32-token page 一次 `tl.dot`
+      消费；page 循环用 cumsum 只访问选中 page。
+    - launch 配置可调（`CONDITION_BLOCK_SELECT_CHUNK/SELECT_WARPS/`
+      `FINALIZE_CHUNK/FINALIZE_WARPS`），默认按 cold-L2 sweep 结果：
+      finalize BLOCK_N=32/4 warps；stats 的 warp 数按 n_blocks 自适应
+      （≤1024 用 8，否则 2——最优值随 context 反转）。
+    - 可选 `CONDITION_BLOCK_SUMMARY_DTYPE=bfloat16` 把 summary 读量
+      减半（默认 FP32）。
+    - CUDA graph decode-only vs full：1.47x/2.01x/2.86x（32K/64K/128K），
+      纯 attention 相 1.54x/3.59x/4.62x；细节见
+      `methods/condition_block_triton_impl/README.md`。
 
 ## Sanity Check
 

@@ -19,6 +19,22 @@ from .legacy import (
 )
 from .page_attention import _condition_block_finalize_attention_kernel
 
+# Launch configuration for the decode kernels. The defaults were picked by a
+# cold-L2 sweep on RTX PRO 6000 Blackwell (see README); the env overrides exist
+# so the sweep can be re-run on other hardware without editing code.
+_SELECT_CHUNK = int(os.environ.get("CONDITION_BLOCK_SELECT_CHUNK", "16"))
+_SELECT_WARPS = os.environ.get("CONDITION_BLOCK_SELECT_WARPS")
+_FINALIZE_CHUNK = int(os.environ.get("CONDITION_BLOCK_FINALIZE_CHUNK", "32"))
+_FINALIZE_WARPS = int(os.environ.get("CONDITION_BLOCK_FINALIZE_WARPS", "4"))
+
+
+def _select_warps(n_blocks):
+    # The sweep found the optimum inverts with context: many warps win while
+    # the summary read set is small, few warps win once it is HBM-bound.
+    if _SELECT_WARPS:
+        return int(_SELECT_WARPS)
+    return 8 if n_blocks <= 1024 else 2
+
 
 def run_prefill_only_condition_block(**_kwargs):
     raise RuntimeError(
@@ -407,15 +423,21 @@ def _build_prompt_blocks(k_all, v_all, block_size):
     v_norm = torch.linalg.vector_norm(v_block_attn, dim=-1, dtype=torch.float32)
     v_norm = v_norm.masked_fill(~valid_token.view(1, n_blocks, block_size), float("-inf"))
 
+    # BF16 summaries halve the per-step summary read (the dominant attention
+    # read at long context) at the cost of slightly perturbing borderline
+    # selection decisions; FP32 stays the default.
+    summary_dtype = getattr(
+        torch, os.environ.get("CONDITION_BLOCK_SUMMARY_DTYPE", "float32")
+    )
     return {
         "k_block_attn": k_block_attn,
         "v_block_attn": v_block_attn,
         "token_idx": token_idx,
         "valid_token": valid_token,
-        "k_bar": k_sum / size_float.view(1, n_blocks, 1),
-        "v_bar": v_sum / size_float.view(1, n_blocks, 1),
-        "k_max": k_for_max.amax(dim=2).float(),
-        "k_min": k_for_min.amin(dim=2).float(),
+        "k_bar": (k_sum / size_float.view(1, n_blocks, 1)).to(summary_dtype),
+        "v_bar": (v_sum / size_float.view(1, n_blocks, 1)).to(summary_dtype),
+        "k_max": k_for_max.amax(dim=2).float().to(summary_dtype),
+        "k_min": k_for_min.amin(dim=2).float().to(summary_dtype),
         "v_norm_max": v_norm.amax(dim=2),
         "v_norm_all": v_norm.amax(dim=2).amax(dim=-1),
         "block_valid_counts": size,
@@ -449,15 +471,18 @@ def _select_prompt_blocks_eager(q_grouped, prefix, eps):
     cluster_exists_view = cluster_exists.view(1, 1, 1, -1)
     size_float = size.clamp_min(1).float()
 
-    s_c = torch.einsum("gsqd,gbd->gsqb", q_grouped, prefix["k_bar"]) / scale
+    k_bar = prefix["k_bar"].to(q_grouped.dtype)
+    k_max = prefix["k_max"].to(q_grouped.dtype)
+    k_min = prefix["k_min"].to(q_grouped.dtype)
+    s_c = torch.einsum("gsqd,gbd->gsqb", q_grouped, k_bar) / scale
     q_bounds = q_grouped[:, :, :, None, :]
     upper = torch.maximum(
-        q_bounds * prefix["k_max"][:, None, None],
-        q_bounds * prefix["k_min"][:, None, None],
+        q_bounds * k_max[:, None, None],
+        q_bounds * k_min[:, None, None],
     ).sum(dim=-1) / scale
     lower = torch.minimum(
-        q_bounds * prefix["k_max"][:, None, None],
-        q_bounds * prefix["k_min"][:, None, None],
+        q_bounds * k_max[:, None, None],
+        q_bounds * k_min[:, None, None],
     ).sum(dim=-1) / scale
     delta = torch.maximum((upper - s_c).abs(), (lower - s_c).abs())
     delta = delta.masked_fill(~cluster_exists_view, 0.0)
@@ -686,14 +711,16 @@ def _workspace_empty(workspace, key, shape, *, device, dtype):
     return tensor
 
 
-def _run_condition_block_selection_stats(q_grouped, prefix, workspace=None):
+def _run_condition_block_selection_stats(
+    q_grouped, prefix, workspace=None, reduce_globals=True
+):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     if n_query != 1:
         raise ValueError("Triton selection stats expects q_len=1.")
     n_blocks = int(prefix["block_valid_counts"].numel())
     rows = int(n_kv_heads * group_size)
     q = q_grouped.reshape(rows, head_dim).contiguous()
-    selection_chunk = 16
+    selection_chunk = _SELECT_CHUNK
     n_chunks = triton.cdiv(n_blocks, selection_chunk)
     s_cache = _workspace_empty(
         workspace,
@@ -736,40 +763,42 @@ def _run_condition_block_selection_stats(q_grouped, prefix, workspace=None):
         BLOCK_G=triton.next_power_of_2(group_size),
         BLOCK_B=selection_chunk,
         BLOCK_D=triton.next_power_of_2(head_dim),
-        num_warps=4,
+        num_warps=_select_warps(n_blocks),
     )
-    global_stats = _workspace_empty(
-        workspace,
-        "selection_global",
-        (4, rows),
-        device=q.device,
-        dtype=torch.float32,
-    )
-    _condition_block_selection_reduce_kernel[(rows,)](
-        partial[0],
-        partial[1],
-        partial[2],
-        partial[3],
-        global_stats[0],
-        global_stats[1],
-        global_stats[2],
-        global_stats[3],
-        n_chunks,
-        BLOCK_C=triton.next_power_of_2(n_chunks),
-        num_warps=4,
-    )
-    return q, s_cache, delta_cache, global_stats, n_blocks, n_chunks
+    global_stats = None
+    if reduce_globals:
+        global_stats = _workspace_empty(
+            workspace,
+            "selection_global",
+            (4, rows),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        _condition_block_selection_reduce_kernel[(rows,)](
+            partial[0],
+            partial[1],
+            partial[2],
+            partial[3],
+            global_stats[0],
+            global_stats[1],
+            global_stats[2],
+            global_stats[3],
+            n_chunks,
+            BLOCK_C=triton.next_power_of_2(n_chunks),
+            num_warps=4,
+        )
+    return q, s_cache, delta_cache, partial, global_stats, n_blocks, n_chunks
 
 
 def _select_prompt_blocks_triton(q_grouped, prefix, eps):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     if n_query != 1:
         return _select_prompt_blocks_eager(q_grouped, prefix, eps)
-    q, s_cache, delta_cache, global_stats, n_blocks, n_chunks = (
+    q, s_cache, delta_cache, _partial, global_stats, n_blocks, n_chunks = (
         _run_condition_block_selection_stats(q_grouped, prefix)
     )
     rows = int(n_kv_heads * group_size)
-    selection_chunk = 16
+    selection_chunk = _SELECT_CHUNK
     selected = torch.empty((rows, n_blocks), device=q.device, dtype=torch.bool)
     z_logits = torch.empty((rows, n_blocks), device=q.device, dtype=torch.float32)
     _condition_block_selection_finalize_kernel[(n_kv_heads, n_chunks)](
@@ -1076,10 +1105,13 @@ def _condition_block_decode_output_fused_triton(
     workspace=None,
 ):
     n_kv_heads, group_size, _n_query, head_dim = q_grouped.shape
-    q, s_cache, delta_cache, global_stats, n_blocks, n_chunks = (
-        _run_condition_block_selection_stats(q_grouped, prompt_prefix, workspace)
+    q, s_cache, delta_cache, sel_partial, _global_stats, n_blocks, n_sel_chunks = (
+        _run_condition_block_selection_stats(
+            q_grouped, prompt_prefix, workspace, reduce_globals=False
+        )
     )
     rows = int(n_kv_heads * group_size)
+    n_chunks = triton.cdiv(n_blocks, _FINALIZE_CHUNK)
     partial_acc = _workspace_empty(
         workspace,
         "attention_partial_acc",
@@ -1120,10 +1152,10 @@ def _condition_block_decode_output_fused_triton(
         prompt_prefix["v_norm_max"].contiguous(),
         prompt_prefix["v_norm_all"].contiguous(),
         prompt_prefix["block_valid_counts"].contiguous(),
-        global_stats[0],
-        global_stats[1],
-        global_stats[2],
-        global_stats[3],
+        sel_partial[0],
+        sel_partial[1],
+        sel_partial[2],
+        sel_partial[3],
         k_suffix,
         v_suffix,
         selected_rows,
@@ -1131,6 +1163,7 @@ def _condition_block_decode_output_fused_triton(
         partial_m,
         partial_l,
         n_blocks,
+        n_sel_chunks,
         suffix_len_dev,
         k_block.stride(0),
         v_block.stride(0),
@@ -1144,11 +1177,12 @@ def _condition_block_decode_output_fused_triton(
         float(eps),
         head_dim**-0.5,
         BLOCK_M=16,
-        BLOCK_N=16,
+        BLOCK_N=_FINALIZE_CHUNK,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_SC=triton.next_power_of_2(n_sel_chunks),
         PAGE_SIZE=int(page_size),
         STORE_SELECTED=bool(store_selected),
-        num_warps=4,
+        num_warps=_FINALIZE_WARPS,
     )
     out = _workspace_empty(
         workspace,

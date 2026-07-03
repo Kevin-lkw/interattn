@@ -558,3 +558,63 @@ GPU busy 占比从 eager 的 85-88% 提高到约 94%，且 graph 模式的 busy 
 略低于 eager（decode 期间不再构建 causal mask）。剩余 wall-busy 差主要是
 均摊的一次性 capture/KV 搬移。到此 decode 的主导项只剩 model GEMV
 （~10.8 ms/step，权重带宽约 83% 峰值），attention 侧优化空间基本吃完。
+## Kernel 带宽效率优化（4 kernel → 3 + launch 配置调优）
+
+CUDA graph 之后 profiling 显示 attention 侧 kernel 只跑到峰值带宽的
+9-17%（full attention 的 flash kernel 是 66-92%）：读的数据太少
+（每步 190-580 MB），落入 latency/occupancy-bound 区间，launch 配置
+（BLOCK=16、4 warps）也偏保守。按 read-volume 理论上限
+1/(s + 2/32) ≈ 13-15x 的 attention 加速，实际只兑现 1.3-3.5x，
+差距全在带宽效率上。本节改动：
+
+1. **selection-reduce kernel 折叠进 finalize**：normalizer 的
+   per-chunk partial（4 × rows × n_chunks，~KB 级，L2 常驻）由每个
+   finalize program 在寄存器里自行归约，省掉每层一次 1.2-1.4us 的
+   纯 launch 开销 kernel。归约顺序与原 reduce kernel 逐位一致。
+   生产路径 kernel 数 4 → 3（stats → finalize → stage2）。
+2. **selected page 单 tile 化**：32-token page 原来按两个 16-token
+   MMA tile 串行消费（受 BLOCK_N=16 耦合），现在 page tile 与 chunk
+   宽度解耦，一个 page 一次 `tl.dot`；page 循环也从"每个 local block
+   一个分支"改成 cumsum 提取，只访问真正选中的 page。
+3. **launch 配置可调 + 按硬件 sweep**：`CONDITION_BLOCK_SELECT_CHUNK`
+   / `SELECT_WARPS` / `FINALIZE_CHUNK` / `FINALIZE_WARPS`。cold-L2
+   microbench（8 组输入轮换，模拟每层 GEMV 冲掉 L2）sweep 结论：
+   - stats kernel 最优 warp 数随 context 反转：32K（n_blocks≤1024）
+     8 warps 最快，64K/128K 2 warps 快约 1.5x → 默认按 n_blocks 自适应。
+   - finalize 最优 BLOCK_N=32、4 warps（n_chunks 减半，stage2 partial
+     读写也减半）。
+   - 32K 整条路径贴着 ~55us/层 的 latency floor，配置几乎不影响；
+     64K/128K cold-L2 全路径分别提速 1.21x / 1.35x。
+4. **BF16 block summaries（可选 flag）**：
+   `CONDITION_BLOCK_SUMMARY_DTYPE=bfloat16` 把 k_bar/k_max/k_min/v_bar
+   存成 BF16，summary 读量减半。之前微基准测不出收益是因为 kernel 还在
+   latency-bound 区；配置调优后 128K stats 再 -19%。默认仍为 FP32
+   （selection 边界 block 可能翻转，LongBench 质量是在 FP32 下验证的）。
+
+Sanity check（全部通过）：
+
+- 合成数据（异质 block、混合选中率、pad/非 pad、suffix 1/33/128）：
+  selection mask 与 eager 参考完全一致；输出 vs legacy stage2 参考
+  max diff ~2e-4（BF16 量级）。
+- 非连续 cache view vs contiguous copy：输出逐位一致。
+- 真实模型 + CUDA graph：新 kernel（含新默认配置）与旧 kernel 生成
+  token 完全一致（32K/64K，LongBench-v2）。
+
+Decode-only 结果（128 fixed tokens，CUDA graph，eps=0.1，block 32）：
+
+| context | attention us/step 旧→新 | ms/step 旧→新 | vs full e2e | vs full attention 相 |
+|---:|---:|---:|---:|---:|
+| 32K  | 1978 → 1691 | 15.43 → 15.12 | 1.44x → **1.47x** | 1.32x → **1.54x** |
+| 64K  | 2586 → 2016 | 16.41 → 15.76 | 1.93x → **2.01x** | 2.80x → **3.59x** |
+| 128K | 3781 → 2897 | 18.31 → 17.34 | 2.71x → **2.86x** | 3.54x → **4.62x** |
+
+再加 `CONDITION_BLOCK_SUMMARY_DTYPE=bfloat16`：attention 降到
+1553/1736/2472 us/step（vs full attention 相 1.68x/4.17x/5.41x），
+e2e 14.95/15.51/17.03 ms/step（1.49x/2.05x/2.91x）。
+
+per-kernel（us/step，旧 → 新 FP32）：stats 2175→1492（128K，效率
+41%→60% 峰值带宽）、finalize 1069→867（32K）、selection-reduce
+39-43→0、stage2 150→85（128K）。32K 的 stats（770us）仍在 latency
+floor 附近，是剩余 attention 开销里最大的一块；进一步压缩需要减少
+summary 读量本身（如 k_max/k_min 换成标量 radius，把 selection 读量
+从 4 vector/block 降到 2，read-bound 上限从 ~14x 提到 ~26x）。

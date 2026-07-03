@@ -6,6 +6,7 @@ import triton.language as tl
 @triton.jit(
     do_not_specialize=[
         "n_blocks",
+        "n_sel_chunks",
         "n_chunks",
         "k_block_head_stride",
         "v_block_head_stride",
@@ -16,6 +17,7 @@ import triton.language as tl
     ],
     do_not_specialize_on_alignment=[
         "n_blocks",
+        "n_sel_chunks",
         "n_chunks",
         "k_block_head_stride",
         "v_block_head_stride",
@@ -35,10 +37,10 @@ def _condition_block_finalize_attention_kernel(
     v_norm_ptr,
     v_norm_all_ptr,
     counts_ptr,
-    z_m_ptr,
-    z_l_ptr,
-    c_m_ptr,
-    c_l_ptr,
+    z_m_part_ptr,
+    z_l_part_ptr,
+    c_m_part_ptr,
+    c_l_part_ptr,
     k_suffix_ptr,
     v_suffix_ptr,
     selected_out_ptr,
@@ -46,6 +48,7 @@ def _condition_block_finalize_attention_kernel(
     partial_m_ptr,
     partial_l_ptr,
     n_blocks,
+    n_sel_chunks,
     suffix_len_ptr,
     k_block_head_stride,
     v_block_head_stride,
@@ -61,6 +64,7 @@ def _condition_block_finalize_attention_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_SC: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     STORE_SELECTED: tl.constexpr,
 ):
@@ -70,6 +74,7 @@ def _condition_block_finalize_attention_kernel(
     m_off = tl.arange(0, BLOCK_M)
     n_off = tl.arange(0, BLOCK_N)
     d_off = tl.arange(0, BLOCK_D)
+    p_off = tl.arange(0, PAGE_SIZE)
     m_mask = m_off < group_size
     block_idx = chunk * BLOCK_N + n_off
     block_mask = block_idx < n_blocks
@@ -96,10 +101,27 @@ def _condition_block_finalize_attention_kernel(
         other=0.0,
     ).to(tl.float32)
     z = s + tl.log(tl.maximum(count, 1).to(tl.float32))[None, :]
-    z_m = tl.load(z_m_ptr + row, mask=m_mask, other=0.0)
-    z_l = tl.load(z_l_ptr + row, mask=m_mask, other=1.0)
-    c_m = tl.load(c_m_ptr + row, mask=m_mask, other=0.0)
-    c_l = tl.load(c_l_ptr + row, mask=m_mask, other=1.0)
+
+    # The per-chunk normalizer partials produced by the selection-stats kernel
+    # are reduced inline (they stay resident in L2), which removes a dedicated
+    # reduce kernel from every layer of every decode step.
+    sc_off = tl.arange(0, BLOCK_SC)
+    sc_mask = sc_off < n_sel_chunks
+    part_off = row[:, None] * n_sel_chunks + sc_off[None, :]
+    part_mask = m_mask[:, None] & sc_mask[None, :]
+    z_m_part = tl.load(z_m_part_ptr + part_off, mask=part_mask, other=-float("inf"))
+    z_l_part = tl.load(z_l_part_ptr + part_off, mask=part_mask, other=0.0)
+    c_m_part = tl.load(c_m_part_ptr + part_off, mask=part_mask, other=-float("inf"))
+    c_l_part = tl.load(c_l_part_ptr + part_off, mask=part_mask, other=0.0)
+    z_m = tl.max(z_m_part, axis=1)
+    c_m = tl.max(c_m_part, axis=1)
+    z_l = tl.sum(z_l_part * tl.exp(z_m_part - z_m[:, None]), axis=1)
+    c_l = tl.sum(c_l_part * tl.exp(c_m_part - c_m[:, None]), axis=1)
+    z_m = tl.where(m_mask, z_m, 0.0)
+    z_l = tl.where(m_mask, z_l, 1.0)
+    c_m = tl.where(m_mask, c_m, 0.0)
+    c_l = tl.where(m_mask, c_l, 1.0)
+
     cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
     tanh_half = 2.0 / (1.0 + tl.exp(-delta)) - 1.0
     b_c = tl.load(
@@ -164,54 +186,56 @@ def _condition_block_finalize_attention_kernel(
     softmax_l = softmax_l * alpha + tl.sum(beta, axis=1)
     softmax_m = new_m
 
-    # Selected pages are loaded only after routing. PAGE_SIZE is independent
-    # from the 16-token MMA tile, so a 32-token page is consumed as two tiles.
-    for local_block in tl.static_range(0, BLOCK_N):
-        page_selected = tl.sum(
-            (selected & (n_off == local_block)).to(tl.int32), axis=0
-        ) > 0
-        if page_selected:
-            page = chunk * BLOCK_N + local_block
-            page_count = tl.load(counts_ptr + page)
-            for page_start in tl.static_range(0, PAGE_SIZE, BLOCK_N):
-                token_idx = page_start + n_off
-                token_active = token_idx < page_count
-                # Token pages are read through the cache view with an explicit
-                # per-head stride, so the caller never has to materialize a
-                # contiguous copy of the blocked prompt K/V.
-                token_off = (
-                    (page * PAGE_SIZE + token_idx[:, None]) * head_dim
-                    + d_off[None, :]
-                )
-                k = tl.load(
-                    k_block_ptr + kv_head * k_block_head_stride + token_off,
-                    mask=token_active[:, None] & d_mask[None, :],
-                    other=0.0,
-                ).to(tl.bfloat16)
-                scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
-                scores = tl.where(
-                    m_mask[:, None] & token_active[None, :],
-                    scores,
-                    -float("inf"),
-                )
-                tile_m = tl.max(scores, axis=1)
-                new_m = tl.where(m_mask, tl.maximum(softmax_m, tile_m), softmax_m)
-                alpha = tl.where(m_mask, tl.exp(softmax_m - new_m), 1.0)
-                beta = tl.where(
-                    m_mask[:, None] & token_active[None, :],
-                    tl.exp(scores - new_m[:, None]),
-                    0.0,
-                )
-                v = tl.load(
-                    v_block_ptr + kv_head * v_block_head_stride + token_off,
-                    mask=token_active[:, None] & d_mask[None, :],
-                    other=0.0,
-                ).to(tl.bfloat16)
-                acc = acc * alpha[:, None] + tl.dot(
-                    beta.to(tl.bfloat16), v, out_dtype=tl.float32
-                )
-                softmax_l = softmax_l * alpha + tl.sum(beta, axis=1)
-                softmax_m = new_m
+    # Selected pages are loaded only after routing. The loop visits exactly the
+    # selected pages of this chunk (extracted via a running cumsum) and each
+    # page is consumed as a single PAGE_SIZE-token MMA tile, independent of the
+    # chunk width BLOCK_N.
+    sel_cum = tl.cumsum(selected.to(tl.int32), axis=0)
+    n_sel = tl.sum(selected.to(tl.int32), axis=0)
+    sel_j = 0
+    while sel_j < n_sel:
+        page_local = tl.sum(
+            tl.where((sel_cum == sel_j + 1) & selected, n_off, 0), axis=0
+        )
+        page = chunk * BLOCK_N + page_local
+        page_count = tl.load(counts_ptr + page)
+        token_active = p_off < page_count
+        # Token pages are read through the cache view with an explicit
+        # per-head stride, so the caller never has to materialize a
+        # contiguous copy of the blocked prompt K/V.
+        token_off = (
+            (page * PAGE_SIZE + p_off[:, None]) * head_dim + d_off[None, :]
+        )
+        page_k = tl.load(
+            k_block_ptr + kv_head * k_block_head_stride + token_off,
+            mask=token_active[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+        page_scores = tl.dot(q, tl.trans(page_k), out_dtype=tl.float32) * scale
+        page_scores = tl.where(
+            m_mask[:, None] & token_active[None, :],
+            page_scores,
+            -float("inf"),
+        )
+        page_m = tl.max(page_scores, axis=1)
+        page_new_m = tl.where(m_mask, tl.maximum(softmax_m, page_m), softmax_m)
+        page_alpha = tl.where(m_mask, tl.exp(softmax_m - page_new_m), 1.0)
+        page_beta = tl.where(
+            m_mask[:, None] & token_active[None, :],
+            tl.exp(page_scores - page_new_m[:, None]),
+            0.0,
+        )
+        page_v = tl.load(
+            v_block_ptr + kv_head * v_block_head_stride + token_off,
+            mask=token_active[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+        acc = acc * page_alpha[:, None] + tl.dot(
+            page_beta.to(tl.bfloat16), page_v, out_dtype=tl.float32
+        )
+        softmax_l = softmax_l * page_alpha + tl.sum(page_beta, axis=1)
+        softmax_m = page_new_m
+        sel_j += 1
     if chunk == n_chunks - 1:
         # The suffix length lives in device memory so a CUDA-graphed decode
         # step can advance it without re-recording the kernel launch.
@@ -258,7 +282,6 @@ def _condition_block_finalize_attention_kernel(
             softmax_l = softmax_l * alpha + tl.sum(beta, axis=1)
             softmax_m = new_m
             suffix_start += BLOCK_N
-
     partial_off = row * n_chunks + chunk
     tl.store(partial_m_ptr + partial_off, softmax_m, mask=m_mask)
     tl.store(partial_l_ptr + partial_off, softmax_l, mask=m_mask)

@@ -1,123 +1,291 @@
-% Tighter condition via within-cluster score variance (Bennett bound).
-% Follows the notation of the Approximation section:
-%   s_i = q k_i / \sqrt{d_k},  s_C = q \bar k / \sqrt{d_k},
-%   Z_C = \sum_{i\in C} e^{s_i},  \hat Z_C = |C| e^{s_C},
-%   u_C = \sum_{i\in C} e^{s_i} v_i / Z_C,
-%   p_C = Z_C / \sum_{C'} Z_{C'},  \hat p_C = \hat Z_C / \sum_{C'} \hat Z_{C'},
-%   b_C = \log(\sum_{i\in C} e^{s_i - s_C} / |C|) \ge 0,
-%   A = \sum_{C'} \hat p_{C'} e^{b_{C'}} \ge 1,
-%   \|v_i\| \le B,  B_C = \max_{i \in C}\|v_i\|,  \max_{i\in C}|q(k_i-\bar k)/\sqrt{d_k}| \le \delta_C.
+% Full derivation of the condition for cluster-approximated attention.
+% Self-contained section: objective, notation, average approximation, the
+% cosh condition (original, with corrected proofs), the variance (Bennett)
+% refinement, the per-cluster guarantee, and the hybrid per-step certificate.
+% Requires: tcolorbox, amsmath.
 
-\section{Tighter condition via within-cluster variance}
+\section{Approximation}
 
-\paragraph{Additional statistic}
-For each cluster $C$ define the within-cluster score variance
+\paragraph{Goal}
+Suppose we split the KVs into clusters with close keys. Under what condition can we
+faithfully approximate full attention? We need conditions that can be efficiently
+verified, and we need to bound the approximation error.
+
+\begin{tcolorbox}[colback=white, colframe=black, arc=0mm, boxrule=0.5pt]
+For a query $q$ and a KV set clustered as $\mathcal C = \{C_1,\dots,C_m\}$: for all
+$\epsilon > 0$, using an approximation method $\mathbf{A}$ [efficient], under a condition
+$\mathbf{Cond}$ [depending on $q$ and $\epsilon$, efficiently verifiable], the vanilla
+output $o$ and the approximated output $\hat o$ satisfy $\|\hat o - o\|_2 < \epsilon$.
+\end{tcolorbox}
+
+Different approximation methods $\mathbf{A}$ lead to different conditions $\mathbf{Cond}$.
+We use the \emph{average approximation}: each cluster is represented by its mean key and
+mean value $(\bar k_C, \bar v_C)$.
+
+\subsection{Notation and setup}
+
+The visible tokens are partitioned into clusters $C_1, \dots, C_m$. For a cluster $C$
+let $\bar k_C = \frac{1}{|C|}\sum_{i \in C} k_i$ and
+$\bar v_C = \frac{1}{|C|}\sum_{i \in C} v_i$ denote the \emph{arithmetic} means (we drop
+the subscript on $\bar k, \bar v$ when the cluster is clear). Define
 \[
-\sigma_C^2 = \frac{1}{|C|}\sum_{i\in C}(s_i - s_C)^2 .
+s_i = \frac{q k_i}{\sqrt{d_k}}, \qquad
+s_C = \frac{q \bar k}{\sqrt{d_k}}, \qquad
+Z_C = \sum_{i\in C} e^{s_i}, \qquad
+\hat Z_C = |C|\, e^{s_C}, \qquad
+u_C = \frac{\sum_{i\in C} e^{s_i} v_i}{Z_C},
 \]
-Because $\bar k$ is the arithmetic mean of the cluster keys, $\sum_{i\in C}(s_i - s_C) = 0$, so
-$\sigma_C^2$ is a genuine variance, and with the within-cluster key covariance
-$\Sigma_C = \frac{1}{|C|}\sum_{i\in C}(k_i-\bar k)(k_i-\bar k)^\top$,
 \[
-\sigma_C^2 = \frac{q\,\Sigma_C\, q^\top}{d_k}, \qquad \sigma_C \le \delta_C .
+p_C = \frac{Z_C}{\sum_{C'} Z_{C'}}, \qquad
+\hat p_C = \frac{\hat Z_C}{\sum_{C'} \hat Z_{C'}} .
+\]
+Vanilla attention output and its average approximation:
+\[
+o = \sum_C p_C\, u_C, \qquad\qquad \hat o = \sum_C \hat p_C\, \bar v_C .
 \]
 
-\paragraph{Lemma (variance-constrained bound on the Jensen gap)}
-Let $x_i = s_i - s_C$, so that $\frac{1}{|C|}\sum_i x_i = 0$, $\frac{1}{|C|}\sum_i x_i^2 = \sigma_C^2$,
-and $x_i \le \delta_C$. Then
+Per-cluster statistics (each is a prompt-side summary plus $O(d_k)$ query-time work):
+\begin{align*}
+B    &\ \ge\ \max_i \|v_i\|_2 \quad \text{(over all visible tokens)}, \\
+B_C  &\ \ge\ \max_{i\in C} \|v_i\|_2, \\
+\delta_C &\ \ge\ \max_{i\in C} \Big|\frac{q(k_i - \bar k)}{\sqrt{d_k}}\Big|, \\
+\sigma_C^2 &\ \ge\ \frac{1}{|C|}\sum_{i\in C}(s_i - s_C)^2
+      \;=\; \frac{q\, \Sigma_C\, q^\top}{d_k},
+      \qquad \Sigma_C = \frac{1}{|C|}\sum_{i\in C}(k_i-\bar k)(k_i-\bar k)^\top .
+\end{align*}
+
+\emph{Remark (mean-zero property).} Because $\bar k$ is the arithmetic mean of the
+cluster keys, $\sum_{i \in C}(s_i - s_C) = 0$ exactly. The whole mass-term analysis
+below relies on this; replacing $\bar k$ by a medoid or a normalized centroid breaks
+it. It also gives $\sigma_C \le \delta_C$ when both are computed exactly.
+
+\subsection{Error decomposition}
+
+Define the Jensen gap of cluster $C$ and the global inflation factor
 \[
-e^{b_C} \;=\; \frac{1}{|C|}\sum_{i\in C} e^{x_i}
+b_C = \log \frac{Z_C}{\hat Z_C}
+    = \log\Big(\frac{1}{|C|}\sum_{i\in C} e^{s_i - s_C}\Big) \ \ge\ 0,
+\qquad
+A = \sum_{C'} \hat p_{C'}\, e^{b_{C'}} \ \ge\ 1,
+\]
+where $b_C \ge 0$ follows from Jensen's inequality and the mean-zero property
+(equality iff the scores in $C$ are constant). By construction
+$p_C = \hat p_C\, e^{b_C} / A$.
+
+From $\hat o - o = \sum_C (\hat p_C - p_C)\, u_C + \sum_C \hat p_C (\bar v_C - u_C)$
+and $\|u_C\|_2 \le B$ ($u_C$ is a convex combination of the $v_i$):
+\[
+\|\hat o - o\|_2
+\ \le\
+\underbrace{B \sum_C |p_C - \hat p_C|}_{\text{mass term}}
+\; + \;
+\underbrace{\sum_C \hat p_C\, \|\bar v_C - u_C\|_2}_{\text{value term}} .
+\]
+The two terms are the two ways a cluster summary can fail: $\hat Z_C$ mis-estimates the
+cluster's softmax mass (spread of scores), and $\bar v_C$ ignores that attention inside
+the cluster is softmax-weighted rather than uniform (key--value correlation).
+
+\subsection{Mass term}
+
+\paragraph{Step 1: cancellation across clusters}
+Treating $e^{b_C}$ as a random variable with law $\hat p$ (so that its mean is $A$),
+and using $\mathbb E|X - \mathbb E X| = 2\,\mathbb E (X - \mathbb E X)_+$,
+\begin{align*}
+\sum_C |p_C - \hat p_C|
+  &= \sum_C \hat p_C \Big| \frac{e^{b_C}}{A} - 1 \Big|
+   = \frac{1}{A} \sum_C \hat p_C \big| e^{b_C} - A \big|
+   = \frac{2}{A} \sum_C \hat p_C \big( e^{b_C} - A \big)_+ \\
+  &\le \frac{2}{A} \sum_C \hat p_C \big( e^{b_C} - 1 \big)
+   = \frac{2(A-1)}{A},
+\end{align*}
+where the inequality uses $A \ge 1$ and $e^{b_C} \ge 1$. Since $A \mapsto 2(A-1)/A$ is
+increasing, any upper bound on $e^{b_C}$ yields a bound on the mass term.
+
+\paragraph{Step 2: bounding the Jensen gap}
+
+\begin{tcolorbox}[colback=white, colframe=black, arc=0mm, boxrule=0.5pt]
+\textbf{Lemma 1 (variance-constrained bound; Bennett).}
+Let $x_i = s_i - s_C$, so $\frac{1}{|C|}\sum_i x_i = 0$,
+$\frac{1}{|C|}\sum_i x_i^2 \le \sigma_C^2$, and $x_i \le \delta_C$. Then
+\[
+e^{b_C} \;=\; \frac{1}{|C|}\sum_{i \in C} e^{x_i}
 \;\le\;
 G(\sigma_C, \delta_C)
-:= \frac{\sigma_C^2\, e^{\delta_C} + \delta_C^2\, e^{-\sigma_C^2/\delta_C}}{\sigma_C^2 + \delta_C^2}.
+\;:=\;
+\frac{\sigma_C^2\, e^{\delta_C} + \delta_C^2\, e^{-\sigma_C^2/\delta_C}}
+     {\sigma_C^2 + \delta_C^2} .
 \]
+\end{tcolorbox}
 
-\emph{Proof.} Let $g(t) = (e^t - 1 - t)/t^2$ (with $g(0)=\tfrac12$); $g$ is nondecreasing.
-For any $a$ and any $x \le \delta$,
+\emph{Proof.} Let $g(t) = (e^t - 1 - t)/t^2$ (with $g(0) = \tfrac12$); $g$ is
+nondecreasing. For any $a$ and any $x \le \delta$,
 \[
 e^{x} = e^{a}\big[1 + (x-a) + g(x-a)(x-a)^2\big]
-\le e^{a}\big[1 + (x-a) + g(\delta-a)(x-a)^2\big].
+\ \le\ e^{a}\big[1 + (x-a) + g(\delta-a)(x-a)^2\big].
 \]
-Averaging over $i$ and using $\frac1n\sum x_i = 0$, $\frac1n\sum x_i^2 = \sigma^2$:
+Averaging over $i \in C$ and using the zero mean and the second-moment bound,
 \[
-\frac{1}{n}\sum_i e^{x_i} \le e^{a}\big[1 - a + g(\delta-a)(\sigma^2 + a^2)\big].
+\frac{1}{|C|}\sum_i e^{x_i}
+\ \le\ e^{a}\big[1 - a + g(\delta-a)\,(\sigma^2 + a^2)\big].
 \]
 Choosing $a = -\sigma^2/\delta$ (so $\delta - a = (\delta^2+\sigma^2)/\delta$ and
 $\sigma^2 + a^2 = \sigma^2(\delta^2+\sigma^2)/\delta^2$) and simplifying gives exactly
-$G(\sigma,\delta)$. $\square$
+$G(\sigma,\delta)$. $\hfill\square$
 
 Remarks:
-(i) $G(\delta,\delta) = \cosh\delta$ and $G(0,\delta) = 1$: the lemma strictly generalizes the
-chord bound $e^{b_C} \le \cosh\delta_C$, which is recovered when no variance information is used.
-The bound is tight: equality holds for scores supported on $\{-\sigma^2/\delta,\ \delta\}$.
-(ii) Only the \emph{one-sided} bound $x_i \le \delta_C$ is used.
-(iii) The proof goes through verbatim with any over-estimates
-$\hat\sigma_C \ge \sigma_C$, $\hat\delta_C \ge \delta_C$ (choose $a = -\hat\sigma_C^2/\hat\delta_C$),
-so plugging in efficiently verifiable upper bounds is sound; one may always take
-$\min\{\cosh\delta_C,\ G(\hat\sigma_C,\hat\delta_C)\}$ so the new condition is never worse than the old one.
-(iv) An efficiently verifiable variance bound: store $D_C = \mathrm{diag}(\Sigma_C)$ (one vector)
-and $\lambda_C = \|\Sigma_C - \mathrm{diag}(\Sigma_C)\|_2$ (one scalar, precomputed offline); then
+\begin{itemize}
+\item[(i)] \emph{The chord bound is the special case with no variance information:}
+  $G(\delta, \delta) = \cosh\delta$, recovering
+  $e^{b_C} \le \tfrac12(e^{-\delta_C} + e^{\delta_C}) = \cosh\delta_C$, which follows
+  directly from the chord inequality
+  $e^x \le \frac{\delta - x}{2\delta} e^{-\delta} + \frac{\delta + x}{2\delta} e^{\delta}$
+  averaged with mean zero. Also $G(0,\delta) = 1$.
+\item[(ii)] Only the one-sided bound $x_i \le \delta_C$ is used, and the bound is tight
+  (equality for scores supported on $\{-\sigma^2/\delta,\ \delta\}$).
+\item[(iii)] The proof holds verbatim with any over-estimates
+  $\hat\sigma_C \ge \sigma_C$, $\hat\delta_C \ge \delta_C$ (choose
+  $a = -\hat\sigma_C^2/\hat\delta_C$), so efficiently verifiable upper bounds may be
+  plugged in; one may always use $\min\{\cosh\delta_C,\ G(\hat\sigma_C,\hat\delta_C)\}$,
+  so the refined condition is never worse than the cosh one.
+\end{itemize}
+
+Writing $F_C$ for either $\cosh\delta_C$ or $G(\sigma_C,\delta_C)$ and
 \[
-\sigma_C^2 \;\le\; \hat\sigma_C^2 := \frac{1}{d_k}\Big(\sum_j q_j^2\, D_{C,j} + \lambda_C \|q\|^2\Big).
+S_F = \sum_C \hat p_C\, F_C \ \ge\ A,
+\qquad\text{we conclude}\qquad
+\sum_C |p_C - \hat p_C| \ \le\ \frac{2\,(S_F - 1)}{S_F}.
 \]
 
-\paragraph{New condition}
-In the original proof $\delta_C$ enters the first term only through $e^{b_C} \le \cosh\delta_C$,
-which gives $A \le S_\delta$. Replacing it with the Lemma gives
+\subsection{Value term}
+
+\begin{tcolorbox}[colback=white, colframe=black, arc=0mm, boxrule=0.5pt]
+\textbf{Lemma 2 (softmax vs.\ uniform).}
+Let $w_i = e^{s_i} / \sum_{j\in C} e^{s_j}$ for $i \in C$ with
+$\max_{i\in C}|s_i - s_C| \le \delta_C$. Then
 \[
-A \;\le\; S_G := \sum_{C} \hat p_{C}\, G(\sigma_C,\delta_C),
-\qquad
-\sum_C |p_C - \hat p_C| \;\le\; \frac{2(S_G - 1)}{S_G},
+\sum_{i\in C} \Big| \frac{1}{|C|} - w_i \Big| \ \le\ 2 \tanh(\delta_C/2).
 \]
-and the rest of the argument is unchanged. The condition becomes
+\end{tcolorbox}
+
+\emph{Proof.} Let $Y_i = e^{s_i - s_C} \in [a, b]$ with $a = e^{-\delta}$,
+$b = e^{\delta}$, and let $T = \frac{1}{|C|}\sum_i Y_i$. The left side equals
+$\frac{1}{|C|}\sum_i |Y_i - T| \,/\, T$. For $y \in [a,b]$ the convex function
+$y \mapsto (y - T)_+$ lies below its chord, $(y-T)_+ \le (b-T)\frac{y-a}{b-a}$, so
+averaging gives $\frac{1}{|C|}\sum_i (Y_i - T)_+ \le \frac{(b-T)(T-a)}{b-a}$, and with
+$\frac{1}{|C|}\sum_i |Y_i - T| = \frac{2}{|C|}\sum_i (Y_i - T)_+$,
+\[
+\sum_{i} \Big| \frac{1}{|C|} - w_i \Big|
+\ \le\ \frac{2\,(b-T)(T-a)}{(b-a)\,T} .
+\]
+The right side is maximized over $T$ at $T = \sqrt{ab} = 1$, where it equals
+$\frac{2(b-1)(1-a)}{b-a} = \frac{2(2\cosh\delta - 2)}{2\sinh\delta} = 2\tanh(\delta/2)$.
+$\hfill\square$
+
+Since $\sum_i \big(\frac{1}{|C|} - w_i\big) = 0$, for any fixed vector $c$,
+\[
+\bar v_C - u_C = \sum_{i\in C} \Big(\frac{1}{|C|} - w_i\Big) v_i
+             = \sum_{i\in C} \Big(\frac{1}{|C|} - w_i\Big) (v_i - c),
+\qquad\text{hence}\qquad
+\|\bar v_C - u_C\|_2 \ \le\ 2 B_C \tanh(\delta_C/2)
+\]
+with $c = 0$ and $B_C = \max_{i\in C}\|v_i\|_2$. (The centered choice
+$c = \bar v_C$, $B_C = \max_i \|v_i - \bar v_C\|_2$, is also valid and never larger.)
+
+\subsection{The condition}
+
+Combining the two terms, for $F_C \in \{\cosh\delta_C,\ G(\sigma_C,\delta_C)\}$:
 
 \begin{tcolorbox}[colback=white, colframe=black, arc=0mm, boxrule=0.5pt]
 \[
 \sum_{C} \hat p_{C}\left(
-\frac{2B\,\big(G(\sigma_C,\delta_C)-1\big)}{S_G}
-+ 2 B_C \tanh(\delta_C/2)\right) < \epsilon
-\;\;\Longrightarrow\;\;
-\|\hat o - o\|_2 < \epsilon .
+\frac{2B\,\big(F_C - 1\big)}{S_F}
++ 2 B_C \tanh(\delta_C/2)\right) \ <\ \epsilon
+\quad\Longrightarrow\quad
+\|\hat o - o\|_2 \ <\ \epsilon,
+\qquad S_F = \sum_{C} \hat p_C F_C .
 \]
 \end{tcolorbox}
 
-Magnitude: empirically $b_C \approx \sigma_C^2/2$ (rank correlation $0.95$), with typical
-$\sigma_C \approx 1$ while range-bound $\delta_C \approx 10\text{--}17$. At those values
-$G(1,10) \approx 219$ vs.\ $\cosh(10) \approx 1.1\times10^{4}$ and
-$G(1,17) \approx 8.3\times10^{4}$ vs.\ $\cosh(17) \approx 1.2\times10^{7}$:
-the first term of the condition tightens by roughly two orders of magnitude.
+With $F_C = \cosh\delta_C$ this is the original condition
+(note $\sum_C \hat p_C\, 2B(\cosh\delta_C - 1)/S_F = 2B(S_F-1)/S_F$ since
+$\sum_C \hat p_C = 1$). With $F_C = G(\sigma_C, \delta_C)$ it is strictly tighter.
 
-\paragraph{Hybrid form (per-step certificate)}
-The decode kernel computes selected clusters exactly \emph{inside the same softmax}:
-for $C$ in the selected set $S$, $\hat Z_C = Z_C$ and the representative value is $u_C$,
-so $b_C = 0$; unselected clusters keep $\hat Z_C = |C|e^{s_C}$ and $\bar v_C$.
-Writing $\hat o_{\mathrm{hyb}}$ for this output and
+\emph{Magnitude.} Empirically $b_C \approx \sigma_C^2/2$ (rank correlation $0.95$),
+with typical $\sigma_C \approx 1$ while the range bound gives
+$\delta_C \approx 10\text{--}17$; there $G \approx 2\times 10^2\text{--}8\times 10^4$
+versus $\cosh\delta_C \approx 10^4\text{--}10^7$, i.e.\ the per-cluster mass factor
+tightens by roughly two orders of magnitude. (Caveat: once $S_F \gg 1$ the
+\emph{normalized} mass term saturates at $2B$ for either $F$; the refinement matters
+for per-cluster scores, selection quality, and the certificate below once the residual
+mass is small.)
+
+\subsection{Per-cluster guarantee}
+
+The summands of the condition are a \emph{diagnostic decomposition}: only their sum
+bounds the error. A genuine per-cluster guarantee follows from bracketing both sides of
+$|p_C - \hat p_C| = \hat p_C\, |e^{b_C} - A| / A$ with $e^{b_C} \in [1, F_C]$ and
+$A \in [1, S_F]$:
 \[
-T = \sum_{C \notin S} \hat p_C\big(G(\sigma_C,\delta_C) - 1\big)
-\qquad (\hat p \text{ from the all-approximate normalizers}),
+\big\| p_C u_C - \hat p_C \bar v_C \big\|_2
+\ \le\
+\hat p_C \left[\, B\, \max\!\Big( F_C - 1,\ \frac{S_F - 1}{S_F} \Big)
++ 2 B_C \tanh(\delta_C/2) \right].
 \]
-the same proof gives, for \emph{any} selected set $S$,
+The second branch of the $\max$ is why the diagnostic share is not a per-cluster bound:
+a cluster with $\delta_C = 0$ still carries probability error because \emph{other}
+clusters inflate $A$. Summing this guarantee loses the cancellation of Step~1 and is
+weaker than the condition by roughly a factor $S_F$; use it per cluster only.
+
+\subsection{Hybrid computation and per-step certificate}
+
+The decode kernel does not approximate every cluster: a selected set $S$ is computed
+exactly \emph{inside the same softmax}, i.e.\ for $C \in S$ the mass is the true $Z_C$
+and the value is $u_C$ (so $b_C = 0$), while $C \notin S$ keep
+$(\hat Z_C, \bar v_C)$. Let $\hat o_{\mathrm{hyb}}$ denote this output and let all
+$\hat p_C$ below be the \emph{all-approximate} weights (available before selection).
+
+\begin{tcolorbox}[colback=white, colframe=black, arc=0mm, boxrule=0.5pt]
+For any selected set $S$, with
+$T = \sum_{C \notin S} \hat p_C\, (F_C - 1)$:
 \[
 \|\hat o_{\mathrm{hyb}} - o\|_2
-\;\le\;
-\frac{2B\,T}{1+T} + \sum_{C\notin S} 2\hat p_C B_C \tanh(\delta_C/2)
-\;\le\;
-\sum_{C \notin S} \hat p_C \Big( 2B\big(G(\sigma_C,\delta_C)-1\big) + 2B_C\tanh(\delta_C/2) \Big).
+\ \le\
+\frac{2B\,T}{1+T} \;+\; \sum_{C\notin S} 2\,\hat p_C B_C \tanh(\delta_C/2)
+\ \le\
+\sum_{C \notin S} \hat p_C \Big( 2B\,(F_C - 1) + 2 B_C \tanh(\delta_C/2) \Big).
 \]
-\emph{Proof sketch.} $e^{b_C}=1$ on $S$, so $A \le 1 + \tilde T$ with
-$\tilde T = \sum_{C\notin S}\hat p^{\mathrm{mix}}_C (G-1)$, where $\hat p^{\mathrm{mix}}$ uses the
-mixed normalizers. Since $Z_C \ge \hat Z_C$ on $S$, the mixed normalizer is larger, hence
-$\hat p^{\mathrm{mix}}_C \le \hat p_C$ for $C \notin S$ and $\tilde T \le T$; $x \mapsto x/(1+x)$
-is increasing. The value term runs only over $C \notin S$. $\square$
+\end{tcolorbox}
 
-The middle expression is a per-decode-step error certificate computable from quantities the
-selection kernel already has; the right-hand side is additive per cluster and requires no
-normalization across clusters.
+\emph{Proof.} Run the same argument with the mixed estimators. For $C \in S$,
+$e^{b_C} = 1$ and the value error vanishes, so
+$A \le 1 + \tilde T$ with $\tilde T = \sum_{C\notin S} \hat p^{\mathrm{mix}}_C (F_C-1)$,
+where $\hat p^{\mathrm{mix}}$ uses the mixed normalizers. Since $Z_C \ge \hat Z_C$ on
+$S$, the mixed normalizer is larger, hence
+$\hat p^{\mathrm{mix}}_C \le \hat p_C$ for $C \notin S$ and $\tilde T \le T$; conclude
+with Step~1 and the monotonicity of $x \mapsto x/(1+x)$. The value term runs only over
+$C \notin S$. $\hfill\square$
 
-\paragraph{Optional refinement of the second term}
-The value term can also use the variance: with $Y_i = e^{x_i}$,
-$\sum_i \big|\tfrac{1}{|C|} - \tfrac{e^{s_i}}{\sum_j e^{s_j}}\big| = \mathbb E|Y-\mathbb E Y|/\mathbb E Y
-\le \sqrt{\mathbb E e^{2x} - 1} \le \sqrt{G(2\sigma_C, 2\delta_C) - 1}$,
-so one may replace $2\tanh(\delta_C/2)$ by
-$\min\{\,2\tanh(\delta_C/2),\ \sqrt{G(2\sigma_C,2\delta_C)-1}\,\}$,
-which helps when both $\sigma_C$ and $\delta_C$ are small (where $\tanh$ has not yet saturated).
+The middle expression is a per-decode-step error certificate computable from
+quantities the selection pass already has; the right-hand side is additive per cluster
+and needs no normalization across clusters.
+
+\paragraph{Efficient verification}
+Per cluster one stores: $\bar k$ (vector) and $\bar v$ (vector, for the approximation
+itself); either the coordinate box $(k_{\max}, k_{\min})$ or the radius
+$r_C = \max_{i}\|k_i - \bar k\|_2$ (scalar) for
+$\delta_C \le \|q\| r_C / \sqrt{d_k}$; the diagonal key variance
+$D_C = \mathrm{diag}(\Sigma_C)$ (vector) and the off-diagonal remainder
+$\lambda_C = \|\Sigma_C - \mathrm{diag}(\Sigma_C)\|_2$ (scalar) for
+\[
+\sigma_C^2 \ \le\ \hat\sigma_C^2
+= \frac{1}{d_k}\Big( \sum_j q_j^2\, D_{C,j} + \lambda_C\, \|q\|_2^2 \Big);
+\]
+and $B_C$ (scalar). All query-time work is $O(d_k)$ per cluster.
+
+\paragraph{Remark (variance form of the value term)}
+With $Y = e^{x}$ as in Lemma 2,
+$\mathbb E|Y - \mathbb E Y| \le \sqrt{\operatorname{Var} Y}$ and
+$\mathbb E e^{2x} \le G(2\sigma_C, 2\delta_C)$ give
+$\sum_i |\tfrac{1}{|C|} - w_i| \le \sqrt{G(2\sigma_C, 2\delta_C) - 1}$, so one may use
+$\min\{\,2\tanh(\delta_C/2),\ \sqrt{G(2\sigma_C, 2\delta_C)-1}\,\}$, which helps when
+$\sigma_C$ and $\delta_C$ are both small (before $\tanh$ saturates).

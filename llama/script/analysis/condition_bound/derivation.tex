@@ -1,0 +1,123 @@
+% Tighter condition via within-cluster score variance (Bennett bound).
+% Follows the notation of the Approximation section:
+%   s_i = q k_i / \sqrt{d_k},  s_C = q \bar k / \sqrt{d_k},
+%   Z_C = \sum_{i\in C} e^{s_i},  \hat Z_C = |C| e^{s_C},
+%   u_C = \sum_{i\in C} e^{s_i} v_i / Z_C,
+%   p_C = Z_C / \sum_{C'} Z_{C'},  \hat p_C = \hat Z_C / \sum_{C'} \hat Z_{C'},
+%   b_C = \log(\sum_{i\in C} e^{s_i - s_C} / |C|) \ge 0,
+%   A = \sum_{C'} \hat p_{C'} e^{b_{C'}} \ge 1,
+%   \|v_i\| \le B,  B_C = \max_{i \in C}\|v_i\|,  \max_{i\in C}|q(k_i-\bar k)/\sqrt{d_k}| \le \delta_C.
+
+\section{Tighter condition via within-cluster variance}
+
+\paragraph{Additional statistic}
+For each cluster $C$ define the within-cluster score variance
+\[
+\sigma_C^2 = \frac{1}{|C|}\sum_{i\in C}(s_i - s_C)^2 .
+\]
+Because $\bar k$ is the arithmetic mean of the cluster keys, $\sum_{i\in C}(s_i - s_C) = 0$, so
+$\sigma_C^2$ is a genuine variance, and with the within-cluster key covariance
+$\Sigma_C = \frac{1}{|C|}\sum_{i\in C}(k_i-\bar k)(k_i-\bar k)^\top$,
+\[
+\sigma_C^2 = \frac{q\,\Sigma_C\, q^\top}{d_k}, \qquad \sigma_C \le \delta_C .
+\]
+
+\paragraph{Lemma (variance-constrained bound on the Jensen gap)}
+Let $x_i = s_i - s_C$, so that $\frac{1}{|C|}\sum_i x_i = 0$, $\frac{1}{|C|}\sum_i x_i^2 = \sigma_C^2$,
+and $x_i \le \delta_C$. Then
+\[
+e^{b_C} \;=\; \frac{1}{|C|}\sum_{i\in C} e^{x_i}
+\;\le\;
+G(\sigma_C, \delta_C)
+:= \frac{\sigma_C^2\, e^{\delta_C} + \delta_C^2\, e^{-\sigma_C^2/\delta_C}}{\sigma_C^2 + \delta_C^2}.
+\]
+
+\emph{Proof.} Let $g(t) = (e^t - 1 - t)/t^2$ (with $g(0)=\tfrac12$); $g$ is nondecreasing.
+For any $a$ and any $x \le \delta$,
+\[
+e^{x} = e^{a}\big[1 + (x-a) + g(x-a)(x-a)^2\big]
+\le e^{a}\big[1 + (x-a) + g(\delta-a)(x-a)^2\big].
+\]
+Averaging over $i$ and using $\frac1n\sum x_i = 0$, $\frac1n\sum x_i^2 = \sigma^2$:
+\[
+\frac{1}{n}\sum_i e^{x_i} \le e^{a}\big[1 - a + g(\delta-a)(\sigma^2 + a^2)\big].
+\]
+Choosing $a = -\sigma^2/\delta$ (so $\delta - a = (\delta^2+\sigma^2)/\delta$ and
+$\sigma^2 + a^2 = \sigma^2(\delta^2+\sigma^2)/\delta^2$) and simplifying gives exactly
+$G(\sigma,\delta)$. $\square$
+
+Remarks:
+(i) $G(\delta,\delta) = \cosh\delta$ and $G(0,\delta) = 1$: the lemma strictly generalizes the
+chord bound $e^{b_C} \le \cosh\delta_C$, which is recovered when no variance information is used.
+The bound is tight: equality holds for scores supported on $\{-\sigma^2/\delta,\ \delta\}$.
+(ii) Only the \emph{one-sided} bound $x_i \le \delta_C$ is used.
+(iii) The proof goes through verbatim with any over-estimates
+$\hat\sigma_C \ge \sigma_C$, $\hat\delta_C \ge \delta_C$ (choose $a = -\hat\sigma_C^2/\hat\delta_C$),
+so plugging in efficiently verifiable upper bounds is sound; one may always take
+$\min\{\cosh\delta_C,\ G(\hat\sigma_C,\hat\delta_C)\}$ so the new condition is never worse than the old one.
+(iv) An efficiently verifiable variance bound: store $D_C = \mathrm{diag}(\Sigma_C)$ (one vector)
+and $\lambda_C = \|\Sigma_C - \mathrm{diag}(\Sigma_C)\|_2$ (one scalar, precomputed offline); then
+\[
+\sigma_C^2 \;\le\; \hat\sigma_C^2 := \frac{1}{d_k}\Big(\sum_j q_j^2\, D_{C,j} + \lambda_C \|q\|^2\Big).
+\]
+
+\paragraph{New condition}
+In the original proof $\delta_C$ enters the first term only through $e^{b_C} \le \cosh\delta_C$,
+which gives $A \le S_\delta$. Replacing it with the Lemma gives
+\[
+A \;\le\; S_G := \sum_{C} \hat p_{C}\, G(\sigma_C,\delta_C),
+\qquad
+\sum_C |p_C - \hat p_C| \;\le\; \frac{2(S_G - 1)}{S_G},
+\]
+and the rest of the argument is unchanged. The condition becomes
+
+\begin{tcolorbox}[colback=white, colframe=black, arc=0mm, boxrule=0.5pt]
+\[
+\sum_{C} \hat p_{C}\left(
+\frac{2B\,\big(G(\sigma_C,\delta_C)-1\big)}{S_G}
++ 2 B_C \tanh(\delta_C/2)\right) < \epsilon
+\;\;\Longrightarrow\;\;
+\|\hat o - o\|_2 < \epsilon .
+\]
+\end{tcolorbox}
+
+Magnitude: empirically $b_C \approx \sigma_C^2/2$ (rank correlation $0.95$), with typical
+$\sigma_C \approx 1$ while range-bound $\delta_C \approx 10\text{--}17$. At those values
+$G(1,10) \approx 219$ vs.\ $\cosh(10) \approx 1.1\times10^{4}$ and
+$G(1,17) \approx 8.3\times10^{4}$ vs.\ $\cosh(17) \approx 1.2\times10^{7}$:
+the first term of the condition tightens by roughly two orders of magnitude.
+
+\paragraph{Hybrid form (per-step certificate)}
+The decode kernel computes selected clusters exactly \emph{inside the same softmax}:
+for $C$ in the selected set $S$, $\hat Z_C = Z_C$ and the representative value is $u_C$,
+so $b_C = 0$; unselected clusters keep $\hat Z_C = |C|e^{s_C}$ and $\bar v_C$.
+Writing $\hat o_{\mathrm{hyb}}$ for this output and
+\[
+T = \sum_{C \notin S} \hat p_C\big(G(\sigma_C,\delta_C) - 1\big)
+\qquad (\hat p \text{ from the all-approximate normalizers}),
+\]
+the same proof gives, for \emph{any} selected set $S$,
+\[
+\|\hat o_{\mathrm{hyb}} - o\|_2
+\;\le\;
+\frac{2B\,T}{1+T} + \sum_{C\notin S} 2\hat p_C B_C \tanh(\delta_C/2)
+\;\le\;
+\sum_{C \notin S} \hat p_C \Big( 2B\big(G(\sigma_C,\delta_C)-1\big) + 2B_C\tanh(\delta_C/2) \Big).
+\]
+\emph{Proof sketch.} $e^{b_C}=1$ on $S$, so $A \le 1 + \tilde T$ with
+$\tilde T = \sum_{C\notin S}\hat p^{\mathrm{mix}}_C (G-1)$, where $\hat p^{\mathrm{mix}}$ uses the
+mixed normalizers. Since $Z_C \ge \hat Z_C$ on $S$, the mixed normalizer is larger, hence
+$\hat p^{\mathrm{mix}}_C \le \hat p_C$ for $C \notin S$ and $\tilde T \le T$; $x \mapsto x/(1+x)$
+is increasing. The value term runs only over $C \notin S$. $\square$
+
+The middle expression is a per-decode-step error certificate computable from quantities the
+selection kernel already has; the right-hand side is additive per cluster and requires no
+normalization across clusters.
+
+\paragraph{Optional refinement of the second term}
+The value term can also use the variance: with $Y_i = e^{x_i}$,
+$\sum_i \big|\tfrac{1}{|C|} - \tfrac{e^{s_i}}{\sum_j e^{s_j}}\big| = \mathbb E|Y-\mathbb E Y|/\mathbb E Y
+\le \sqrt{\mathbb E e^{2x} - 1} \le \sqrt{G(2\sigma_C, 2\delta_C) - 1}$,
+so one may replace $2\tanh(\delta_C/2)$ by
+$\min\{\,2\tanh(\delta_C/2),\ \sqrt{G(2\sigma_C,2\delta_C)-1}\,\}$,
+which helps when both $\sigma_C$ and $\delta_C$ are small (where $\tanh$ has not yet saturated).

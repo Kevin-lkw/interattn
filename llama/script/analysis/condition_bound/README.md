@@ -143,9 +143,14 @@ the eager runner). The kernel path needs the storable bound
 
 1. ~~Oracle Bennett, offline~~ — done, see above (certificate criterion failed by
    saturation, selection criterion passed strongly).
-2. **Verifiable statistics** — `sigma_hat^2` via diag + spectral remainder; scalar
-   radius for delta. Re-run `bennett_condition.py` + `ppl_bennett.py` with the storable
-   stats; accept if PPL-at-matched-budget keeps most of the oracle gain.
+2. ~~Verifiable statistics~~ — done (`storable_sigma.py`, block 32): **the storable
+   sigmas largely lose the oracle selection gain.** Matched-k error vs cosh: oracle
+   0.82–0.99x, diag-only 0.89–1.01x (keeps a sliver; valid as a *score*, not a bound),
+   diag+lambda 1.00–1.19x (the spectral remainder over-inflates sigma and is *worse*
+   than cosh). Verdict for generation (block 32): Bennett with storable stats is an
+   **IO/speed** win (2 vec + 2 scalars, stats kernel 1.28–1.36x), roughly
+   quality-neutral; the quality win needs oracle-ish sigma or small blocks. The
+   diag+lambda form remains useful only for the optional certificate.
 3. **Selection rule decision** — done in effect: Bennett share dominates; keep the
    normalized share form (with G).
 4. **Kernel integration** — swap summaries (`D_C`, radius, lambda for `k_max/k_min`),

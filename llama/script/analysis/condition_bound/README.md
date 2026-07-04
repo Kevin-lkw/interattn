@@ -17,6 +17,9 @@ same as `result/Llama-2-7b-hf/wikitext_0/condition_block_corr/`.
 | `hybrid_guarantee.py` | Per-cluster guarantee, hybrid certificate validity, certified-score vs share-rule ranking |
 | `estimator_correction.py` | Estimator-correction ablation (negative result) |
 | `selection_kernel_bench.py` | Cost of the S_delta normalizer in the Triton stats kernel (~0.1%, free) |
+| `bennett_condition.py` | Stage 1: Bennett vs cosh — slack, Spearman, matched-budget selection, eps->budget calibration |
+| `ppl_bennett.py` | PPL-vs-budget sweep with the Bennett condition (wraps runner_cond_block) |
+| `bennett_kernel_bench.py` | Stats kernel with Bennett summaries (2 vec + 2 scalars) vs production (3 vec) |
 
 Run from repo root, e.g. `python llama/script/analysis/condition_bound/hybrid_guarantee.py --device cuda:0`
 (nanogpt env; flags: `--device`, `--budget`, `--layers`).
@@ -72,21 +75,57 @@ Verifiable sigma bound: store `diag(Sigma_C)` (1 vector) + off-diagonal spectral
 become a usable ranking (its failure was traced to cosh overweighting); fewer summary
 bytes in the kernel that grows with context.
 
+## Stage-1 results: tighter / faster / better (2026-07-04)
+
+Scripts: `bennett_condition.py` (offline, oracle sigma), `ppl_bennett.py` (PPL sweep,
+monkeypatched runner_cond_block), `bennett_kernel_bench.py` (stats-kernel microbench).
+
+**Tighter — per-cluster yes, certified-eps no (saturation).** G is ~100x smaller than
+cosh per cluster and Spearman improves (+0.01–0.02, e.g. 0.9167 -> 0.9399 layer 15).
+But the *normalized total bound* and the post-selection certificate are unchanged at
+5–20% budgets: once `S_F >> 1` the mass term saturates at `2B` for either F, and the
+rest is the (unchanged) tanh value term. Bennett only shows in the certificate when
+selection drives `T = sum_unsel p_hat (G-1)` below O(1).
+
+**Better selection at matched budget (offline).** Ranking by the Bennett share beats the
+cosh share everywhere: true hybrid error ratios 0.50–0.90 across layers 10/15/20,
+block 10/20, frac 5/10/20% (best: layer 20 block 10 frac 5%: 0.504).
+
+**Better PPL at same budget.** Full-model sweep (Llama-2-7b, wikitext_0, block 20,
+oracle sigma; cosh baseline = saved `condition_block_runner/budget=0.05`):
+
+| budget (causal) | cosh PPL | bennett PPL |
+|---:|---:|---:|
+| 0.82 | 3.960 (eps .05) | 3.950 (eps .05) |
+| 0.69 / 0.72 | 3.952 (eps .1) | 3.948 (eps .1) |
+| 0.34 / 0.38 | 6.330 (eps .5) | 3.984 (eps .5) |
+| 0.22 / 0.27 | 13.450 (eps 1) | 4.144 (eps 1) |
+| 0.08 / 0.16 | 211.3 (eps 5) | 8.964 (eps 5) |
+
+teacher 3.951. At matched budget ~0.27 the cosh curve interpolates to PPL ~9.7 vs
+bennett 4.14 (excess over teacher ~30x smaller). Below budget ~0.15 both collapse
+(bennett cliff at eps 10: 1990 @ 0.138; cosh 3766 @ 0.055).
+
+**Faster.** Bennett summaries need `k_bar` + diag-variance + 2 scalars instead of
+`k_bar/k_max/k_min` (3 vectors). Stats-kernel microbench (cold L2, production configs,
+includes the extra G-cache store): 1.25x @32K, 1.35x @64K, 1.28x @128K.
+
+Caveat: PPL sweep uses oracle `sigma^2(q)` (exact within-block score variance — free in
+the eager runner). The kernel path needs the storable bound
+`sigma_hat^2 = (sum_j q_j^2 D_j + lambda ||q||^2)/d_k`; quantifying that gap is stage 2.
+
 ## Plan
 
-1. **Oracle Bennett, offline** — add `G` to this harness with exact `sigma_C^2(q)`,
-   range-bound delta. Verify: 0 violations; post-selection certificate slack improves
-   >= 30x; Spearman >= 0.88 baseline; matched-budget ranking with Bennett score vs
-   share rule.
-2. **Verifiable statistics** — `sigma_hat^2 = (sum_j q_j^2 D_j + lambda ||q||^2)/d_k`
-   (diag + spectral remainder, prefill-computed); optionally scalar radius for delta.
-   Accept if degradation vs oracle sigma < 2x.
-3. **Selection rule decision** — Bennett-scored condition vs production share at matched
-   budget; pick by true error, spot-check LongBench.
-4. **Kernel integration** — replace `k_max/k_min` reads with `D_C` + 2 scalars in the
-   selection-stats kernel (bytes/block: 3 vectors -> 2 vectors + 2 scalars); sanity:
-   mask parity vs eager reference, token parity e2e; re-validate LongBench at matched
-   selected ratio; measure decode ms/step (stats kernel is the context-growing cost).
+1. ~~Oracle Bennett, offline~~ — done, see above (certificate criterion failed by
+   saturation, selection criterion passed strongly).
+2. **Verifiable statistics** — `sigma_hat^2` via diag + spectral remainder; scalar
+   radius for delta. Re-run `bennett_condition.py` + `ppl_bennett.py` with the storable
+   stats; accept if PPL-at-matched-budget keeps most of the oracle gain.
+3. **Selection rule decision** — done in effect: Bennett share dominates; keep the
+   normalized share form (with G).
+4. **Kernel integration** — swap summaries (`D_C`, radius, lambda for `k_max/k_min`),
+   fused-path parity sanity (mask/token), LongBench re-validation at matched selected
+   ratio, decode ms/step (microbench predicts 1.25–1.35x on the stats kernel).
 
 Efficiency note (per project direction): stages 1–3 ignore implementation efficiency —
 they only require that every quantity is *in principle* a per-block prompt-side summary

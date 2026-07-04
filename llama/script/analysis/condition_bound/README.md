@@ -106,6 +106,24 @@ teacher 3.951. At matched budget ~0.27 the cosh curve interpolates to PPL ~9.7 v
 bennett 4.14 (excess over teacher ~30x smaller). Below budget ~0.15 both collapse
 (bennett cliff at eps 10: 1990 @ 0.138; cosh 3766 @ 0.055).
 
+**Better PPL at same budget — main setting (Llama-3.1-8B, block 32, wikitext n20).**
+`ppl_bennett_ms.py` (multisample wrapper) vs cosh baseline, same 20 samples, same eps
+grid, oracle sigma; plot: `result/Llama-3.1-8B/wikitext_n20_block32/ppl_cosh_vs_bennett.png`.
+Teacher 6.840. The gain is consistent but much smaller than on Llama-2 block 20:
+
+| budget | cosh PPL | bennett PPL | excess-over-teacher ratio |
+|---:|---:|---:|---:|
+| ~0.40 | 7.011 | 6.977 | 0.80 |
+| ~0.29 | 7.930 | 7.556 | 0.66 |
+| ~0.19 | 29.63 | 25.32 | 0.85 |
+| ~0.16 | 127.8 | 131.5 | ~1 (collapse region) |
+
+Note: previous block-10 cosh curve dominates block 32 at matched budget (finer
+granularity), but block 32 is the decode-kernel setting. Candidate reasons the gain
+shrinks vs Llama-2/block-20: GQA head-shared selection (condition averaged over 4
+query heads) dilutes ranking differences, and larger blocks shift the score-spread
+regime; worth a targeted ablation before kernel work.
+
 **Faster.** Bennett summaries need `k_bar` + diag-variance + 2 scalars instead of
 `k_bar/k_max/k_min` (3 vectors). Stats-kernel microbench (cold L2, production configs,
 includes the extra G-cache store): 1.25x @32K, 1.35x @64K, 1.28x @128K.

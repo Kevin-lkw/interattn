@@ -25,7 +25,7 @@ o = \sum_C p_C\, u_C,
 \qquad\qquad
 \hat o = \sum_C \hat p_C\, \bar v_C .
 \]
-We assume per-cluster statistics satisfying
+We assume a global bound $B$ and per-cluster statistics $B_C$, $\delta_C$ with
 \[
 B \ \ge\ \max_i \|v_i\|_2, \qquad
 B_C \ \ge\ \max_{i\in C} \|v_i\|_2, \qquad
@@ -45,8 +45,6 @@ Let $S_\delta = \sum_C \hat p_C \cosh \delta_C$. Then
 \frac{2B\,(S_\delta - 1)}{S_\delta}
 + \sum_C 2\, \hat p_C B_C \tanh\!\big(\delta_C/2\big).
 \]
-In particular, if the left-hand sum is smaller than $\epsilon$, then
-$\|\hat o - o\|_2 < \epsilon$.
 \end{theorem}
 
 The proof combines two lemmas, bounding respectively the error in the cluster
@@ -71,7 +69,8 @@ $\mathbb E |X - \mathbb E X| = 2\, \mathbb E (X - \mathbb E X)_+$,
 \ \le\ \frac{2}{A} \sum_C \hat p_C \big( e^{b_C} - 1 \big)
 = \frac{2(A-1)}{A},
 \]
-where the inequality uses $(t - A)_+ \le t - 1$ for $t \ge 1 \le A$.
+where the inequality uses $(t - A)_+ \le t - 1$, valid since $e^{b_C} \ge 1$
+and $A \ge 1$.
 By convexity of the exponential, for $x \in [-\delta_C, \delta_C]$,
 \[
 e^{x} \ \le\ \frac{\delta_C - x}{2\delta_C}\, e^{-\delta_C}
@@ -93,7 +92,7 @@ Let $w_i = e^{s_i} / \sum_{j \in C} e^{s_j}$ for $i \in C$. Then
 
 \begin{proof}
 Let $Y_i = e^{x_i} \in [a, b]$ with $a = e^{-\delta_C}$, $b = e^{\delta_C}$, and
-$T = \frac{1}{|C|} \sum_i Y_i$, so that
+$T = \frac{1}{|C|} \sum_i Y_i \in [a, b]$, so that
 $\sum_i |\frac{1}{|C|} - w_i| = \frac{1}{|C|\,T} \sum_i |Y_i - T|
 = \frac{2}{|C|\,T} \sum_i (Y_i - T)_+$.
 The convex function $y \mapsto (y - T)_+$ lies below its chord on $[a, b]$:
@@ -105,7 +104,8 @@ $(y - T)_+ \le (b - T) \frac{y - a}{b - a}$. Averaging over $i$,
 \ =\ \frac{2\,(2\cosh\delta_C - 2)}{2 \sinh \delta_C}
 \ =\ 2 \tanh\!\big(\delta_C/2\big),
 \]
-the middle step maximizing over $T$ at $T = \sqrt{ab} = 1$.
+the middle step maximizing $(b - T)(T - a)/T$ over $T \in [a, b]$ at
+$T = \sqrt{ab} = 1$.
 For the second claim, the coefficients $\frac{1}{|C|} - w_i$ sum to zero, so
 $\bar v_C - u_C = \sum_i \big( \frac{1}{|C|} - w_i \big) v_i$ and
 $\|\bar v_C - u_C\|_2 \le \max_{i \in C} \|v_i\|_2 \sum_i |\frac{1}{|C|} - w_i|$.

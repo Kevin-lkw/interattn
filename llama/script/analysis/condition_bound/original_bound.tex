@@ -1,9 +1,8 @@
 
 % Error bound for cluster-averaged attention (original cosh condition).
 % Paper-style, self-contained section. Requires amsmath, amsthm with
-% theorem/lemma/remark/proof environments defined, e.g.
+% theorem/lemma/proof environments defined, e.g.
 %   \newtheorem{theorem}{Theorem}  \newtheorem{lemma}{Lemma}
-%   \theoremstyle{remark}\newtheorem{remark}{Remark}
 
 \section{An Efficiently Verifiable Error Bound for Cluster-Averaged Attention}
 
@@ -122,21 +121,3 @@ and $\|u_C\|_2 \le B$ ($u_C$ is a convex combination of the $v_i$),
 and Lemmas~\ref{lem:mass} and~\ref{lem:value} bound the two terms. The stated
 equality holds because $\sum_C \hat p_C = 1$.
 \end{proof}
-
-\begin{remark}[role of the arithmetic mean]
-The proof of Lemma~\ref{lem:mass} uses $\sum_{i \in C}(s_i - s_C) = 0$, which holds
-exactly because $\bar k_C$ is the arithmetic mean of the cluster keys; replacing it
-by a medoid or a normalized centroid invalidates both $b_C \ge 0$ and the
-$\cosh$ bound.
-\end{remark}
-
-\begin{remark}[efficient verification]
-All quantities in Theorem~\ref{thm:condition} are computable from per-cluster
-summaries with $O(d_k)$ work per cluster and query: $\bar k_C$ and $\bar v_C$
-(vectors), $B_C$ (scalar), and, for $\delta_C$, either the coordinate-wise bounds
-$(k_{\max}, k_{\min})$, giving
-$\delta_C \le \max\big( |\overline{s}_C - s_C|,\ |\underline{s}_C - s_C| \big)$ with
-$\overline{s}_C, \underline{s}_C$ the box upper/lower bounds on $q k / \sqrt{d_k}$,
-or the radius $r_C = \max_{i \in C} \|k_i - \bar k_C\|_2$, giving
-$\delta_C \le \|q\|_2\, r_C / \sqrt{d_k}$.
-\end{remark}

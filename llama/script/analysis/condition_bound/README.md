@@ -118,11 +118,18 @@ Teacher 6.840. The gain is consistent but much smaller than on Llama-2 block 20:
 | ~0.19 | 29.63 | 25.32 | 0.85 |
 | ~0.16 | 127.8 | 131.5 | ~1 (collapse region) |
 
-Note: previous block-10 cosh curve dominates block 32 at matched budget (finer
-granularity), but block 32 is the decode-kernel setting. Candidate reasons the gain
-shrinks vs Llama-2/block-20: GQA head-shared selection (condition averaged over 4
-query heads) dilutes ranking differences, and larger blocks shift the score-spread
-regime; worth a targeted ablation before kernel work.
+Block 10, same 20 samples (`wikitext_n20_block10_bennett`, cosh low-budget extension in
+`wikitext_n20_block10_ext`; plot `ppl_block10_vs_block32_cosh_vs_bennett.png`): Bennett
+is Pareto-better at every eps except the collapse floor — same or less budget AND lower
+PPL, excess-over-teacher ratio 0.57–0.85 (eps=1: 7.947@0.207 vs 8.776@0.211; eps=2.5:
+23.16 vs 33.90 at budget 0.182; wash at eps=5/budget 0.174).
+
+Block-size comparison at matched budget: block 10 dominates block 32 for both
+conditions across the whole usable range (e.g. budget ~0.31: block10-Bennett 6.96 vs
+block32-Bennett ~7.4; budget ~0.21: block10-Bennett 7.95 while block32 needs ~0.29 for
+7.93). Best combo overall: block 10 + Bennett. The Bennett gain is also larger at
+block 10 than block 32 — consistent with GQA head-shared selection and coarser blocks
+diluting per-block ranking differences; a per-head-selection ablation remains open.
 
 **Faster.** Bennett summaries need `k_bar` + diag-variance + 2 scalars instead of
 `k_bar/k_max/k_min` (3 vectors). Stats-kernel microbench (cold L2, production configs,

@@ -10,7 +10,8 @@ same as `result/Llama-2-7b-hf/wikitext_0/condition_block_corr/`.
 
 | file | what it shows |
 |---|---|
-| `derivation.tex` | New bound: variance-constrained (Bennett) replacement of `cosh(delta)`, hybrid per-step certificate, per-cluster guarantee |
+| `original_bound.tex` | Paper-style derivation of the original cosh condition (theorem + two lemmas, full proofs) |
+| `derivation.tex` | Extended version: Bennett refinement and hybrid per-step certificate (route parked; see stage-2 gate) |
 | `sanity_mc.py` | CPU Monte Carlo for every inequality (TV lemma, Bennett lemma, all-approx bound, hybrid certificate) — all PASS |
 | `bound_variants.py` | Bound validity/slack + Spearman for B_C / global-B variants |
 | `error_decompose.py` | True error split into mass vs value channels; `b_C ~ Var(s)/2` fit |

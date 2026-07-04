@@ -1,0 +1,142 @@
+
+% Error bound for cluster-averaged attention (original cosh condition).
+% Paper-style, self-contained section. Requires amsmath, amsthm with
+% theorem/lemma/remark/proof environments defined, e.g.
+%   \newtheorem{theorem}{Theorem}  \newtheorem{lemma}{Lemma}
+%   \theoremstyle{remark}\newtheorem{remark}{Remark}
+
+\section{An Efficiently Verifiable Error Bound for Cluster-Averaged Attention}
+
+Let the visible key--value pairs $\{(k_i, v_i)\}$ be partitioned into clusters
+$C_1, \dots, C_m$, and let $q \in \mathbb R^{d_k}$ be a query. Write
+$s_i = q k_i / \sqrt{d_k}$, and for each cluster $C$ let
+$\bar k_C = \frac{1}{|C|} \sum_{i \in C} k_i$ and
+$\bar v_C = \frac{1}{|C|} \sum_{i \in C} v_i$ denote the arithmetic means,
+$s_C = q \bar k_C / \sqrt{d_k}$, and
+\[
+Z_C = \sum_{i\in C} e^{s_i}, \qquad
+\hat Z_C = |C|\, e^{s_C}, \qquad
+u_C = \frac{1}{Z_C}\sum_{i\in C} e^{s_i} v_i, \qquad
+p_C = \frac{Z_C}{\sum_{C'} Z_{C'}}, \qquad
+\hat p_C = \frac{\hat Z_C}{\sum_{C'} \hat Z_{C'}} .
+\]
+Exact attention and its \emph{cluster-averaged} approximation are
+\[
+o = \sum_C p_C\, u_C,
+\qquad\qquad
+\hat o = \sum_C \hat p_C\, \bar v_C .
+\]
+We assume per-cluster statistics satisfying
+\[
+B \ \ge\ \max_i \|v_i\|_2, \qquad
+B_C \ \ge\ \max_{i\in C} \|v_i\|_2, \qquad
+\delta_C \ \ge\ \max_{i\in C} \Big| \frac{q (k_i - \bar k_C)}{\sqrt{d_k}} \Big| .
+\]
+
+\begin{theorem}\label{thm:condition}
+Let $S_\delta = \sum_C \hat p_C \cosh \delta_C$. Then
+\[
+\|\hat o - o\|_2
+\ \le\
+\sum_{C} \hat p_{C} \left(
+\frac{2B \left( \cosh\delta_C - 1 \right)}{S_\delta}
++ 2 B_C \tanh\!\big(\delta_C/2\big)
+\right)
+\ =\
+\frac{2B\,(S_\delta - 1)}{S_\delta}
++ \sum_C 2\, \hat p_C B_C \tanh\!\big(\delta_C/2\big).
+\]
+In particular, if the left-hand sum is smaller than $\epsilon$, then
+$\|\hat o - o\|_2 < \epsilon$.
+\end{theorem}
+
+The proof combines two lemmas, bounding respectively the error in the cluster
+\emph{masses} and in the cluster \emph{values}.
+
+\begin{lemma}[mass]\label{lem:mass}
+$\displaystyle \sum_C |p_C - \hat p_C| \ \le\ \frac{2\,(S_\delta - 1)}{S_\delta}$.
+\end{lemma}
+
+\begin{proof}
+Let $x_i = s_i - s_C$ and
+$b_C = \log (Z_C / \hat Z_C) = \log\big( \frac{1}{|C|} \sum_{i \in C} e^{x_i} \big)$.
+Since $\bar k_C$ is the arithmetic mean, $\sum_{i\in C} x_i = 0$, so $b_C \ge 0$ by
+Jensen's inequality. With $A = \sum_{C'} \hat p_{C'} e^{b_{C'}} \ge 1$ we have
+$p_C = \hat p_C\, e^{b_C} / A$. Regarding $e^{b_C}$ as a random variable with law
+$(\hat p_C)_C$ and mean $A$, and using
+$\mathbb E |X - \mathbb E X| = 2\, \mathbb E (X - \mathbb E X)_+$,
+\[
+\sum_C |p_C - \hat p_C|
+= \frac{1}{A} \sum_C \hat p_C \big| e^{b_C} - A \big|
+= \frac{2}{A} \sum_C \hat p_C \big( e^{b_C} - A \big)_+
+\ \le\ \frac{2}{A} \sum_C \hat p_C \big( e^{b_C} - 1 \big)
+= \frac{2(A-1)}{A},
+\]
+where the inequality uses $(t - A)_+ \le t - 1$ for $t \ge 1 \le A$.
+By convexity of the exponential, for $x \in [-\delta_C, \delta_C]$,
+\[
+e^{x} \ \le\ \frac{\delta_C - x}{2\delta_C}\, e^{-\delta_C}
+           + \frac{\delta_C + x}{2\delta_C}\, e^{\delta_C};
+\]
+averaging over $i \in C$ and using $\sum_i x_i = 0$ gives
+$e^{b_C} \le \cosh \delta_C$, hence $A \le S_\delta$. The claim follows because
+$t \mapsto 2(t-1)/t$ is increasing.
+\end{proof}
+
+\begin{lemma}[value]\label{lem:value}
+Let $w_i = e^{s_i} / \sum_{j \in C} e^{s_j}$ for $i \in C$. Then
+\[
+\sum_{i\in C} \Big| \frac{1}{|C|} - w_i \Big| \ \le\ 2 \tanh\!\big(\delta_C/2\big),
+\qquad\text{and consequently}\qquad
+\|\bar v_C - u_C\|_2 \ \le\ 2 B_C \tanh\!\big(\delta_C/2\big).
+\]
+\end{lemma}
+
+\begin{proof}
+Let $Y_i = e^{x_i} \in [a, b]$ with $a = e^{-\delta_C}$, $b = e^{\delta_C}$, and
+$T = \frac{1}{|C|} \sum_i Y_i$, so that
+$\sum_i |\frac{1}{|C|} - w_i| = \frac{1}{|C|\,T} \sum_i |Y_i - T|
+= \frac{2}{|C|\,T} \sum_i (Y_i - T)_+$.
+The convex function $y \mapsto (y - T)_+$ lies below its chord on $[a, b]$:
+$(y - T)_+ \le (b - T) \frac{y - a}{b - a}$. Averaging over $i$,
+\[
+\sum_{i} \Big| \frac{1}{|C|} - w_i \Big|
+\ \le\ \frac{2\,(b - T)(T - a)}{(b - a)\, T}
+\ \le\ \frac{2\,(b - 1)(1 - a)}{b - a}
+\ =\ \frac{2\,(2\cosh\delta_C - 2)}{2 \sinh \delta_C}
+\ =\ 2 \tanh\!\big(\delta_C/2\big),
+\]
+the middle step maximizing over $T$ at $T = \sqrt{ab} = 1$.
+For the second claim, the coefficients $\frac{1}{|C|} - w_i$ sum to zero, so
+$\bar v_C - u_C = \sum_i \big( \frac{1}{|C|} - w_i \big) v_i$ and
+$\|\bar v_C - u_C\|_2 \le \max_{i \in C} \|v_i\|_2 \sum_i |\frac{1}{|C|} - w_i|$.
+\end{proof}
+
+\begin{proof}[Proof of Theorem~\ref{thm:condition}]
+From $\hat o - o = \sum_C (\hat p_C - p_C)\, u_C + \sum_C \hat p_C (\bar v_C - u_C)$
+and $\|u_C\|_2 \le B$ ($u_C$ is a convex combination of the $v_i$),
+\[
+\|\hat o - o\|_2
+\ \le\ B \sum_C |p_C - \hat p_C| + \sum_C \hat p_C\, \|\bar v_C - u_C\|_2,
+\]
+and Lemmas~\ref{lem:mass} and~\ref{lem:value} bound the two terms. The stated
+equality holds because $\sum_C \hat p_C = 1$.
+\end{proof}
+
+\begin{remark}[role of the arithmetic mean]
+The proof of Lemma~\ref{lem:mass} uses $\sum_{i \in C}(s_i - s_C) = 0$, which holds
+exactly because $\bar k_C$ is the arithmetic mean of the cluster keys; replacing it
+by a medoid or a normalized centroid invalidates both $b_C \ge 0$ and the
+$\cosh$ bound.
+\end{remark}
+
+\begin{remark}[efficient verification]
+All quantities in Theorem~\ref{thm:condition} are computable from per-cluster
+summaries with $O(d_k)$ work per cluster and query: $\bar k_C$ and $\bar v_C$
+(vectors), $B_C$ (scalar), and, for $\delta_C$, either the coordinate-wise bounds
+$(k_{\max}, k_{\min})$, giving
+$\delta_C \le \max\big( |\overline{s}_C - s_C|,\ |\underline{s}_C - s_C| \big)$ with
+$\overline{s}_C, \underline{s}_C$ the box upper/lower bounds on $q k / \sqrt{d_k}$,
+or the radius $r_C = \max_{i \in C} \|k_i - \bar k_C\|_2$, giving
+$\delta_C \le \|q\|_2\, r_C / \sqrt{d_k}$.
+\end{remark}

@@ -77,6 +77,18 @@ true hybrid error vs the box baseline at fractions 5/10/20%. Logs:
   pca4/eig4 also help at layer 20 (0.44–0.71x) but are erratic across layers.
 - Valid *bounds* stay >= 3.6x loose (best: eig4 at 3.6–4.7x vs box 4.6–5.4x).
 
+**Term decomposition (`term_decompose.py`, block 32 and 10).** The two terms play
+opposite roles. Term 2 (value, `2 p_hat B_C tanh(d/2)`) is per-block saturated with box
+delta (tanh = 1, ranks by `p_hat B_C`) — but that costs nothing, because term 2 is a
+poor selector even with oracle delta (t2-only ranking: 1.1–5x worse error, despite the
+*highest* Spearman 0.86–0.95 — bulk correlation, wrong top tail). Term 1 (mass,
+`~2B softmax(log p_hat + d)`) is the opposite: per-block never saturates, its sum is
+pinned at 2B, and it does the actual selecting — 64–84% of the share among top-10%
+selected blocks is term 1, t1-only ranking ~reproduces the full share, and the entire
+oracle-delta gain flows through it (oracle-t1 ~= oracle-full, 0.36–0.93x). Consequence:
+a better delta only pays through term 1's top-tail ordering of `log p_hat + delta`;
+global rank metrics (Spearman) mislead here.
+
 **Verdict.** Better storable delta is effectively open in the regime that matters:
 worst-case hardness is real and the measured geometry is adversarial (high-rank hull,
 heavy-tailed spectrum), so every certified bound stays ~4–5x loose and the certificate

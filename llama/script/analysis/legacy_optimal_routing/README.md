@@ -3,7 +3,7 @@
 这个目录保存早期用于回答“optimal routing 为什么有效、能否被简单规则逼近”的探索代码。
 它们是研究过程与诊断工具，不是当前 condition-block 方法的主实现。
 
-当前主线位于父目录：
+当前主线位于相邻的 `condition_block_ppl/`：
 
 - `condition_block.py`：按 cluster 计算 condition，并根据阈值决定压缩或展开。
 - `runner_cond_block.py`：condition-block 的多层 PPL runner。
@@ -11,7 +11,8 @@
 - `condition_block_single.py`、`condition_block_optim.py`、`condition_block_corr.py`：单次 forward、efficient 实现和相关性分析。
 - `condition_ksim_*.py` / `runner_*ksim_cluster.py`：K-similarity cluster 变体。
 
-新 condition-block 变体应继续放在父目录，不要放进本目录。
+新的 PPL/condition 分析变体应放进 `condition_block_ppl/`；自回归生成实现应放进
+`condition_block_gen/`，不要放进本目录。
 
 ## 实验与 runner 对照
 

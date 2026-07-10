@@ -35,7 +35,7 @@ def parse_args(description, default_layers=(10, 15, 20)):
 
 
 def load_ctx(args):
-    from analysis.runner import load_context
+    from analysis.runtime import load_context
     from analysis.runner_utils import set_seed, str_to_torch_dtype
 
     set_seed(42)
@@ -51,7 +51,7 @@ def layer_groups(ctx, args, layer):
         _choose_evenly,
         _resolve_query_positions,
     )
-    from analysis.compare_utils import resolve_head_indices, validate_common_args
+    from analysis.experiment_utils import resolve_head_indices, validate_common_args
     from analysis.online_routing import build_runtime_layer_ctx, capture_layer_artifacts
     from analysis.sanity import grouped_query_heads, move_model_inputs_to_device
 

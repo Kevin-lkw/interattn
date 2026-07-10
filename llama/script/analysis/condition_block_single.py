@@ -17,7 +17,7 @@ import torch
 from transformers.models.llama import modeling_llama
 
 from .condition_block import _resolve_block_size
-from .runner import load_context
+from .runtime import load_context
 from .runner_cond_block import (
     _batched_hybrid_outputs_for_queries,
     _build_block_prefix_tensors,

@@ -24,12 +24,12 @@ import matplotlib.pyplot as plt
 import torch
 
 from .attention import gen_mask_h2o_with_belong_all
-from .compare_error import canonicalize_belong
-from .compare_error_fixed_cluster_qscan import (
+from .legacy_optimal_routing.compare_error import canonicalize_belong
+from .legacy_optimal_routing.compare_error_fixed_cluster_qscan import (
     _align_prefix_patches_to_pos_list,
     _choose_evenly,
 )
-from .compare_utils import (
+from .experiment_utils import (
     add_common_compare_args,
     build_baseline_prefix_patches,
     build_optimal_saved_prefix_patches,
@@ -39,7 +39,7 @@ from .compare_utils import (
 )
 from .config import set_seed, str_to_torch_dtype
 from .online_routing import build_runtime_layer_ctx, capture_layer_artifacts
-from .runner import load_context
+from .runtime import load_context
 from .sanity import move_model_inputs_to_device
 
 

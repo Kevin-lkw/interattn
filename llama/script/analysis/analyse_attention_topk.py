@@ -15,7 +15,7 @@ import torch
 
 from .config import parse_args, set_seed, str_to_torch_dtype
 from .online_routing import capture_layer_artifacts
-from .runner import load_context, resolve_layers
+from .runtime import load_context, resolve_layers
 from .sanity import move_model_inputs_to_device
 
 

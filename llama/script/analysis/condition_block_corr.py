@@ -20,9 +20,9 @@ import torch
 
 from .condition import _choose_evenly, _resolve_query_positions, _build_routing_pos_list
 from .condition_block import _resolve_block_size
-from .compare_utils import add_common_compare_args, resolve_head_indices, validate_common_args
+from .experiment_utils import add_common_compare_args, resolve_head_indices, validate_common_args
 from .online_routing import build_runtime_layer_ctx, capture_layer_artifacts
-from .runner import load_context
+from .runtime import load_context
 from .runner_utils import set_seed, str_to_torch_dtype
 from .sanity import grouped_query_heads, move_model_inputs_to_device
 

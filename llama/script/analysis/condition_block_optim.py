@@ -18,7 +18,7 @@ from transformers.models.llama import modeling_llama
 
 from .condition_block import _resolve_block_size
 from .condition_block_single import condition_block_single_forward
-from .runner import load_context
+from .runtime import load_context
 from .runner_cond_block import (
     _build_block_prefix_tensors,
     _full_attention_stats,

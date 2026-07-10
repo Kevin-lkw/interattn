@@ -24,7 +24,7 @@ from .online_routing import (
     capture_layer_artifacts,
     run_with_multilayer_patches,
 )
-from .runner import load_context, resolve_layers
+from .runtime import load_context, resolve_layers
 from .runner_cond_block import (
     _full_attention_stats,
     _merge_stats,

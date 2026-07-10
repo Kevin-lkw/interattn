@@ -139,6 +139,14 @@ def normalize_budget_key(result_dict, target_budget, atol=1e-12):
     return None
 
 
+def get_result_path(layer_idx, dataset, start, adaptive_budget, strategy, loss_type):
+    adaptive_str = adaptive_budget_tag(adaptive_budget)
+    return (
+        f"../result/{dataset}_{start}/{adaptive_str}/{strategy}/{loss_type}/"
+        f"layer{layer_idx}/result.pt"
+    )
+
+
 def nll_to_ppl(nll):
     return float(torch.exp(torch.tensor(float(nll), dtype=torch.float32)).item())
 

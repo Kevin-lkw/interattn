@@ -217,13 +217,19 @@ def resolve_head_indices(num_heads):
     return list(range(num_heads))
 
 
-def build_prompt(dataset_name):
+def build_prompt(dataset_name, join_separator="\n", filter_empty=True):
     if dataset_name == "wikitext":
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        return "\n".join([text for text in dataset["text"] if text.strip()])
+        texts = dataset["text"]
+        if filter_empty:
+            texts = [text for text in texts if text.strip()]
+        return join_separator.join(texts)
     if dataset_name == "pg19":
         dataset = load_dataset("emozilla/pg19-test", split="test")
-        return "\n".join([text for text in dataset["text"] if text.strip()])
+        texts = dataset["text"]
+        if filter_empty:
+            texts = [text for text in texts if text.strip()]
+        return join_separator.join(texts)
     if dataset_name == "oasst2":
         dataset = load_dataset("OpenAssistant/oasst2", split="train")
         texts = dataset["text"]
@@ -240,7 +246,7 @@ def build_prompt(dataset_name):
             ]
         if len(filtered_texts) == 0:
             raise ValueError("No valid text found in OASST2 after filtering.")
-        return "\n".join(filtered_texts)
+        return join_separator.join(filtered_texts)
     raise ValueError(
         f"Unsupported dataset '{dataset_name}'. Supported now: wikitext, pg19, oasst2"
     )

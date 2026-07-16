@@ -29,6 +29,8 @@ from ...sanity import (
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 DEFAULT_RESULT_ROOT = Path(__file__).resolve().parents[4] / "result"
+LEGACY_PROTOCOL = "legacy"
+ALIGNED_PROTOCOL = "aligned"
 
 
 def model_output_name(model):
@@ -57,6 +59,16 @@ def add_common_args(parser):
         help="Token distance between windows. Defaults to seq_len.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--ppl-protocol",
+        choices=[LEGACY_PROTOCOL, ALIGNED_PROTOCOL],
+        default=LEGACY_PROTOCOL,
+        help=(
+            "legacy preserves the original cross-window target convention; "
+            "aligned uses standard within-window next-token labels and the "
+            "WikiText-2 double-newline concatenation used by compression work."
+        ),
+    )
     parser.add_argument("--output-root", type=Path, default=None)
     return parser
 
@@ -73,7 +85,14 @@ def validate_common_args(args):
     if args.sample_stride <= 0:
         raise ValueError("--sample-stride must be > 0")
     if args.output_root is None:
-        args.output_root = DEFAULT_RESULT_ROOT / model_output_name(args.model) / "wikitext_n100"
+        result_name = (
+            "aligned_ppl"
+            if args.ppl_protocol == ALIGNED_PROTOCOL
+            else "wikitext_n100"
+        )
+        args.output_root = (
+            DEFAULT_RESULT_ROOT / model_output_name(args.model) / result_name
+        )
     return args
 
 
@@ -88,8 +107,14 @@ def load_model_and_tokens(args):
     dtype = str_to_torch_dtype(args.dtype)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     starts = sample_starts(args)
-    required_len = starts[-1] + args.seq_len + 1
-    prompt = build_prompt(args.dataset)
+    target_lookahead = 0 if args.ppl_protocol == ALIGNED_PROTOCOL else 1
+    required_len = starts[-1] + args.seq_len + target_lookahead
+    join_separator = "\n\n" if args.ppl_protocol == ALIGNED_PROTOCOL else "\n"
+    prompt = build_prompt(
+        args.dataset,
+        join_separator=join_separator,
+        filter_empty=args.ppl_protocol != ALIGNED_PROTOCOL,
+    )
     encoded = tokenizer(
         prompt,
         max_length=required_len,
@@ -111,12 +136,26 @@ def load_model_and_tokens(args):
     return model, tokenizer, encoded, dtype, starts
 
 
-def build_sample_context(model, tokenizer, encoded, dtype, device, start, seq_len):
+def build_sample_context(
+    model,
+    tokenizer,
+    encoded,
+    dtype,
+    device,
+    start,
+    seq_len,
+    ppl_protocol=LEGACY_PROTOCOL,
+):
     inputs = {
         key: value[:, start : start + seq_len]
         for key, value in encoded.items()
     }
-    labels = encoded["input_ids"][:, start + 1 : start + seq_len + 1]
+    if ppl_protocol == ALIGNED_PROTOCOL:
+        # Match the standard causal-LM shift inside an independent fixed-length
+        # evaluation chunk. No label is read from the following chunk.
+        labels = encoded["input_ids"][:, start + 1 : start + seq_len]
+    else:
+        labels = encoded["input_ids"][:, start + 1 : start + seq_len + 1]
     return RunContext(
         model=model,
         tokenizer=tokenizer,
@@ -133,7 +172,7 @@ def build_sample_context(model, tokenizer, encoded, dtype, device, start, seq_le
 
 
 def prepare_sample(ctx, seq_len):
-    pos_list = list(range(seq_len))
+    pos_list = list(range(ctx.gt_label.shape[1]))
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
     labels = get_tail_labels(ctx, pos_list, ctx.device)
     with torch.no_grad():
@@ -218,6 +257,7 @@ def run_routing_method(
         budget=budget,
         num_layers=ctx.model_config.num_hidden_layers,
         full_attention_layers=full_attention_layers,
+        pos_list=pos_list,
     )
 
 
@@ -280,6 +320,7 @@ def run_attention_topk_method(
         budget=budget,
         num_layers=ctx.model_config.num_hidden_layers,
         full_attention_layers=full_attention_layers,
+        pos_list=pos_list,
     )
 
 
@@ -344,11 +385,18 @@ def build_attention_topk_alpha_from_artifacts(
     return F.softmax(alpha_logits, dim=-1)
 
 
-def effective_causal_budget(seq_len, budget, num_layers, full_attention_layers):
+def effective_causal_budget(
+    seq_len,
+    budget,
+    num_layers,
+    full_attention_layers,
+    pos_list=None,
+):
     visible = int(seq_len * budget)
-    total_available = seq_len * (seq_len + 1) // 2
+    query_positions = range(seq_len) if pos_list is None else pos_list
+    total_available = sum(pos + 1 for pos in query_positions)
     selected_per_compressed_layer = sum(
-        min(pos + 1, visible) for pos in range(seq_len)
+        min(pos + 1, visible) for pos in query_positions
     )
     selected = (
         full_attention_layers * total_available
@@ -364,6 +412,7 @@ def metric_record(ref_logits, student_logits, labels, measured_budget):
         "student_ppl": math.exp(float(metrics["student_nll"])),
         "teacher_ppl": math.exp(float(metrics["teacher_nll"])),
         "measured_budget": float(measured_budget),
+        "num_tokens": int(labels.numel()),
     }
 
 
@@ -374,6 +423,13 @@ def load_or_create_summary(path, method, args, settings):
         if summary.get("starts") != expected_starts:
             raise ValueError(
                 f"Existing starts in {path} do not match current configuration."
+            )
+        existing_config = summary.get("config", {})
+        existing_protocol = existing_config.get("ppl_protocol", LEGACY_PROTOCOL)
+        if existing_protocol != args.ppl_protocol:
+            raise ValueError(
+                f"Existing protocol {existing_protocol!r} in {path} does not "
+                f"match requested protocol {args.ppl_protocol!r}."
             )
         return summary
     return {
@@ -398,9 +454,11 @@ def aggregate_samples(summary):
     grouped = {}
     teacher_ppls = []
     teacher_nlls = []
+    teacher_token_counts = []
     for sample in summary["samples"].values():
         teacher_ppls.append(float(sample["teacher_ppl"]))
         teacher_nlls.append(float(sample["teacher_nll"]))
+        teacher_token_counts.append(int(sample.get("num_tokens", 1)))
         for setting, record in sample["results"].items():
             grouped.setdefault(float(setting), []).append(record)
 
@@ -408,14 +466,19 @@ def aggregate_samples(summary):
         "num_completed_samples": len(summary["samples"]),
     }
     if teacher_ppls:
-        aggregate["teacher"] = summarize_values(teacher_ppls, teacher_nlls)
+        aggregate["teacher"] = summarize_values(
+            teacher_ppls,
+            teacher_nlls,
+            teacher_token_counts,
+        )
 
     aggregate["settings"] = {}
     for setting, records in sorted(grouped.items()):
         ppls = [float(record["student_ppl"]) for record in records]
         nlls = [float(record["student_nll"]) for record in records]
         budgets = [float(record["measured_budget"]) for record in records]
-        setting_summary = summarize_values(ppls, nlls)
+        token_counts = [int(record.get("num_tokens", 1)) for record in records]
+        setting_summary = summarize_values(ppls, nlls, token_counts)
         setting_summary["mean_measured_budget"] = float(
             torch.tensor(budgets, dtype=torch.float64).mean().item()
         )
@@ -423,15 +486,22 @@ def aggregate_samples(summary):
     return aggregate
 
 
-def summarize_values(ppls, nlls):
+def summarize_values(ppls, nlls, token_counts=None):
     ppl_tensor = torch.tensor(ppls, dtype=torch.float64)
     nll_tensor = torch.tensor(nlls, dtype=torch.float64)
+    if token_counts is None:
+        token_count_tensor = torch.ones_like(nll_tensor)
+    else:
+        token_count_tensor = torch.tensor(token_counts, dtype=torch.float64)
+    corpus_nll = (nll_tensor * token_count_tensor).sum() / token_count_tensor.sum()
     return {
         "count": int(ppl_tensor.numel()),
         "mean_ppl": float(ppl_tensor.mean().item()),
         "std_ppl": float(ppl_tensor.std(unbiased=False).item()),
         "mean_nll": float(nll_tensor.mean().item()),
-        "corpus_ppl": float(torch.exp(nll_tensor.mean()).item()),
+        "num_tokens": int(token_count_tensor.sum().item()),
+        "corpus_nll": float(corpus_nll.item()),
+        "corpus_ppl": float(torch.exp(corpus_nll).item()),
     }
 
 
@@ -439,10 +509,12 @@ def plot_aggregate(summary, path, setting_label):
     settings = summary["aggregate"].get("settings", {})
     if not settings:
         return
+    protocol = summary.get("config", {}).get("ppl_protocol", LEGACY_PROTOCOL)
+    ppl_key = "corpus_ppl" if protocol == ALIGNED_PROTOCOL else "mean_ppl"
     points = sorted(
         (
             float(record["mean_measured_budget"]),
-            float(record["mean_ppl"]),
+            float(record[ppl_key]),
             float(setting),
         )
         for setting, record in settings.items()
@@ -464,15 +536,22 @@ def plot_aggregate(summary, path, setting_label):
         )
     teacher = summary["aggregate"].get("teacher")
     if teacher:
+        teacher_label = (
+            "Full-attention corpus PPL"
+            if protocol == ALIGNED_PROTOCOL
+            else "Mean full-attention PPL"
+        )
         ax.axhline(
-            float(teacher["mean_ppl"]),
+            float(teacher[ppl_key]),
             color="#6b7280",
             linestyle="--",
             linewidth=1.0,
-            label="Mean full-attention PPL",
+            label=teacher_label,
         )
     ax.set_xlabel("Mean equivalent causal attention budget")
-    ax.set_ylabel("Mean sample PPL")
+    ax.set_ylabel("Corpus PPL" if protocol == ALIGNED_PROTOCOL else "Mean sample PPL")
+    if protocol == ALIGNED_PROTOCOL:
+        ax.set_xscale("log")
     ax.set_yscale("log")
     ax.grid(alpha=0.24)
     ax.legend()
@@ -489,7 +568,12 @@ def run_multisample(args, method, settings, evaluate_sample, setting_label):
     set_seed(args.seed)
     output_dir = args.output_root / method
     summary_path = output_dir / "summary.pt"
-    plot_path = output_dir / "mean_ppl_vs_budget.png"
+    plot_name = (
+        "corpus_ppl_vs_budget.png"
+        if args.ppl_protocol == ALIGNED_PROTOCOL
+        else "mean_ppl_vs_budget.png"
+    )
+    plot_path = output_dir / plot_name
     summary = load_or_create_summary(summary_path, method, args, settings)
 
     model, tokenizer, encoded, dtype, starts = load_model_and_tokens(args)
@@ -514,6 +598,7 @@ def run_multisample(args, method, settings, evaluate_sample, setting_label):
             device=args.device,
             start=start,
             seq_len=args.seq_len,
+            ppl_protocol=args.ppl_protocol,
         )
         prepared = prepare_sample(ctx, args.seq_len)
         pos_list, model_inputs, labels, ref_logits, teacher_nll, teacher_ppl = prepared
@@ -534,6 +619,7 @@ def run_multisample(args, method, settings, evaluate_sample, setting_label):
             "start": int(start),
             "teacher_nll": float(teacher_nll),
             "teacher_ppl": float(teacher_ppl),
+            "num_tokens": int(labels.numel()),
             "results": results,
         }
         save_summary(summary, summary_path)

@@ -100,3 +100,8 @@ For sample-parallel execution, disjoint outputs can be merged by token start
 with `aligned_ppl.merge_summaries`. The merge rejects duplicate or missing
 starts, mismatched methods, and mismatched setting grids before recomputing the
 token-weighted aggregate.
+
+To extend an existing curve with a disjoint setting grid, first produce a
+complete summary over the same starts, then use `aligned_ppl.merge_settings`.
+It requires matching methods, ordered starts, protocol, model, dtype, sequence
+length, token counts, and teacher NLLs; overlapping settings are rejected.

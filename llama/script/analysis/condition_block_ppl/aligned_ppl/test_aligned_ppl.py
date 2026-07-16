@@ -10,6 +10,7 @@ from ..multisample.common import (
     build_sample_context,
     effective_causal_budget,
 )
+from .merge_settings import merge_setting_summaries
 
 
 def _context(protocol):
@@ -90,3 +91,44 @@ def test_corpus_ppl_is_token_weighted():
         expected,
     )
     assert aggregate["teacher"]["num_tokens"] == 4
+
+
+def test_setting_merge_preserves_samples_and_extends_grid():
+    def summary(setting, student_nll):
+        samples = {}
+        for index, start in enumerate((0, 4)):
+            samples[index] = {
+                "start": start,
+                "teacher_nll": math.log(2),
+                "teacher_ppl": 2.0,
+                "num_tokens": 3,
+                "results": {
+                    setting: {
+                        "student_nll": student_nll,
+                        "student_ppl": math.exp(student_nll),
+                        "measured_budget": setting,
+                        "num_tokens": 3,
+                    }
+                },
+            }
+        return {
+            "method": "h2o",
+            "config": {
+                "ppl_protocol": ALIGNED_PROTOCOL,
+                "seq_len": 4,
+                "dtype": "bfloat16",
+                "model": "test",
+                "budgets": [setting],
+            },
+            "starts": [0, 4],
+            "settings": [setting],
+            "samples": samples,
+        }
+
+    merged = merge_setting_summaries(
+        [summary(0.5, math.log(3)), summary(0.25, math.log(4))]
+    )
+    assert merged["settings"] == [0.25, 0.5]
+    assert merged["config"]["budgets"] == [0.25, 0.5]
+    assert merged["aggregate"]["num_completed_samples"] == 2
+    assert set(merged["samples"][0]["results"]) == {0.25, 0.5}

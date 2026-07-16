@@ -176,8 +176,10 @@ conda run -n nanogpt python -m \
 These plots use a log-scale decode budget, show the measured Double-P point and
 the dense score, retain the available fixed-budget baselines, and collapse the
 available eager/Triton ConditionBlock sweeps into one non-dominated Pareto
-frontier. The raw per-dataset plots remain unchanged under each dataset's
-`eval_plots/` directory.
+frontier. Where both methods are available, the dark dashed curve is the joint
+ConditionBlock/Double-P frontier, so its marker colors identify which method
+owns each task-specific budget region. The raw per-dataset plots remain
+unchanged under each dataset's `eval_plots/` directory.
 
 The Double-P paper does not name a separate low-budget preset. Its Figure 10
 sweeps `p1` in `{0.85, 0.90, 0.95}` and `p2` in

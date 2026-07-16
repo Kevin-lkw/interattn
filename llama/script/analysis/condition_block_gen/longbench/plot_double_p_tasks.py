@@ -40,6 +40,10 @@ CONDITION_STYLE = {
     "color": "#E45756",
     "marker": "o",
 }
+JOINT_STYLE = {
+    "label": "CB/Double-P joint Pareto",
+    "color": "#111827",
+}
 DOUBLE_P_COLOR = "#0891B2"
 FULL_COLOR = "#111827"
 
@@ -164,12 +168,14 @@ def draw_panel(
     rows = task["rows"]
     full = task["full"]
     double_p = task["double_p"]
+    condition_rows = [
+        row for row in rows if row.get("method") in CONDITION_METHODS
+    ]
+    double_p_points = best_at_each_budget(task["double_p_rows"])
     for method, style in CURVE_METHODS.items():
         plot_curve(ax, [row for row in rows if row.get("method") == method], style)
 
-    condition_points = pareto_frontier(
-        [row for row in rows if row.get("method") in CONDITION_METHODS]
-    )
+    condition_points = pareto_frontier(condition_rows)
     if condition_points:
         ax.plot(
             [budget(row) for row in condition_points],
@@ -190,7 +196,6 @@ def draw_panel(
         label="Full attention",
         zorder=1,
     )
-    double_p_points = best_at_each_budget(task["double_p_rows"])
     double_p_frontier = pareto_frontier(double_p_points)
     if len(double_p_frontier) > 1:
         ax.plot(
@@ -198,6 +203,18 @@ def draw_panel(
             [float(row["score"]) for row in double_p_frontier],
             color=DOUBLE_P_COLOR,
             linewidth=1.5,
+            zorder=4,
+        )
+    if condition_points and double_p_points:
+        joint_frontier = pareto_frontier(condition_rows + double_p_points)
+        ax.plot(
+            [budget(row) for row in joint_frontier],
+            [float(row["score"]) for row in joint_frontier],
+            color=JOINT_STYLE["color"],
+            linestyle="--",
+            linewidth=1.9,
+            alpha=0.72,
+            label=JOINT_STYLE["label"],
             zorder=4,
         )
     ax.scatter(
@@ -262,6 +279,8 @@ def ordered_legend(tasks):
             labels.append(style["label"])
     if present & CONDITION_METHODS:
         labels.append(CONDITION_STYLE["label"])
+    if present & CONDITION_METHODS and "double_p" in present:
+        labels.append(JOINT_STYLE["label"])
     labels.extend(["Double-P", "Full attention"])
     return labels
 

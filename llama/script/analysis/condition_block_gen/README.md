@@ -179,6 +179,33 @@ available eager/Triton ConditionBlock sweeps into one non-dominated Pareto
 frontier. The raw per-dataset plots remain unchanged under each dataset's
 `eval_plots/` directory.
 
+The Double-P paper does not name a separate low-budget preset. Its Figure 10
+sweeps `p1` in `{0.85, 0.90, 0.95}` and `p2` in
+`{0.5, 0.6, 0.7, 0.8}`, while selecting `(0.95, 0.7)` as the balanced
+Llama-3.1-8B setting. The `(0.90, 0.50)` marker has no text annotation in the
+published figure, but is present as the remaining color/shape combination and
+is the figure's lowest-latency point. The low-budget subset used here is:
+
+```text
+(0.85, 0.5)  (0.90, 0.5)
+(0.85, 0.6)  (0.90, 0.6)  (0.95, 0.6)
+(0.85, 0.7)  (0.95, 0.7)
+```
+
+All seven configurations are therefore paper ablation points. The final point
+is the default run described above. Set `P1` and `P2` when calling
+`run_double_p.sh` for the other configurations. After refreshing every
+dataset's cached evaluation summary, aggregate and plot this sweep with:
+
+```bash
+conda run -n nanogpt python -m \
+  llama.script.analysis.condition_block_gen.longbench.summarize_double_p_sweep
+```
+
+The sweep plot shows all configurations as labeled points and connects only
+the non-dominated Double-P frontier; it does not treat the two-parameter grid
+as a one-dimensional curve.
+
 ## RULER
 
 ```bash

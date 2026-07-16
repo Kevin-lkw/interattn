@@ -125,11 +125,15 @@ def load_dataset(root, dataset, p1, p2):
     full_rows = [row for row in rows if row.get("method") == "full"]
     if len(full_rows) != 1:
         raise ValueError(f"Expected one full-attention row for {dataset}")
+    double_p_rows = [
+        row for row in rows if row.get("method") == "double_p" and valid_point(row)
+    ]
     return {
         "dataset": dataset,
         "rows": rows,
         "full": full_rows[0],
         "double_p": select_double_p(rows, p1, p2),
+        "double_p_rows": double_p_rows,
     }
 
 
@@ -149,7 +153,14 @@ def plot_curve(ax, rows, style):
     )
 
 
-def draw_panel(ax, task, *, annotate=True, title_size=10):
+def draw_panel(
+    ax,
+    task,
+    *,
+    annotate=True,
+    annotate_sweep=False,
+    title_size=10,
+):
     rows = task["rows"]
     full = task["full"]
     double_p = task["double_p"]
@@ -179,17 +190,38 @@ def draw_panel(ax, task, *, annotate=True, title_size=10):
         label="Full attention",
         zorder=1,
     )
+    double_p_points = best_at_each_budget(task["double_p_rows"])
+    double_p_frontier = pareto_frontier(double_p_points)
+    if len(double_p_frontier) > 1:
+        ax.plot(
+            [budget(row) for row in double_p_frontier],
+            [float(row["score"]) for row in double_p_frontier],
+            color=DOUBLE_P_COLOR,
+            linewidth=1.5,
+            zorder=4,
+        )
+    ax.scatter(
+        [budget(row) for row in double_p_points],
+        [float(row["score"]) for row in double_p_points],
+        marker="D",
+        s=38,
+        color=DOUBLE_P_COLOR,
+        edgecolor="white",
+        linewidth=0.45,
+        label="Double-P",
+        zorder=5,
+    )
+
     dp_budget = budget(double_p)
     dp_score = float(double_p["score"])
     ax.scatter(
         [dp_budget],
         [dp_score],
         marker="D",
-        s=48,
+        s=60,
         color=DOUBLE_P_COLOR,
         edgecolor="white",
-        linewidth=0.5,
-        label="Double-P",
+        linewidth=0.8,
         zorder=5,
     )
     if annotate:
@@ -201,6 +233,18 @@ def draw_panel(ax, task, *, annotate=True, title_size=10):
             fontsize=7,
             color=DOUBLE_P_COLOR,
         )
+    if annotate_sweep and len(double_p_points) > 1:
+        for index, row in enumerate(double_p_points):
+            if row is double_p:
+                continue
+            ax.annotate(
+                f"({float(row['p1']):g},{float(row['p2']):g})",
+                (budget(row), float(row["score"])),
+                xytext=(4, 5 if index % 2 == 0 else -10),
+                textcoords="offset points",
+                fontsize=6.5,
+                color=DOUBLE_P_COLOR,
+            )
     ax.set_title(
         f"{task['dataset']}\nDP {dp_score:.2f} | Dense {float(full['score']):.2f}",
         fontsize=title_size,
@@ -286,7 +330,7 @@ def plot_grid(path, tasks, dpi):
 
 def plot_individual(path, task, dpi):
     fig, ax = plt.subplots(figsize=(7.6, 5.0), constrained_layout=True)
-    draw_panel(ax, task, title_size=13)
+    draw_panel(ax, task, annotate_sweep=True, title_size=13)
     ax.set_xlabel("Effective decode attention budget")
     ax.set_ylabel("LongBench score")
     labels = ordered_legend([task])

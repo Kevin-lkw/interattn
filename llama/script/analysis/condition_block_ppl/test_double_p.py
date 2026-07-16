@@ -8,6 +8,10 @@ from ..condition_block_gen.methods.double_p import (
     top_p_mask,
 )
 from .multisample.run_double_p import _combined_full_chunk_budget
+from .runner_double_p_full_causal import (
+    causal_clustered_end,
+    full_causal_double_p_attention,
+)
 
 
 def test_top_p_mask_selects_minimal_prefix():
@@ -110,3 +114,63 @@ def test_aligned_budget_combines_dense_prefix_and_sparse_tail():
         tail_budget=tail_budget,
     )
     assert math.isclose(combined, 28 / 38)
+
+
+def test_full_causal_cluster_prefix_never_reaches_query_or_window():
+    for position in range(40):
+        clustered_end = causal_clustered_end(
+            position,
+            cluster_size=4,
+            sink_tokens=2,
+            window_size=3,
+        )
+        if clustered_end:
+            assert clustered_end <= position + 1 - 3
+            assert (clustered_end - 2) % 4 == 0
+
+
+def test_full_causal_dense_thresholds_match_every_causal_position():
+    torch.manual_seed(11)
+    n_kv_heads = 2
+    group_size = 3
+    seq_len = 17
+    head_dim = 8
+    q_all = torch.randn(n_kv_heads * group_size, seq_len, head_dim)
+    k_all = torch.randn(n_kv_heads, seq_len, head_dim)
+    v_all = torch.randn(n_kv_heads, seq_len, head_dim)
+    positions = list(range(seq_len))
+
+    output, stats = full_causal_double_p_attention(
+        q_all=q_all,
+        k_all=k_all,
+        v_all=v_all,
+        pos_list=positions,
+        cluster_size=3,
+        kmeans_iters=3,
+        p1=1.0,
+        p2=1.0,
+        sink_tokens=1,
+        window_size=2,
+    )
+    reference = torch.empty_like(output)
+    q_grouped = q_all.reshape(
+        n_kv_heads,
+        group_size,
+        seq_len,
+        head_dim,
+    )
+    for position in positions:
+        logits = torch.einsum(
+            "grd,gtd->grt",
+            q_grouped[:, :, position],
+            k_all[:, : position + 1],
+        ) / math.sqrt(head_dim)
+        weights = torch.softmax(logits, dim=-1)
+        reference[:, position] = torch.einsum(
+            "grt,gtd->grd",
+            weights,
+            v_all[:, : position + 1],
+        ).reshape(-1, head_dim)
+
+    assert torch.allclose(output, reference, atol=3e-6, rtol=3e-6)
+    assert stats["hybrid_tokens"] == stats["total_available"]

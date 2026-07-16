@@ -44,19 +44,21 @@ The default method grids are inherited from `multisample/`:
   capacity are split equally, every layer compressed.
 - QUEST: page size 16 and budgets `0.05 0.1 0.2 0.3 0.4 0.5 0.6 0.7`; first
   two layers dense.
-- Double-P: `(p1, p2)` settings `(0.50, 0.10)`, `(0.65, 0.15)`,
+- Full-causal Double-P: `(p1, p2)` settings `(0.10, 0.01)`, `(0.20, 0.025)`,
+  `(0.30, 0.05)`, `(0.40, 0.075)`, `(0.50, 0.10)`, `(0.65, 0.15)`,
   `(0.75, 0.20)`, `(0.85, 0.30)`, `(0.90, 0.50)`, `(0.95, 0.70)`, and
   `(1.00, 1.00)`; cluster size 32, four k-means iterations, four sink tokens,
-  a 64-token local window, and the first two layers dense.
+  a 64-token exact local window, and the first two layers dense.
 
-Double-P needs an explicit adaptation because the published algorithm starts
-after dense prefill. For each 2048-token chunk, the first 1536 scored query
-positions use dense attention and the remaining 511 use teacher-forced
-Double-P. PPL is still computed over all 2047 within-chunk targets. Its plotted
-budget combines the exact causal cost of the dense prefix and the measured
-sparse-tail cost. This preserves the fixed-chunk PPL labels and a
-prefill-then-continuation execution pattern, but it should be described as our
-aligned PPL adaptation rather than a metric reported in the Double-P paper.
+The published Double-P algorithm clusters a completed dense prompt before
+decode. The aligned PPL runner instead applies a full-causal extension to all
+2047 scored query positions, with no fixed dense prefill. Whenever another
+complete 32-token group has left the local window, it causally reruns k-means
+over that completed prefix. Tokens that have left the window but do not yet
+form a complete group remain exact until the next reclustering point. Thus no
+cluster consumed by query position `t` contains a key after `t`. This is our
+full-causal accuracy extension, not an execution mode reported in the
+Double-P paper.
 
 ## Sanity check
 

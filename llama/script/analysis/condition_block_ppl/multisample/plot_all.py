@@ -9,7 +9,7 @@ from .common import DEFAULT_OUTPUT_ROOT
 
 METHODS = [
     ("condition_block", "Condition-block", "o", "#2563eb"),
-    ("double_p", "Double-P", "P", "#0891b2"),
+    ("double_p_full_causal", "Double-P (full-causal)", "P", "#0891b2"),
     ("attention_topk", "Oracle attention top-k", "s", "#dc2626"),
     ("h2o", "H2O", "^", "#16a34a"),
     ("streamllm", "StreamLLM", "v", "#ea580c"),

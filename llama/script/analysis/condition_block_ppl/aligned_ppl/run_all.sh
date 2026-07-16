@@ -64,7 +64,7 @@ run_python -m script.analysis.condition_block_ppl.multisample.verify_dataset \
 
 run_method script.analysis.condition_block_ppl.multisample.run_attention_topk attention_topk
 run_method script.analysis.condition_block_ppl.multisample.run_condition_block condition_block
-run_method script.analysis.condition_block_ppl.multisample.run_double_p double_p
+run_method script.analysis.condition_block_ppl.multisample.run_double_p_full_causal double_p_full_causal
 run_method script.analysis.condition_block_ppl.multisample.run_h2o h2o
 run_method script.analysis.condition_block_ppl.multisample.run_streamllm streamllm
 run_method script.analysis.condition_block_ppl.multisample.run_quest quest
@@ -72,7 +72,7 @@ run_method script.analysis.condition_block_ppl.multisample.run_quest quest
 run_python -m script.analysis.condition_block_ppl.multisample.plot_all \
   --output-root "${OUTPUT_ROOT}" \
   --require-samples "${NUM_SAMPLES}" \
-  --methods condition_block double_p attention_topk h2o streamllm quest \
+  --methods condition_block double_p_full_causal attention_topk h2o streamllm quest \
   --metric corpus_ppl --xscale log --include-all-settings \
   2>&1 | tee "${LOG_DIR}/plot_all.log"
 

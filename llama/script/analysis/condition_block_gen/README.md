@@ -165,6 +165,20 @@ The summary reports both the repository-aligned 16-task macro average and the
 13-task subset used in the Double-P paper's LongBench table. The repository
 protocol adds `trec`, `samsum`, and `passage_count` to that paper subset.
 
+After the per-dataset `eval_dataset_plot.py` summaries exist, generate a clean
+4-by-4 task overview plus one presentation plot per task with:
+
+```bash
+conda run -n nanogpt python -m \
+  llama.script.analysis.condition_block_gen.longbench.plot_double_p_tasks
+```
+
+These plots use a log-scale decode budget, show the measured Double-P point and
+the dense score, retain the available fixed-budget baselines, and collapse the
+available eager/Triton ConditionBlock sweeps into one non-dominated Pareto
+frontier. The raw per-dataset plots remain unchanged under each dataset's
+`eval_plots/` directory.
+
 ## RULER
 
 ```bash

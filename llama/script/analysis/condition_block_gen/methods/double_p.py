@@ -823,5 +823,6 @@ def _double_p_config_metadata(method) -> dict:
         "p2": float(method.double_p_p2),
         "sink_tokens": int(method.double_p_sink_tokens),
         "window_size": int(method.double_p_window_size),
+        "full_attention_layers": int(method.full_attention_layers),
         "generated_tokens_exact": True,
     }

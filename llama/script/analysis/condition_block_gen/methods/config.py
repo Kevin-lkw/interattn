@@ -12,6 +12,12 @@ class GenerationMethod:
     condition_block_size: int | None = None
     condition_delta_mode: str = "range_bound"
     quest_page_size: int | None = None
+    double_p_cluster_size: int = 32
+    double_p_kmeans_iters: int = 4
+    double_p_p1: float = 0.95
+    double_p_p2: float = 0.70
+    double_p_sink_tokens: int = 4
+    double_p_window_size: int = 64
     kvpress_window_size: int = 64
     kvpress_kernel_size: int = 5
     kvpress_alpha_safeguard: float = 0.20
@@ -32,7 +38,10 @@ def build_method(args):
             quest_page_size = max(1, int(round(1.0 / budget)))
         elif quest_page_size is not None:
             budget = 1.0 / int(quest_page_size)
-    elif args.method not in {"condition_block", "condition_block_triton"} and budget is None:
+    elif (
+        args.method not in {"condition_block", "condition_block_triton", "double_p"}
+        and budget is None
+    ):
         budget = 1.0
     return GenerationMethod(
         name=args.method,
@@ -44,6 +53,12 @@ def build_method(args):
         condition_block_size=args.condition_block_size,
         condition_delta_mode=args.condition_delta_mode,
         quest_page_size=None if quest_page_size is None else int(quest_page_size),
+        double_p_cluster_size=int(getattr(args, "double_p_cluster_size", 32)),
+        double_p_kmeans_iters=int(getattr(args, "double_p_kmeans_iters", 4)),
+        double_p_p1=float(getattr(args, "double_p_p1", 0.95)),
+        double_p_p2=float(getattr(args, "double_p_p2", 0.70)),
+        double_p_sink_tokens=int(getattr(args, "double_p_sink_tokens", 4)),
+        double_p_window_size=int(getattr(args, "double_p_window_size", 64)),
         kvpress_window_size=int(args.kvpress_window_size),
         kvpress_kernel_size=int(args.kvpress_kernel_size),
         kvpress_alpha_safeguard=float(args.kvpress_alpha_safeguard),
@@ -64,6 +79,7 @@ def add_method_args(parser):
             "h2o",
             "condition_block",
             "condition_block_triton",
+            "double_p",
             "quest",
         ],
     )
@@ -78,6 +94,17 @@ def add_method_args(parser):
         default="range_bound",
     )
     parser.add_argument("--quest-page-size", type=int, default=None)
+    parser.add_argument(
+        "--double-p-cluster-size",
+        type=int,
+        default=32,
+        help="Target average number of prompt-middle tokens per Double-P k-means cluster.",
+    )
+    parser.add_argument("--double-p-kmeans-iters", type=int, default=4)
+    parser.add_argument("--double-p-p1", type=float, default=0.95)
+    parser.add_argument("--double-p-p2", type=float, default=0.70)
+    parser.add_argument("--double-p-sink-tokens", type=int, default=4)
+    parser.add_argument("--double-p-window-size", type=int, default=64)
     parser.add_argument("--kvpress-window-size", type=int, default=64)
     parser.add_argument("--kvpress-kernel-size", type=int, default=5)
     parser.add_argument("--kvpress-alpha-safeguard", type=float, default=0.20)

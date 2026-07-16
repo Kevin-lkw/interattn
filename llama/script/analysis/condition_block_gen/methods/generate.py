@@ -45,6 +45,18 @@ def generate_with_method(model, tokenizer, input_ids, attention_mask, method, de
             device=device,
             dataset=dataset,
         )
+    if method.kind == "double_p":
+        from .double_p import generate_double_p_cached
+
+        return generate_double_p_cached(
+            model=model,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            method=method,
+            device=device,
+            dataset=dataset,
+        )
     return generate_with_full_forward_patches(
         model=model,
         tokenizer=tokenizer,

@@ -19,6 +19,7 @@ LOCAL_PATCH_METHODS = {
     "attention_topk",
     "condition_block",
     "condition_block_triton",
+    "double_p",
     "quest",
 }
 
@@ -67,6 +68,21 @@ def validate_generation_args(args):
             raise ValueError("--budget is not used by condition_block; use --condition-block-size and --condition-eps.")
         if args.condition_block_size is None or args.condition_block_size <= 0:
             raise ValueError("--condition-block-size must be provided and > 0 for condition_block.")
+    elif args.method == "double_p":
+        if args.budget is not None:
+            raise ValueError(
+                "--budget is not used by double_p; use --double-p-p1/--double-p-p2."
+            )
+        if args.double_p_cluster_size <= 0:
+            raise ValueError("--double-p-cluster-size must be > 0")
+        if args.double_p_kmeans_iters <= 0:
+            raise ValueError("--double-p-kmeans-iters must be > 0")
+        if not 0 < float(args.double_p_p2) <= float(args.double_p_p1) <= 1:
+            raise ValueError("double_p requires 0 < p2 <= p1 <= 1")
+        if args.double_p_sink_tokens < 0:
+            raise ValueError("--double-p-sink-tokens must be >= 0")
+        if args.double_p_window_size < 0:
+            raise ValueError("--double-p-window-size must be >= 0")
     elif args.method == "quest":
         has_budget = args.budget is not None
         has_page_size = args.quest_page_size is not None
@@ -213,6 +229,14 @@ def output_path(args, benchmark_name):
         filename = (
             f"{method.name}_block={method.condition_block_size}"
             f"_eps={method.condition_eps:g}.jsonl"
+        )
+    elif method.kind == "double_p":
+        filename = (
+            f"{method.name}_cluster={method.double_p_cluster_size}"
+            f"_iters={method.double_p_kmeans_iters}"
+            f"_p1={method.double_p_p1:g}_p2={method.double_p_p2:g}"
+            f"_sink={method.double_p_sink_tokens}"
+            f"_window={method.double_p_window_size}.jsonl"
         )
     elif method.kind == "quest" and args.budget is None:
         filename = f"{method.name}_page={method.quest_page_size}.jsonl"

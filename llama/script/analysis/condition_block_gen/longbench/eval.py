@@ -159,6 +159,25 @@ def parse_run_name(path):
             "page_size": int(page_size),
             "budget": 1.0 / int(page_size),
         }
+    match = re.fullmatch(
+        r"(double_p)_cluster=([^_]+)_iters=([^_]+)_p1=([^_]+)_p2=([^_]+)"
+        r"_sink=([^_]+)_window=([^_]+)(?:_maxnew=\d+)?",
+        path.stem,
+    )
+    if match is not None:
+        method, cluster_size, kmeans_iters, p1, p2, sink_tokens, window_size = (
+            match.groups()
+        )
+        return {
+            "run": path.stem,
+            "method": method,
+            "cluster_size": int(cluster_size),
+            "kmeans_iters": int(kmeans_iters),
+            "p1": float(p1),
+            "p2": float(p2),
+            "sink_tokens": int(sink_tokens),
+            "window_size": int(window_size),
+        }
     match = re.fullmatch(r"(.+)_budget=([^_]+)(?:_maxnew=\d+)?", path.stem)
     if match is None:
         return {"run": path.stem}

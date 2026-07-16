@@ -100,10 +100,54 @@ def infer_condition_budgets(rows):
     }
 
 
+def infer_double_p_budgets(rows):
+    total_hybrid = 0
+    total_available = 0
+    decode_hybrid = 0
+    decode_available = 0
+    sample_budgets = []
+    generated_steps = []
+    for row in rows:
+        budget = row.get("double_p_budget")
+        if not budget:
+            continue
+        row_hybrid = int(budget.get("hybrid_tokens", 0))
+        row_available = int(budget.get("total_available", 0))
+        total_hybrid += row_hybrid
+        total_available += row_available
+        sample_budget = row.get("double_p_equiv_budget")
+        if sample_budget is not None:
+            sample_budgets.append(float(sample_budget))
+
+        steps = len(budget.get("by_step", []))
+        if steps <= 0:
+            continue
+        generated_steps.append(float(steps))
+        # The first generated token is sampled from the dense prefill logits.
+        # Remove that unavoidable step when comparing decode-only budgets.
+        row_units = float(budget.get("rows", 0)) / float(steps)
+        first_step_available = int(round(row_units * float(row.get("input_tokens", 0))))
+        row_decode_available = row_available - first_step_available
+        if row_decode_available > 0:
+            decode_hybrid += row_hybrid - first_step_available
+            decode_available += row_decode_available
+
+    return {
+        "effective_budget": float(total_hybrid / total_available) if total_available else None,
+        "effective_decode_budget": (
+            float(decode_hybrid / decode_available) if decode_available > 0 else None
+        ),
+        "mean_sample_budget": mean(sample_budgets),
+        "mean_generated_tokens": mean(generated_steps),
+    }
+
+
 def infer_effective_budget(run_info, rows):
     method = run_info.get("method")
     if method in CONDITION_BLOCK_METHODS:
         return infer_condition_budgets(rows)["effective_budget"]
+    if method == "double_p":
+        return infer_double_p_budgets(rows)["effective_budget"]
     if method == "full":
         return 1.0
     return run_info.get("budget")
@@ -124,6 +168,8 @@ def run_label(row):
         return f"{prefix} b{row['block_size']} eps={row['eps']:g}"
     if method == "quest":
         return f"QUEST {row['budget']:g}"
+    if method == "double_p":
+        return f"Double-P p1={row['p1']:g}, p2={row['p2']:g}"
     if "budget" in row:
         return f"{method} {row['budget']:g}"
     return row["run"]
@@ -197,6 +243,8 @@ def evaluate_dataset(args, cached_rows=None):
         run_info["score"] = score_rows(args.dataset, pred_rows, metadata, args.e)
         if run_info.get("method") in CONDITION_BLOCK_METHODS:
             run_info.update(infer_condition_budgets(pred_rows))
+        elif run_info.get("method") == "double_p":
+            run_info.update(infer_double_p_budgets(pred_rows))
         else:
             run_info["effective_budget"] = infer_effective_budget(run_info, pred_rows)
             run_info["effective_decode_budget"] = run_info["effective_budget"]
@@ -218,12 +266,15 @@ def sort_key(row):
         "kvpress_adakv_snapkv": 3,
         "h2o": 4,
         "quest": 5,
-        "condition_block": 6,
-        "condition_block_triton": 7,
+        "double_p": 6,
+        "condition_block": 7,
+        "condition_block_triton": 8,
     }
     return (
         method_order.get(row.get("method"), 99),
         row.get("budget", -1),
+        row.get("p1", -1),
+        row.get("p2", -1),
         row.get("block_size", -1),
         row.get("eps", -1),
         row["run"],
@@ -245,6 +296,12 @@ def write_csv(path, rows):
         "effective_decode_budget",
         "mean_sample_budget",
         "budget",
+        "cluster_size",
+        "kmeans_iters",
+        "p1",
+        "p2",
+        "sink_tokens",
+        "window_size",
         "block_size",
         "eps",
         "num_predictions",
@@ -270,6 +327,7 @@ def plot_score_vs_budget(path, rows, dataset, dpi, xscale="linear"):
         "kvpress_adakv_snapkv": "#B279A2",
         "h2o": "#F58518",
         "quest": "#54A24B",
+        "double_p": "#0891B2",
         "condition_block": "#E45756",
         "condition_block_triton": "#17A589",
     }
@@ -279,6 +337,7 @@ def plot_score_vs_budget(path, rows, dataset, dpi, xscale="linear"):
         "kvpress_adakv_snapkv": "AdaKV SnapKV",
         "h2o": "H2O",
         "quest": "QUEST",
+        "double_p": "Double-P",
     }
 
     condition_rows = [row for row in rows if row.get("method") in CONDITION_BLOCK_METHODS]
@@ -450,9 +509,7 @@ def main():
     print("Top rows:")
     scored_rows = [row for row in rows if row.get("score") is not None]
     for row in sorted(scored_rows, key=lambda item: item["score"], reverse=True)[:8]:
-        budget = row.get("effective_budget")
-        if row.get("method") in CONDITION_BLOCK_METHODS:
-            budget = row.get("effective_decode_budget")
+        budget = row.get("effective_decode_budget")
         budget_text = "n/a" if budget is None else f"{budget:.4f}"
         print(f"{row['score']:6.2f}  budget={budget_text}  n={row['num_predictions']:4d}  {row['label']}")
 

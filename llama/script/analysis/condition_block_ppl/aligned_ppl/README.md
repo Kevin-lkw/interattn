@@ -40,14 +40,23 @@ The default method grids are inherited from `multisample/`:
   `1.0 0.5 0.25 0.1 0.075 0.05`; first two layers dense.
 - StreamLLM: budgets `0.25 0.5 1.0`; four sink tokens through the shared sink
   implementation, every layer compressed.
+- H2O: cache-budget fractions `0.25 0.5 1.0`; heavy-hitter and recent-token
+  capacity are split equally, every layer compressed.
+- QUEST: page size 16 and budgets `0.05 0.1 0.2 0.3 0.4 0.5 0.6 0.7`; first
+  two layers dense.
+- Double-P: `(p1, p2)` settings `(0.50, 0.10)`, `(0.65, 0.15)`,
+  `(0.75, 0.20)`, `(0.85, 0.30)`, `(0.90, 0.50)`, `(0.95, 0.70)`, and
+  `(1.00, 1.00)`; cluster size 32, four k-means iterations, four sink tokens,
+  a 64-token local window, and the first two layers dense.
 
-The current n=20 run intentionally omits H2O and QUEST. Their shared runners
-remain available, but they are not required by `aligned_ppl/run_all.sh` and are
-not included in the combined plot.
-
-Double-P is excluded because its published algorithm is defined for sparse
-decode after dense prefill; applying it to every prefill query would be an
-unpublished extension rather than the traditional fixed-chunk protocol.
+Double-P needs an explicit adaptation because the published algorithm starts
+after dense prefill. For each 2048-token chunk, the first 1536 scored query
+positions use dense attention and the remaining 511 use teacher-forced
+Double-P. PPL is still computed over all 2047 within-chunk targets. Its plotted
+budget combines the exact causal cost of the dense prefix and the measured
+sparse-tail cost. This preserves the fixed-chunk PPL labels and a
+prefill-then-continuation execution pattern, but it should be described as our
+aligned PPL adaptation rather than a metric reported in the Double-P paper.
 
 ## Sanity check
 

@@ -64,6 +64,11 @@ def parse_args():
     parser.add_argument("--full-attention-layers", type=int, default=0)
     parser.add_argument("--skip-stats", action="store_true", help="Set CONDITION_BLOCK_SKIP_STATS=1 for condition-block methods.")
     parser.add_argument("--compile-selection", action="store_true", help="Set CONDITION_BLOCK_COMPILE_SELECTION=1 for Triton condition-block.")
+    parser.add_argument(
+        "--mixed-summaries",
+        action="store_true",
+        help="Set CONDITION_BLOCK_MIXED_SUMMARIES=1 for the exact mixed summary layout.",
+    )
     parser.add_argument("--triton-chunk-blocks", type=int, default=64)
     parser.add_argument("--hf-repo", default=None, help="Override LongBench v2 HF repo. Default tries THUDM then zai-org.")
     parser.add_argument("--split", default="train")
@@ -292,6 +297,8 @@ def main():
         os.environ["CONDITION_BLOCK_SKIP_STATS"] = "1"
     if args.compile_selection:
         os.environ["CONDITION_BLOCK_COMPILE_SELECTION"] = "1"
+    if args.mixed_summaries:
+        os.environ["CONDITION_BLOCK_MIXED_SUMMARIES"] = "1"
     os.environ.setdefault("CONDITION_BLOCK_TRITON_CHUNK_BLOCKS", str(args.triton_chunk_blocks))
 
     repo, dataset = load_longbench_v2(args.hf_repo, args.split)
@@ -386,6 +393,7 @@ def main():
                     payload["max_new_tokens"] = args.max_new_tokens
                     payload["condition_block_size"] = args.condition_block_size
                     payload["condition_eps"] = args.condition_eps
+                    payload["mixed_summaries"] = args.mixed_summaries
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                     handle.flush()
                     print(json.dumps(payload, ensure_ascii=False), flush=True)

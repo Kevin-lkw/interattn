@@ -732,3 +732,93 @@ python -m llama.script.analysis.condition_block_gen.longbench.run_all \
   --method condition_block_triton_term1_softmax \
   --condition-block-size 32 --condition-eps 0.1 --max-new-tokens 128
 ```
+
+## Exact-formulation HBM IO 优化路线
+
+目标是不改 condition 或 attention formulation，只减少 decode 每步从 HBM
+读取的 summary/cache 字节。所有实验都先与当前 FP32-summary Triton 路径做
+selection mask 和输出 sanity，再在独占 GPU 上测 cold-L2 stage latency 与
+CUDA-graph decode-only latency。只有稳定可复现的改动才进入生产路径。
+
+### Step 1：mixed-summary storage（已实现）
+
+生产 kernel 对不同 summary 的实际精度需求并不相同：
+
+- `k_bar` 参与 selection score，继续存 FP32；
+- `k_max/k_min` 是从 BF16 K page 逐元素选出的原值，存回 K 的 source dtype
+  不丢信息，kernel load 后仍转 FP32 计算；
+- `v_bar` 原来从 FP32 load 后立即转 BF16 再做 `tl.dot`，因此可提前存 BF16；
+- `v_norm_max/v_norm_all` 继续存 FP32。
+
+在 128K、block 32、8 KV heads、head_dim 128 下，每层每步 summary 主读量
+预计从约 64 MiB 降到 40 MiB（-37.5%）：selection 的 K summary 从 48 MiB
+降到 32 MiB，representative V 从 16 MiB 降到 8 MiB。实验开关：
+
+```bash
+CONDITION_BLOCK_MIXED_SUMMARIES=1
+```
+
+保留标准：production fused path 的 selected mask 完全一致、输出达到 BF16
+路径的严格数值一致，并且 64K/128K attention stage 或 decode-only 有稳定收益。
+
+实验结果（RTX PRO 6000 Blackwell，block 32，eps 0.1）：
+
+| cold-L2 stage（单层） | 64K FP32→mixed | speedup | 128K FP32→mixed | speedup |
+|---|---:|---:|---:|---:|
+| selection stats+reduce | 41.46→38.96 us | 1.064x | 64.05→55.62 us | **1.151x** |
+| production fused attention | 66.14→60.67 us | 1.090x | 96.10→81.77 us | **1.175x** |
+| dummy 0% sparse attention | 45.62→41.27 us | 1.105x | 63.58→57.16 us | 1.112x |
+
+测量使用两轮交替 FP32/mixed、每轮 10 warmup + 50 measured；benchmark
+新增 `--cold-l2`，每次计时前用 256 MiB CUDA buffer 驱逐 128 MiB L2，避免
+单层 summary 常驻 L2 造成假象：
+
+```bash
+python -m llama.script.analysis.condition_block_gen.condition_block_stage_latency \
+  --device cuda:0 --contexts 65536 131072 --block-size 32 \
+  --suffix-tokens 128 --selected-ratios 0 --warmup 10 --iters 50 --cold-l2 \
+  --mixed-summaries
+```
+
+CUDA-graph decode-only（128 fixed tokens，3 measured samples）：
+
+| context | FP32 summaries | mixed summaries | speedup |
+|---:|---:|---:|---:|
+| 64K | 2.0076 s | 2.0446 s（单个 2.137 s 抖动；median 2.0066→2.0108） | 无可测收益 |
+| 128K | 2.1901 s | 2.1665 s | **1.011x** |
+
+attention 降低 9-18%，但 e2e 仍被约 10.6 ms/step 的 model GEMV 稀释；因此
+128K 总体只改善约 1.1%，64K 落在系统噪声内。它仍作为显式、严格等价的
+HBM/显存优化保留，不改变默认 FP32 layout。
+
+Sanity：synthetic 的 bounds FP32 值、selected mask 和 fused BF16 output 均
+逐位一致（包含 0% 与近 100% selected 边界）；真实 LongBench
+NarrativeQA 10/10、GovReport 10/10 prediction 完全一致。注意该“严格等价”
+针对 production fused Triton path；legacy PyTorch stage2 不应与此 flag 混用。
+
+### Step 2：packed bounds + TMA/pipelined selection
+
+把同 dtype 的 `k_max/k_min` 打包为连续 bounds tensor，尝试用 Triton tensor
+descriptor/TMA 按 tile 搬入 SRAM，并让一个 persistent CTA 循环多个 chunk，
+用双缓冲重叠下一 tile 的 HBM load 与当前 tile 的 dot/reduce。这里不改变读
+字节，只改善 transaction 合并、load stream 数和 latency hiding。
+
+保留标准：cold-L2 selection-stats 至少稳定降低 5%，且 64K/128K decode-only
+有可测收益；否则只记录结果并撤回实验代码。
+
+### Step 3：cache policy
+
+对一次性流式 summary/page load 尝试 `.cg`/`evict_first`，对同层随后立即消费
+的 `s/delta/partial` 使用 `evict_last`。不把 128K summaries 设为 persisting
+L2：单层 working set 已接近 128 MiB，而所有层总 summary 远超 80 MiB
+persisting 上限，强占 L2 还可能挤掉模型权重。
+
+保留标准：多轮 stage 与 decode-only 都同方向，且没有让 model GEMV 退化。
+
+### Step 4：multi-query/speculative amortization
+
+若单-query kernel 已接近 HBM/launch 上限，唯一仍可能带来数量级变化的 exact
+formulation 方向是一次处理 K 个 query：summary tile 只搬一次，在 SRAM/
+register 中同时完成 K 个 query 的 selection 与 attention。这需要 speculative
+decode 或 multi-token verification 配合，属于模型调度层改造；先用 synthetic
+stage prototype 测 K=2/4 的 IO 摊薄上限，再决定是否接入完整 generation。

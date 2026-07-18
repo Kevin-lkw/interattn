@@ -405,6 +405,32 @@ def _ensure_paged_layout(x, block_size):
     return x.contiguous()
 
 
+def _summary_storage_dtypes(source_dtype):
+    """Choose summary storage dtypes without changing fused-kernel arithmetic.
+
+    The production kernel consumes ``k_bar`` in FP32, but ``v_bar`` is rounded
+    to BF16 immediately before the representative-value dot product.  The
+    coordinate extrema are values copied from the source K tensor, so storing
+    them in that source dtype is lossless.  This mixed layout therefore removes
+    bytes that the fused path would otherwise widen and then narrow again.
+
+    ``CONDITION_BLOCK_SUMMARY_DTYPE`` remains the older uniform, potentially
+    approximate layout.  Mixing the two modes would make the accuracy contract
+    ambiguous, so reject that combination explicitly.
+    """
+    summary_dtype_name = os.environ.get("CONDITION_BLOCK_SUMMARY_DTYPE", "float32")
+    summary_dtype = getattr(torch, summary_dtype_name)
+    mixed = os.environ.get("CONDITION_BLOCK_MIXED_SUMMARIES") == "1"
+    if not mixed:
+        return summary_dtype, summary_dtype, summary_dtype
+    if summary_dtype != torch.float32:
+        raise ValueError(
+            "CONDITION_BLOCK_MIXED_SUMMARIES=1 requires "
+            "CONDITION_BLOCK_SUMMARY_DTYPE=float32 (or unset)."
+        )
+    return torch.float32, torch.bfloat16, source_dtype
+
+
 def _build_prompt_blocks(k_all, v_all, block_size):
     k_block_attn, n_blocks = _pad_blocks(k_all, block_size)
     v_block_attn, _ = _pad_blocks(v_all, block_size)
@@ -428,21 +454,18 @@ def _build_prompt_blocks(k_all, v_all, block_size):
     v_norm = torch.linalg.vector_norm(v_block_attn, dim=-1, dtype=torch.float32)
     v_norm = v_norm.masked_fill(~valid_token.view(1, n_blocks, block_size), float("-inf"))
 
-    # BF16 summaries halve the per-step summary read (the dominant attention
-    # read at long context) at the cost of slightly perturbing borderline
-    # selection decisions; FP32 stays the default.
-    summary_dtype = getattr(
-        torch, os.environ.get("CONDITION_BLOCK_SUMMARY_DTYPE", "float32")
+    k_bar_dtype, v_bar_dtype, bound_dtype = _summary_storage_dtypes(
+        k_block_attn.dtype
     )
     return {
         "k_block_attn": k_block_attn,
         "v_block_attn": v_block_attn,
         "token_idx": token_idx,
         "valid_token": valid_token,
-        "k_bar": (k_sum / size_float.view(1, n_blocks, 1)).to(summary_dtype),
-        "v_bar": (v_sum / size_float.view(1, n_blocks, 1)).to(summary_dtype),
-        "k_max": k_for_max.amax(dim=2).float().to(summary_dtype),
-        "k_min": k_for_min.amin(dim=2).float().to(summary_dtype),
+        "k_bar": (k_sum / size_float.view(1, n_blocks, 1)).to(k_bar_dtype),
+        "v_bar": (v_sum / size_float.view(1, n_blocks, 1)).to(v_bar_dtype),
+        "k_max": k_for_max.amax(dim=2).to(bound_dtype),
+        "k_min": k_for_min.amin(dim=2).to(bound_dtype),
         "v_norm_max": v_norm.amax(dim=2),
         "v_norm_all": v_norm.amax(dim=2).amax(dim=-1),
         "block_valid_counts": size,
@@ -1031,6 +1054,11 @@ def _condition_block_decode_output(
         and os.environ.get("CONDITION_BLOCK_COMPACT_SDPA_STAGE2") != "1"
         and os.environ.get("CONDITION_BLOCK_LEGACY_STAGE2") != "1"
     )
+    if os.environ.get("CONDITION_BLOCK_MIXED_SUMMARIES") == "1" and not use_fused_triton:
+        raise ValueError(
+            "CONDITION_BLOCK_MIXED_SUMMARIES=1 requires the fused Triton "
+            "stage2 path with block_size 16 or 32."
+        )
     if term1_mass_exp and not use_fused_triton:
         raise ValueError(
             "term1-softmax requires the fused Triton stage2 path with "

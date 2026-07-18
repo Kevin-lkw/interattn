@@ -249,6 +249,15 @@ def parse_args():
             "registers, so bfloat16 halves summary IO without touching kernel code."
         ),
     )
+    parser.add_argument(
+        "--mixed-summaries",
+        action="store_true",
+        help=(
+            "Use the exact mixed production layout: FP32 k_bar, source-dtype "
+            "k_max/k_min, and BF16 v_bar. This cannot be combined with "
+            "--summary-dtype bfloat16."
+        ),
+    )
     parser.add_argument("--contexts", nargs="+", type=int, default=[32768, 65536, 131072])
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--suffix-tokens", type=int, default=0)
@@ -264,27 +273,50 @@ def parse_args():
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--cold-l2",
+        action="store_true",
+        help="Evict the synthetic summaries from L2 before every timed call.",
+    )
+    parser.add_argument(
+        "--l2-flush-mib",
+        type=int,
+        default=256,
+        help="Size of the CUDA buffer used by --cold-l2 (default: 256 MiB).",
+    )
     parser.add_argument("--include-full-sdpa", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("/tmp/condition_block_stage_latency.jsonl"))
     return parser.parse_args()
 
 
-def cuda_time_ms(fn, warmup, iters):
+def cuda_time_ms(fn, warmup, iters, l2_flush=None):
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush.add_(1)
         fn()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for _ in range(iters):
+        if l2_flush is not None:
+            l2_flush.add_(1)
+        starts[_].record()
         fn()
-    end.record()
+        ends[_].record()
     torch.cuda.synchronize()
-    return float(start.elapsed_time(end)) / float(iters)
+    return sum(start.elapsed_time(end) for start, end in zip(starts, ends)) / float(iters)
 
 
 def build_synthetic_prefix(
-    *, n_kv_heads, context_tokens, block_size, head_dim, dtype, device, summary_dtype=torch.float32
+    *,
+    n_kv_heads,
+    context_tokens,
+    block_size,
+    head_dim,
+    dtype,
+    device,
+    summary_dtype=torch.float32,
+    mixed_summaries=False,
 ):
     n_blocks = math.ceil(context_tokens / block_size)
     total_tokens = n_blocks * block_size
@@ -309,13 +341,21 @@ def build_synthetic_prefix(
     k_for_min = k_block.masked_fill(~valid, float("inf"))
     v_norm = torch.linalg.vector_norm(v_block, dim=-1, dtype=torch.float32)
     v_norm = v_norm.masked_fill(~valid_tokens.view(1, n_blocks, block_size), float("-inf"))
+    if mixed_summaries:
+        if summary_dtype != torch.float32:
+            raise ValueError("mixed summaries require --summary-dtype float32")
+        k_bar_dtype = torch.float32
+        v_bar_dtype = torch.bfloat16
+        bound_dtype = dtype
+    else:
+        k_bar_dtype = v_bar_dtype = bound_dtype = summary_dtype
     return {
         "k_block_attn": k_block,
         "v_block_attn": v_block,
-        "k_bar": k_bar.to(summary_dtype),
-        "v_bar": v_bar.to(summary_dtype),
-        "k_max": k_for_max.amax(dim=2).float().to(summary_dtype),
-        "k_min": k_for_min.amin(dim=2).float().to(summary_dtype),
+        "k_bar": k_bar.to(k_bar_dtype),
+        "v_bar": v_bar.to(v_bar_dtype),
+        "k_max": k_for_max.amax(dim=2).to(bound_dtype),
+        "k_min": k_for_min.amin(dim=2).to(bound_dtype),
         "v_norm_max": v_norm.amax(dim=2),
         "v_norm_all": v_norm.amax(dim=2).amax(dim=-1),
         "block_valid_counts": counts,
@@ -430,6 +470,15 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     summary_dtype = torch.bfloat16 if args.summary_dtype == "bfloat16" else torch.float32
+    if args.mixed_summaries and summary_dtype != torch.float32:
+        raise ValueError("--mixed-summaries cannot be combined with --summary-dtype bfloat16")
+    l2_flush = None
+    if args.cold_l2:
+        l2_flush = torch.empty(
+            args.l2_flush_mib * 1024 * 1024,
+            device=device,
+            dtype=torch.uint8,
+        )
 
     with args.output.open("w", encoding="utf-8") as handle:
         for context_tokens in args.contexts:
@@ -441,6 +490,7 @@ def main():
                 dtype=dtype,
                 device=device,
                 summary_dtype=summary_dtype,
+                mixed_summaries=args.mixed_summaries,
             )
             q_grouped = torch.randn(
                 (args.kv_heads, group_size, 1, args.head_dim),
@@ -460,6 +510,8 @@ def main():
                 "context_tokens": int(context_tokens),
                 "block_size": int(args.block_size),
                 "summary_dtype": args.summary_dtype,
+                "mixed_summaries": args.mixed_summaries,
+                "cold_l2": args.cold_l2,
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_stats_reduce",
@@ -473,6 +525,7 @@ def main():
                     ),
                     args.warmup,
                     args.iters,
+                    l2_flush,
                 ),
             }
             print(json.dumps(row), flush=True)
@@ -482,6 +535,8 @@ def main():
                 "context_tokens": int(context_tokens),
                 "block_size": int(args.block_size),
                 "summary_dtype": args.summary_dtype,
+                "mixed_summaries": args.mixed_summaries,
+                "cold_l2": args.cold_l2,
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_materialize",
@@ -495,6 +550,7 @@ def main():
                     ),
                     args.warmup,
                     args.iters,
+                    l2_flush,
                 ),
             }
             print(json.dumps(row), flush=True)
@@ -516,6 +572,8 @@ def main():
                 "context_tokens": int(context_tokens),
                 "block_size": int(args.block_size),
                 "summary_dtype": args.summary_dtype,
+                "mixed_summaries": args.mixed_summaries,
+                "cold_l2": args.cold_l2,
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "production_fused_selection_attention",
@@ -538,6 +596,7 @@ def main():
                     ),
                     args.warmup,
                     args.iters,
+                    l2_flush,
                 ),
             }
             print(json.dumps(row), flush=True)
@@ -547,13 +606,17 @@ def main():
                 row = {
                     "context_tokens": int(context_tokens),
                     "block_size": int(args.block_size),
+                    "summary_dtype": args.summary_dtype,
+                    "mixed_summaries": args.mixed_summaries,
                     "n_blocks": int(prefix["block_valid_counts"].numel()),
                     "suffix_tokens": int(args.suffix_tokens),
+                    "cold_l2": args.cold_l2,
                     "stage": "full_sdpa_decode_attention",
                     "latency_ms": cuda_time_ms(
                         lambda: run_full_sdpa(q_grouped, prefix),
                         args.warmup,
                         args.iters,
+                        l2_flush,
                     ),
                 }
                 print(json.dumps(row), flush=True)
@@ -577,11 +640,14 @@ def main():
                 row = {
                     "context_tokens": int(context_tokens),
                     "block_size": int(args.block_size),
+                    "summary_dtype": args.summary_dtype,
+                    "mixed_summaries": args.mixed_summaries,
                     "n_blocks": int(prefix["block_valid_counts"].numel()),
                     "suffix_tokens": int(args.suffix_tokens),
                     "stage": "dummy_sparse_attention",
                     "selected_ratio": float(ratio),
                     "selected_blocks": int(selected[0].sum().item()),
+                    "cold_l2": args.cold_l2,
                     "theoretical_candidate_fraction": theoretical_fraction,
                     "latency_ms": cuda_time_ms(
                         lambda selected=selected: run_sparse_attention_dummy(
@@ -597,6 +663,7 @@ def main():
                         ),
                         args.warmup,
                         args.iters,
+                        l2_flush,
                     ),
                 }
                 print(json.dumps(row), flush=True)

@@ -848,10 +848,43 @@ Blackwell PTX 不允许在同一 load 上组合 `.cg` 与 `evict_first`，因此
 分支已撤回，只保留本记录。原因是 `s/delta/partial` 很小且本来就能停留在
 L2，而流式 summary 的访问顺序已经规则；硬件默认 cache policy 足够好。
 
-### Step 4：multi-query/speculative amortization
+### Step 4：multi-query/speculative amortization（上限已测，暂不接入）
 
 若单-query kernel 已接近 HBM/launch 上限，唯一仍可能带来数量级变化的 exact
 formulation 方向是一次处理 K 个 query：summary tile 只搬一次，在 SRAM/
 register 中同时完成 K 个 query 的 selection 与 attention。这需要 speculative
 decode 或 multi-token verification 配合，属于模型调度层改造；先用 synthetic
 stage prototype 测 K=2/4 的 IO 摊薄上限，再决定是否接入完整 generation。
+
+已新增独立 benchmark：
+
+```bash
+python -m llama.script.analysis.condition_block_gen.condition_block_multi_query_latency \
+  --device cuda:0 --contexts 65536 131072 --queries 1 2 4 \
+  --multi-warps 2 4 8 --warmup 10 --iters 50
+```
+
+它把 query 排成 `[KV head, K, GQA group, head_dim]`，每个 program 只加载一次
+mixed `k_bar` 与 TMA bounds，然后同时产生 K 组 `s/delta/normalizer`。比较：
+
+1. `K × single cold`：模拟 query 之间模型权重把 summaries 逐出 L2；
+2. `sequential K after one flush`：K 次现有 kernel 共享 warm L2 的强基线；
+3. 单个 multi-query kernel。
+
+保持与生产 kernel 相同 2 warps 时，`s/delta/global stats` 逐位一致：
+
+| context | K | K×single cold | sequential warm | multi-query | vs K×cold | vs warm |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64K | 2 | 86.16 us | 69.73 us | 88.82 us | 0.970x | 0.785x |
+| 128K | 2 | 116.62 us | 102.17 us | 116.40 us | 1.002x | 0.878x |
+| 128K | 4 | 233.24 us | 187.60 us | 4682.53 us | 0.050x | 0.040x |
+
+K=4/2-warps 因 `QUERY_ROWS=16` 的大三维中间量发生严重 register spill；8 warps
+可降到 267.20 us，但会改变浮点归约顺序，而且仍慢于 233.24 us cold baseline
+和 187.60 us warm baseline。K=2 也没有兑现 IO 摊薄。
+
+结论：当前 exact range-bound selection 不只是 summary HBM IO；三组 FP32
+query-summary reduction、`s/delta` materialization 和寄存器/occupancy 都随 K
+线性增长。仅把 K 个 query 塞进同一 program 不值得改 speculative generation。
+下一次只有在能把 bound 改写为 tensor-core GEMM、或把 query tile 分片后仍能
+共享 SRAM summaries 时再重开；本轮只保留 benchmark，不改 production 路径。

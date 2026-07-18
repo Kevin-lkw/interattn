@@ -1,8 +1,8 @@
 # Aligned WikiText-2 PPL
 
 This suite implements the fixed-chunk perplexity protocol commonly used in
-LLaMA compression and quantization work. It intentionally does not implement
-the decode-tail experiment.
+LLaMA compression and quantization work and scores every within-chunk
+next-token target.
 
 ## Protocol
 

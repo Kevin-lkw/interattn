@@ -1,7 +1,7 @@
 # Double-P implementation map
 
 This repository contains one shared eager-PyTorch Double-P attention core and
-three evaluation protocols.  None of these paths is a Triton/fused latency
+two evaluation protocols.  Neither path is a Triton/fused latency
 implementation; timing from them must not be reported as Double-P speedup.
 
 ## Algorithm and shared invariants
@@ -35,12 +35,11 @@ The stable public helpers are:
 | Protocol | Entry point | Dense prefill | Scored queries | Clustering behavior |
 | --- | --- | --- | --- | --- |
 | LongBench generation | `condition_block_gen/methods/double_p.py` | Yes | Autoregressive decode | Cluster the completed prompt once per layer/KV head and cache it |
-| Decode-faithful PPL | `condition_block_ppl/runner_double_p.py` | Yes | Teacher-forced continuation only | Cluster the fixed prompt; continuation is never visible to prompt k-means |
 | Full-causal PPL extension | `condition_block_ppl/runner_double_p_full_causal.py` | No fixed prefill | Every fixed-chunk causal query | Rebuild clusters after each complete `cluster_size` group leaves the exact window |
 
-LongBench and decode-faithful PPL match the paper's prompt-then-decode use
-case.  Full-causal PPL is a repository extension for alignment with
-traditional fixed-chunk perplexity; it should be named explicitly in tables.
+LongBench matches the paper's prompt-then-decode use case.  PPL uses only the
+full-causal repository extension so that every token in the traditional
+fixed-chunk protocol is scored; it should be named explicitly in tables.
 
 In cached generation, sink tokens, the prompt-tail window, and all generated
 tokens remain exact.  The first generated token comes from dense prefill
@@ -53,7 +52,7 @@ logits.  Decode-only budget reports remove that unavoidable first step.
 - threshold parsing and validation;
 - stable PPL result keys;
 - the paper and dense-anchor settings;
-- decode-faithful and full-causal default threshold grids;
+- the full-causal default threshold grid;
 - validation that PPL grids have unique `p1` values.
 
 The unique-`p1` constraint is an output-schema requirement: multisample PPL
@@ -84,15 +83,6 @@ Related files:
 
 ## PPL workflows
 
-Decode-faithful single-sample diagnostic:
-
-```bash
-python -m llama.script.analysis.condition_block_ppl.runner_double_p \
-  --model meta-llama/Llama-3.1-8B \
-  --seq-len 1024 --prompt-len 768 \
-  --p-settings 0.90:0.50 0.95:0.70 1.0:1.0
-```
-
 Traditional full-chunk aligned PPL uses the full-causal extension:
 
 ```bash
@@ -100,9 +90,6 @@ python -m \
   llama.script.analysis.condition_block_ppl.multisample.run_double_p_full_causal \
   --help
 ```
-
-The decode-faithful multisample counterpart is
-`condition_block_ppl/multisample/run_double_p.py`.
 
 ## Verification
 
@@ -113,10 +100,9 @@ python -m pytest -q \
 python -m py_compile \
   llama/script/analysis/condition_block_gen/methods/double_p.py \
   llama/script/analysis/condition_block_ppl/double_p_config.py \
-  llama/script/analysis/condition_block_ppl/runner_double_p.py \
   llama/script/analysis/condition_block_ppl/runner_double_p_full_causal.py
 ```
 
 The unit tests cover top-p prefix semantics, k-means summary conservation,
-dense-equivalent GQA attention, full-chunk budget composition, causal cluster
-boundaries, full-causal dense equivalence, and threshold-grid validation.
+dense-equivalent GQA attention, causal cluster boundaries, full-causal dense
+equivalence, and threshold-grid validation.

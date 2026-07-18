@@ -1,9 +1,9 @@
 """Shared Double-P threshold configuration helpers.
 
-The PPL entry points key result rows by ``p1``, so each threshold grid must
-use a unique ``p1`` value.  Keeping parsing, validation, and the default grids
-here prevents the decode-faithful and full-causal runners from silently
-drifting apart.
+The aligned full-causal PPL entry point keys result rows by ``p1``, so each
+threshold grid must use a unique ``p1`` value.  Keeping parsing, validation,
+and the default grid here prevents runner and result-schema settings from
+silently drifting apart.
 """
 
 from __future__ import annotations
@@ -15,7 +15,11 @@ from collections.abc import Iterable
 PAPER_P_SETTING = (0.95, 0.70)
 DENSE_P_SETTING = (1.00, 1.00)
 
-DEFAULT_DECODE_FAITHFUL_P_SETTINGS = (
+DEFAULT_FULL_CAUSAL_P_SETTINGS = (
+    (0.10, 0.01),
+    (0.20, 0.025),
+    (0.30, 0.05),
+    (0.40, 0.075),
     (0.50, 0.10),
     (0.65, 0.15),
     (0.75, 0.20),
@@ -23,14 +27,6 @@ DEFAULT_DECODE_FAITHFUL_P_SETTINGS = (
     (0.90, 0.50),
     PAPER_P_SETTING,
     DENSE_P_SETTING,
-)
-
-DEFAULT_FULL_CAUSAL_P_SETTINGS = (
-    (0.10, 0.01),
-    (0.20, 0.025),
-    (0.30, 0.05),
-    (0.40, 0.075),
-    *DEFAULT_DECODE_FAITHFUL_P_SETTINGS,
 )
 
 

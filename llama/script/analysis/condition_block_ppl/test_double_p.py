@@ -14,7 +14,6 @@ from .double_p_config import (
     p2_by_unique_p1,
     parse_p_setting,
 )
-from .multisample.run_double_p import _combined_full_chunk_budget
 from .runner_double_p_full_causal import (
     causal_clustered_end,
     full_causal_double_p_attention,
@@ -123,23 +122,6 @@ def test_dense_thresholds_match_causal_gqa_attention():
 
     assert torch.allclose(output, reference, atol=2e-6, rtol=2e-6)
     assert stats["hybrid_tokens"] == stats["total_available"]
-
-
-def test_aligned_budget_combines_dense_prefix_and_sparse_tail():
-    # Prefix positions 0 and 1 cost (1 + 2) * 2 heads * 3 layers = 18.
-    tail_budget = {
-        "aggregate": {
-            "hybrid_tokens": 10,
-            "total_available": 20,
-        }
-    }
-    combined = _combined_full_chunk_budget(
-        num_heads=2,
-        num_layers=3,
-        prefix_positions=[0, 1],
-        tail_budget=tail_budget,
-    )
-    assert math.isclose(combined, 28 / 38)
 
 
 def test_full_causal_cluster_prefix_never_reaches_query_or_window():

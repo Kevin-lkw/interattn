@@ -11,6 +11,7 @@
 | --- | --- |
 | `condition_block.py` | 单层分析入口：计算各 cluster 的 condition，并按阈值决定压缩或展开 |
 | `runner_cond_block.py` | condition-block 多层 PPL runner |
+| `runner_cond_block_sink_recent.py` | 首个 sink block 和末个 recent block 固定展开，其余 block 按 condition 判断的 PPL 变体 |
 | `condition_block_hierarchy.py` / `runner_cond_block_hierarchy.py` | 层次化 block 变体 |
 | `condition_block_single.py` | 单次 forward 实现与 sanity check |
 | `condition_block_optim.py` | 更高效的 streaming/SDPA 实现 |
@@ -43,6 +44,9 @@ python -m script.analysis.condition_block_ppl.condition_block --help
 
 # 多层 PPL sweep
 python -m script.analysis.condition_block_ppl.runner_cond_block --help
+
+# sink/recent block 固定展开的多层 PPL sweep
+python -m script.analysis.condition_block_ppl.runner_cond_block_sink_recent --help
 
 # 多样本评测
 python -m script.analysis.condition_block_ppl.multisample.run_condition_block --help

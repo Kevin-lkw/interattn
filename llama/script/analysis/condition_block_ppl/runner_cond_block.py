@@ -42,9 +42,11 @@ def _model_output_name(model):
     return str(model).rstrip("/").split("/")[-1]
 
 
-def parse_args():
+def parse_args(
+    description="Run condition-thresholded block hybrid attention for all layers.",
+):
     parser = argparse.ArgumentParser(
-        description="Run condition-thresholded block hybrid attention for all layers."
+        description=description
     )
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B")
     parser.add_argument("--dataset", type=str, default="wikitext")
@@ -116,7 +118,7 @@ def parse_args():
     return args
 
 
-def _resolve_output_dir(args):
+def _resolve_output_dir(args, method_name="condition_block_runner"):
     if args.output_dir is not None:
         base_dir = args.output_dir
     else:
@@ -126,7 +128,7 @@ def _resolve_output_dir(args):
             "result",
             _model_output_name(args.model),
             sample_tag,
-            "condition_block_runner",
+            method_name,
         )
     out_dir = os.path.join(base_dir, f"budget={args.budget:g}")
     os.makedirs(out_dir, exist_ok=True)
@@ -283,6 +285,7 @@ def _batched_hybrid_outputs_for_queries(
     eps,
     delta_mode,
     share_selection_across_heads=False,
+    force_first_last_blocks=False,
 ):
     n_heads, n_query, head_dim = q_pos.shape
     n_blocks = prefix["block_starts"].numel()
@@ -344,6 +347,19 @@ def _batched_hybrid_outputs_for_queries(
     else:
         selected = (condition > eps) & cluster_exists.unsqueeze(0)
 
+    forced = torch.zeros_like(selected)
+    newly_forced = torch.zeros_like(selected)
+    if force_first_last_blocks:
+        block_idx = torch.arange(n_blocks, device=pos_tensor.device)
+        last_visible_block = cluster_exists.long().sum(dim=-1) - 1
+        forced_by_query = cluster_exists & (
+            (block_idx.unsqueeze(0) == 0)
+            | (block_idx.unsqueeze(0) == last_visible_block.unsqueeze(1))
+        )
+        forced = forced_by_query.unsqueeze(0).expand(n_heads, -1, -1)
+        newly_forced = forced & ~selected
+        selected = selected | forced
+
     token_selected = selected.unsqueeze(-1) & token_visible.unsqueeze(0)
     token_logits = block_logits.masked_fill(~token_selected, float("-inf"))
     cluster_logits = z_logits.masked_fill(selected | ~cluster_exists.unsqueeze(0), float("-inf"))
@@ -380,6 +396,22 @@ def _batched_hybrid_outputs_for_queries(
         "hybrid_tokens": int(hybrid_tokens.item()),
         "total_available": int(total_available.item()),
     }
+    if force_first_last_blocks:
+        stats.update(
+            {
+                "forced_clusters": int(forced.sum().item()),
+                "forced_tokens": int(
+                    (forced.long() * size.view(1, n_query, n_blocks)).sum().item()
+                ),
+                "newly_forced_clusters": int(newly_forced.sum().item()),
+                "newly_forced_tokens": int(
+                    (
+                        newly_forced.long()
+                        * size.view(1, n_query, n_blocks)
+                    ).sum().item()
+                ),
+            }
+        )
     return output, stats
 
 
@@ -391,6 +423,7 @@ def build_condition_block_patch(
     block_size,
     eps,
     delta_mode="range_bound",
+    force_first_last_blocks=False,
 ):
     q_all = artifacts["q"].to(ctx.device)[0]
     k_all = artifacts["k"].to(ctx.device)[0]
@@ -425,6 +458,7 @@ def build_condition_block_patch(
             eps=eps,
             delta_mode=delta_mode,
             share_selection_across_heads=True,
+            force_first_last_blocks=force_first_last_blocks,
         )
         output[query_heads] = group_output
         _merge_stats(budget_stats, group_stats)
@@ -566,6 +600,9 @@ def run_for_eps(ctx, args, eps, layer_idx_list, pos_list, model_inputs):
             block_size=args.block_size,
             eps=eps,
             delta_mode=args.delta_mode,
+            force_first_last_blocks=getattr(
+                args, "force_first_last_blocks", False
+            ),
         )
         layer_to_patch[layer_idx] = patch_hidden
         budget_stats[int(layer_idx)] = _summarize_budget(
@@ -599,9 +636,16 @@ def run_for_eps(ctx, args, eps, layer_idx_list, pos_list, model_inputs):
     }
 
 
-def main():
+def main(
+    args=None,
+    *,
+    output_method="condition_block_runner",
+    runner_label="condition-block runner",
+    summary_filename="runner_cond_block_summary.pt",
+):
     set_seed(42)
-    args = parse_args()
+    if args is None:
+        args = parse_args()
     if args.eval_start != args.start:
         args = copy.copy(args)
         args.start = args.eval_start
@@ -618,7 +662,7 @@ def main():
     )
     model_inputs = move_model_inputs_to_device(ctx.inputs, ctx.device)
     labels = get_tail_labels(ctx, pos_list, ctx.device)
-    output_dir = _resolve_output_dir(args)
+    output_dir = _resolve_output_dir(args, method_name=output_method)
 
     with torch.no_grad():
         ref_logits = ctx.model(**model_inputs, use_cache=False).logits[:, pos_list, :].float()
@@ -643,7 +687,7 @@ def main():
     }
 
     for eps in args.eps:
-        print(f"\n[condition-block runner] eps={eps:g}")
+        print(f"\n[{runner_label}] eps={eps:g}")
         student_logits, layer_to_patch, budget = run_for_eps(
             ctx=ctx,
             args=args,
@@ -676,7 +720,7 @@ def main():
         if torch.cuda.is_available() and str(ctx.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
-    summary_path = os.path.join(output_dir, "runner_cond_block_summary.pt")
+    summary_path = os.path.join(output_dir, summary_filename)
     torch.save(summary, summary_path)
     print(f"Saved summary to: {summary_path}")
     plot_path = plot_ppl_vs_budget_from_summary(summary_path)

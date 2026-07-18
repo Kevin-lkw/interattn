@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 from transformers import StaticCache
 from transformers.models.llama import modeling_llama
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -18,6 +19,7 @@ from .legacy import (
     _condition_block_stage2_reduce_kernel,
 )
 from .page_attention import _condition_block_finalize_attention_kernel
+from .selection_tma import condition_block_selection_stats_tma_kernel
 
 # Launch configuration for the decode kernels. The defaults were picked by a
 # cold-L2 sweep on RTX PRO 6000 Blackwell (see README); the env overrides exist
@@ -457,19 +459,32 @@ def _build_prompt_blocks(k_all, v_all, block_size):
     k_bar_dtype, v_bar_dtype, bound_dtype = _summary_storage_dtypes(
         k_block_attn.dtype
     )
-    return {
+    k_max = k_for_max.amax(dim=2).to(bound_dtype)
+    k_min = k_for_min.amin(dim=2).to(bound_dtype)
+    prefix = {
         "k_block_attn": k_block_attn,
         "v_block_attn": v_block_attn,
         "token_idx": token_idx,
         "valid_token": valid_token,
         "k_bar": (k_sum / size_float.view(1, n_blocks, 1)).to(k_bar_dtype),
         "v_bar": (v_sum / size_float.view(1, n_blocks, 1)).to(v_bar_dtype),
-        "k_max": k_for_max.amax(dim=2).to(bound_dtype),
-        "k_min": k_for_min.amin(dim=2).to(bound_dtype),
+        "k_max": k_max,
+        "k_min": k_min,
         "v_norm_max": v_norm.amax(dim=2),
         "v_norm_all": v_norm.amax(dim=2).amax(dim=-1),
         "block_valid_counts": size,
     }
+    if os.environ.get("CONDITION_BLOCK_TMA_BOUNDS") == "1":
+        k_bounds = (
+            torch.stack((k_max, k_min), dim=-1).flatten(2).contiguous()
+        )
+        # Keep compatibility views without retaining duplicate max/min storage.
+        # The TMA path consumes k_bounds; the views are only for diagnostics.
+        bounds_view = k_bounds.view(*k_max.shape, 2)
+        prefix["k_bounds"] = k_bounds
+        prefix["k_max"] = bounds_view[..., 0]
+        prefix["k_min"] = bounds_view[..., 1]
+    return prefix
 
 
 def _select_prompt_blocks(q_grouped, prefix, eps):
@@ -775,29 +790,73 @@ def _run_condition_block_selection_stats(
         device=q.device,
         dtype=torch.float32,
     )
-    _condition_block_selection_stats_kernel[(n_kv_heads, n_chunks)](
-        q,
-        prefix["k_bar"].contiguous(),
-        prefix["k_max"].contiguous(),
-        prefix["k_min"].contiguous(),
-        prefix["block_valid_counts"].contiguous(),
-        s_cache,
-        delta_cache,
-        partial[0],
-        partial[1],
-        partial[2],
-        partial[3],
-        n_blocks,
-        n_chunks,
-        group_size,
-        head_dim,
-        head_dim**-0.5,
-        BLOCK_G=triton.next_power_of_2(group_size),
-        BLOCK_B=selection_chunk,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        TERM1_MASS_EXP=bool(term1_mass_exp),
-        num_warps=_select_warps(n_blocks),
-    )
+    use_tma_bounds = os.environ.get("CONDITION_BLOCK_TMA_BOUNDS") == "1"
+    if use_tma_bounds:
+        capability = torch.cuda.get_device_capability(q.device)
+        if capability[0] < 9:
+            raise ValueError("TMA bounds require Hopper/Blackwell (compute capability >= 9.0).")
+        block_d = triton.next_power_of_2(head_dim)
+        if block_d != head_dim:
+            raise ValueError("TMA bounds currently require a power-of-two head_dim.")
+        persist_chunks = int(os.environ.get("CONDITION_BLOCK_TMA_PERSIST_CHUNKS", "1"))
+        if persist_chunks < 1:
+            raise ValueError("CONDITION_BLOCK_TMA_PERSIST_CHUNKS must be >= 1.")
+        bounds = prefix.get("k_bounds")
+        if bounds is None:
+            raise ValueError("TMA bounds require a prompt prefix with packed k_bounds.")
+        bounds_desc = TensorDescriptor.from_tensor(
+            bounds,
+            block_shape=[1, selection_chunk, 2 * block_d],
+        )
+        condition_block_selection_stats_tma_kernel[
+            (n_kv_heads, triton.cdiv(n_chunks, persist_chunks))
+        ](
+            q,
+            prefix["k_bar"].contiguous(),
+            bounds_desc,
+            prefix["block_valid_counts"].contiguous(),
+            s_cache,
+            delta_cache,
+            partial[0],
+            partial[1],
+            partial[2],
+            partial[3],
+            n_blocks,
+            n_chunks,
+            group_size,
+            head_dim,
+            head_dim**-0.5,
+            BLOCK_G=triton.next_power_of_2(group_size),
+            BLOCK_B=selection_chunk,
+            BLOCK_D=block_d,
+            PERSIST_CHUNKS=persist_chunks,
+            TERM1_MASS_EXP=bool(term1_mass_exp),
+            num_warps=_select_warps(n_blocks),
+        )
+    else:
+        _condition_block_selection_stats_kernel[(n_kv_heads, n_chunks)](
+            q,
+            prefix["k_bar"].contiguous(),
+            prefix["k_max"].contiguous(),
+            prefix["k_min"].contiguous(),
+            prefix["block_valid_counts"].contiguous(),
+            s_cache,
+            delta_cache,
+            partial[0],
+            partial[1],
+            partial[2],
+            partial[3],
+            n_blocks,
+            n_chunks,
+            group_size,
+            head_dim,
+            head_dim**-0.5,
+            BLOCK_G=triton.next_power_of_2(group_size),
+            BLOCK_B=selection_chunk,
+            BLOCK_D=triton.next_power_of_2(head_dim),
+            TERM1_MASS_EXP=bool(term1_mass_exp),
+            num_warps=_select_warps(n_blocks),
+        )
     global_stats = None
     if reduce_globals:
         global_stats = _workspace_empty(
@@ -1058,6 +1117,11 @@ def _condition_block_decode_output(
         raise ValueError(
             "CONDITION_BLOCK_MIXED_SUMMARIES=1 requires the fused Triton "
             "stage2 path with block_size 16 or 32."
+        )
+    if os.environ.get("CONDITION_BLOCK_TMA_BOUNDS") == "1" and not use_fused_triton:
+        raise ValueError(
+            "CONDITION_BLOCK_TMA_BOUNDS=1 requires the fused Triton stage2 "
+            "path with block_size 16 or 32."
         )
     if term1_mass_exp and not use_fused_triton:
         raise ValueError(

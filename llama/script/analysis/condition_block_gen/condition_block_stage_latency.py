@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -258,6 +259,11 @@ def parse_args():
             "--summary-dtype bfloat16."
         ),
     )
+    parser.add_argument(
+        "--tma-bounds",
+        action="store_true",
+        help="Use the experimental packed-bounds TMA selection kernel.",
+    )
     parser.add_argument("--contexts", nargs="+", type=int, default=[32768, 65536, 131072])
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--suffix-tokens", type=int, default=0)
@@ -349,7 +355,7 @@ def build_synthetic_prefix(
         bound_dtype = dtype
     else:
         k_bar_dtype = v_bar_dtype = bound_dtype = summary_dtype
-    return {
+    prefix = {
         "k_block_attn": k_block,
         "v_block_attn": v_block,
         "k_bar": k_bar.to(k_bar_dtype),
@@ -360,6 +366,11 @@ def build_synthetic_prefix(
         "v_norm_all": v_norm.amax(dim=2).amax(dim=-1),
         "block_valid_counts": counts,
     }
+    if os.environ.get("CONDITION_BLOCK_TMA_BOUNDS") == "1":
+        prefix["k_bounds"] = torch.stack(
+            (prefix["k_max"], prefix["k_min"]), dim=-1
+        ).flatten(2).contiguous()
+    return prefix
 
 
 def build_dummy_selected(n_kv_heads, n_blocks, ratio, device):
@@ -459,6 +470,8 @@ def run_full_sdpa(q_grouped, prefix):
 
 def main():
     args = parse_args()
+    if args.tma_bounds:
+        os.environ["CONDITION_BLOCK_TMA_BOUNDS"] = "1"
     set_seed(42)
     if not torch.cuda.is_available() or not str(args.device).startswith("cuda"):
         raise RuntimeError("This benchmark requires a CUDA device.")
@@ -512,6 +525,10 @@ def main():
                 "summary_dtype": args.summary_dtype,
                 "mixed_summaries": args.mixed_summaries,
                 "cold_l2": args.cold_l2,
+                "tma_bounds": args.tma_bounds,
+                "tma_persist_chunks": int(
+                    os.environ.get("CONDITION_BLOCK_TMA_PERSIST_CHUNKS", "1")
+                ),
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_stats_reduce",
@@ -537,6 +554,10 @@ def main():
                 "summary_dtype": args.summary_dtype,
                 "mixed_summaries": args.mixed_summaries,
                 "cold_l2": args.cold_l2,
+                "tma_bounds": args.tma_bounds,
+                "tma_persist_chunks": int(
+                    os.environ.get("CONDITION_BLOCK_TMA_PERSIST_CHUNKS", "1")
+                ),
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_materialize",
@@ -574,6 +595,10 @@ def main():
                 "summary_dtype": args.summary_dtype,
                 "mixed_summaries": args.mixed_summaries,
                 "cold_l2": args.cold_l2,
+                "tma_bounds": args.tma_bounds,
+                "tma_persist_chunks": int(
+                    os.environ.get("CONDITION_BLOCK_TMA_PERSIST_CHUNKS", "1")
+                ),
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "production_fused_selection_attention",
@@ -611,6 +636,7 @@ def main():
                     "n_blocks": int(prefix["block_valid_counts"].numel()),
                     "suffix_tokens": int(args.suffix_tokens),
                     "cold_l2": args.cold_l2,
+                    "tma_bounds": args.tma_bounds,
                     "stage": "full_sdpa_decode_attention",
                     "latency_ms": cuda_time_ms(
                         lambda: run_full_sdpa(q_grouped, prefix),

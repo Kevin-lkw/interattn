@@ -796,15 +796,35 @@ Sanity：synthetic 的 bounds FP32 值、selected mask 和 fused BF16 output 均
 NarrativeQA 10/10、GovReport 10/10 prediction 完全一致。注意该“严格等价”
 针对 production fused Triton path；legacy PyTorch stage2 不应与此 flag 混用。
 
-### Step 2：packed bounds + TMA/pipelined selection
+### Step 2：packed bounds + TMA selection（已实现，可选）
 
-把同 dtype 的 `k_max/k_min` 打包为连续 bounds tensor，尝试用 Triton tensor
-descriptor/TMA 按 tile 搬入 SRAM，并让一个 persistent CTA 循环多个 chunk，
-用双缓冲重叠下一 tile 的 HBM load 与当前 tile 的 dot/reduce。这里不改变读
-字节，只改善 transaction 合并、load stream 数和 latency hiding。
+把同 dtype 的 `k_max/k_min` 交错打包为连续 bounds tensor，用 Triton tensor
+descriptor/TMA 按 tile 搬入 SRAM。它不改变读字节，只改善 transaction 合并、
+load stream 数和 latency hiding。仅支持 Hopper/Blackwell，默认关闭：
 
-保留标准：cold-L2 selection-stats 至少稳定降低 5%，且 64K/128K decode-only
-有可测收益；否则只记录结果并撤回实验代码。
+```bash
+CONDITION_BLOCK_MIXED_SUMMARIES=1 CONDITION_BLOCK_TMA_BOUNDS=1
+```
+
+`PERSIST_CHUNKS=1/2/4/8` sweep 显示 1 最优；让一个 CTA 连续处理更多 chunk
+会降低全卡并行度，128K selection 反而依次从 51.8 us 变成
+58.1/66.0/74.6 us，因此默认不做 persistent 合并。
+
+两轮交替 cold-L2 A/B（mixed baseline → mixed+TMA）：
+
+| stage | 64K | speedup | 128K | speedup |
+|---|---:|---:|---:|---:|
+| selection stats+reduce | 38.65→37.21 us | 1.039x | 55.49→51.33 us | **1.081x** |
+| production fused attention | 61.23→57.69 us | **1.061x** | 82.22→78.20 us | **1.051x** |
+
+CUDA-graph decode-only（128 fixed tokens，3 measured）：128K mixed
+`2.1665 s` → TMA `2.1465 s`（增量 **1.009x**）；相对原 FP32-summary
+`2.1901 s` 合计 **1.020x**。64K 仍在噪声内。synthetic 非整块 context 的
+`s/delta/global stats/selected/output` 全部逐位一致；LongBench NarrativeQA
+5/5、GovReport 5/5 prediction 与 mixed baseline 完全一致。
+
+结论：达到 selection ≥5% 的保留标准，但 e2e 只有约 1%，所以保持显式可选，
+不作为跨硬件默认路径。
 
 ### Step 3：cache policy
 

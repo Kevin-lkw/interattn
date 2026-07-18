@@ -57,6 +57,10 @@ tokens exact, and reports the measured equivalent budget. It does not provide
 a Double-P latency/speedup measurement because the paper's custom kernel is not
 publicly available here.
 
+The shared algorithm, the distinction between generation/decode-faithful PPL/
+full-causal PPL, all Double-P entry points, and verification commands are
+indexed in [`../DOUBLE_P.md`](../DOUBLE_P.md).
+
 Local full-forward methods (`attention_topk`, `condition_block`, and `quest`)
 require eager attention so the runner can capture Q/K/V; this is set
 automatically unless you explicitly pass another attention implementation.

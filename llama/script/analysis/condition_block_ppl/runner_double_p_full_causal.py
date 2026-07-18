@@ -21,8 +21,8 @@ import torch
 from tqdm import tqdm
 
 from ..condition_block_gen.methods.double_p import (
-    _double_p_decode_output,
     build_double_p_prompt_clusters,
+    double_p_attention,
 )
 from ..online_routing import capture_layer_artifacts, run_with_multilayer_patches
 from .runner_cond_block import (
@@ -30,7 +30,7 @@ from .runner_cond_block import (
     _merge_stats,
     _summarize_budget,
 )
-from .runner_double_p import _setting_key
+from .double_p_config import double_p_setting_key
 
 
 def causal_clustered_end(
@@ -144,7 +144,7 @@ def full_causal_double_p_attention(
             sink_tokens=min(int(sink_tokens), int(clustered_end)),
             window_size=0,
         )
-        epoch_output, epoch_stats = _double_p_decode_output(
+        epoch_output, epoch_stats = double_p_attention(
             q_grouped=q_grouped,
             k_all=k_all,
             v_all=v_all,
@@ -216,7 +216,7 @@ def run_full_causal_setting(
     layer_to_patch = {}
     budget_stats = {}
     aggregate_stats = {}
-    setting = _setting_key(p1, p2)
+    setting = double_p_setting_key(p1, p2)
 
     if float(p1) == 1.0 and float(p2) == 1.0:
         for layer_idx in layer_idx_list:

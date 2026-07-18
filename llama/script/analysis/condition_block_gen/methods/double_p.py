@@ -34,6 +34,19 @@ from .condition_block import (
 from .patching import merge_stats, summarize_stats
 
 
+__all__ = [
+    "DoublePDecodeRunner",
+    "batched_euclidean_kmeans_assign",
+    "build_double_p_prompt_clusters",
+    "double_p_attention",
+    "double_p_decode_context",
+    "full_attention_sdpa_context",
+    "generate_double_p_cached",
+    "summarize_double_p_step_metadata",
+    "top_p_mask",
+]
+
+
 def _resolve_num_clusters(num_tokens: int, cluster_size: int) -> int:
     num_tokens = int(num_tokens)
     cluster_size = int(cluster_size)
@@ -264,7 +277,7 @@ def top_p_mask(probabilities: torch.Tensor, p: float) -> torch.Tensor:
     return selected
 
 
-def _double_p_decode_output(
+def double_p_attention(
     *,
     q_grouped: torch.Tensor,
     k_all: torch.Tensor,
@@ -646,7 +659,7 @@ class DoublePDecodeRunner:
             )
             self.prompt_cluster_cache[cache_key] = prompt_clusters
 
-        output, stats = _double_p_decode_output(
+        output, stats = double_p_attention(
             q_grouped=q_grouped,
             k_all=k_all,
             v_all=v_all,

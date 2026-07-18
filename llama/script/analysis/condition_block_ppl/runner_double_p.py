@@ -18,36 +18,25 @@ import torch
 from tqdm import tqdm
 
 from ..condition_block_gen.methods.double_p import (
-    _double_p_decode_output,
     build_double_p_prompt_clusters,
+    double_p_attention,
 )
 from ..online_routing import capture_layer_artifacts, run_with_multilayer_patches
 from ..runner_utils import mean_nll_and_ppl, nll_to_ppl, set_seed, str_to_torch_dtype
 from ..runtime import load_context, resolve_layers
 from ..sanity import compute_metrics, get_tail_labels, move_model_inputs_to_device
+from .double_p_config import (
+    DENSE_P_SETTING,
+    PAPER_P_SETTING,
+    double_p_setting_key,
+    parse_p_setting,
+)
 from .runner_cond_block import (
     _full_attention_stats,
     _merge_stats,
     _model_output_name,
     _summarize_budget,
 )
-
-
-def _parse_p_setting(raw: str) -> tuple[float, float]:
-    parts = str(raw).replace(",", ":").split(":")
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError(
-            f"Invalid Double-P setting {raw!r}; expected P1:P2, for example 0.95:0.70."
-        )
-    try:
-        p1, p2 = map(float, parts)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Invalid Double-P setting {raw!r}.") from exc
-    if not 0 < p2 <= p1 <= 1:
-        raise argparse.ArgumentTypeError(
-            f"Double-P requires 0 < p2 <= p1 <= 1, got {p1}:{p2}."
-        )
-    return p1, p2
 
 
 def parse_args():
@@ -77,9 +66,9 @@ def parse_args():
     parser.add_argument("--kmeans-iters", type=int, default=4)
     parser.add_argument(
         "--p-settings",
-        type=_parse_p_setting,
+        type=parse_p_setting,
         nargs="+",
-        default=[(0.95, 0.70), (1.0, 1.0)],
+        default=[PAPER_P_SETTING, DENSE_P_SETTING],
         metavar="P1:P2",
         help=(
             "Double-P thresholds. The 1:1 setting is a dense-equivalence check; "
@@ -118,10 +107,6 @@ def parse_args():
     if args.layers is None:
         args.all_layers = True
     return args
-
-
-def _setting_key(p1: float, p2: float) -> str:
-    return f"p1={float(p1):g}_p2={float(p2):g}"
 
 
 def _resolve_output_dir(args) -> str:
@@ -197,7 +182,7 @@ def build_double_p_patch(
             sink_tokens=sink_tokens,
             window_size=window_size,
         )
-        output, stats = _double_p_decode_output(
+        output, stats = double_p_attention(
             q_grouped=q_grouped,
             k_all=k_all,
             v_all=v_all,
@@ -223,7 +208,7 @@ def run_for_setting(ctx, args, p1, p2, layer_idx_list, pos_list, model_inputs):
     layer_to_patch = {}
     budget_stats = {}
     aggregate_stats = {}
-    setting = _setting_key(p1, p2)
+    setting = double_p_setting_key(p1, p2)
 
     if float(p1) == 1.0 and float(p2) == 1.0:
         # Keep the plotted/reference endpoint exactly identical to the teacher.
@@ -386,7 +371,7 @@ def main():
             "runs": {},
         }
     for p1, p2 in args.p_settings:
-        setting = _setting_key(p1, p2)
+        setting = double_p_setting_key(p1, p2)
         if args.resume and setting in summary["runs"]:
             print(f"[resume] skipping existing setting {setting}")
             continue

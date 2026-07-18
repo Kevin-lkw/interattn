@@ -2,24 +2,13 @@ import argparse
 import math
 from types import SimpleNamespace
 
-from ..runner_double_p import _parse_p_setting
+from ..double_p_config import (
+    DEFAULT_FULL_CAUSAL_P_SETTINGS,
+    p2_by_unique_p1,
+    parse_p_setting,
+)
 from ..runner_double_p_full_causal import run_full_causal_setting
 from .common import add_common_args, metric_record, run_multisample
-
-
-DEFAULT_P_SETTINGS = [
-    (0.10, 0.01),
-    (0.20, 0.025),
-    (0.30, 0.05),
-    (0.40, 0.075),
-    (0.50, 0.10),
-    (0.65, 0.15),
-    (0.75, 0.20),
-    (0.85, 0.30),
-    (0.90, 0.50),
-    (0.95, 0.70),
-    (1.00, 1.00),
-]
 
 
 def parse_args():
@@ -38,9 +27,9 @@ def parse_args():
     parser.add_argument("--full-attention-layers", type=int, default=2)
     parser.add_argument(
         "--p-settings",
-        type=_parse_p_setting,
+        type=parse_p_setting,
         nargs="+",
-        default=DEFAULT_P_SETTINGS,
+        default=DEFAULT_FULL_CAUSAL_P_SETTINGS,
         metavar="P1:P2",
     )
     args = parser.parse_args()
@@ -50,12 +39,10 @@ def parse_args():
         parser.error("--sink-tokens and --window-size must be non-negative")
     if args.full_attention_layers < 0:
         parser.error("--full-attention-layers must be non-negative")
-    p1_values = [float(p1) for p1, _p2 in args.p_settings]
-    if len(p1_values) != len(set(p1_values)):
-        parser.error("Every Double-P setting must have a unique p1 value")
-    args.p2_by_p1 = {
-        float(p1): float(p2) for p1, p2 in args.p_settings
-    }
+    try:
+        args.p2_by_p1 = p2_by_unique_p1(args.p_settings)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 

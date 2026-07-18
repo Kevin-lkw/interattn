@@ -1,11 +1,18 @@
+import argparse
 import math
 
+import pytest
 import torch
 
 from ..condition_block_gen.methods.double_p import (
-    _double_p_decode_output,
     build_double_p_prompt_clusters,
+    double_p_attention,
     top_p_mask,
+)
+from .double_p_config import (
+    double_p_setting_key,
+    p2_by_unique_p1,
+    parse_p_setting,
 )
 from .multisample.run_double_p import _combined_full_chunk_budget
 from .runner_double_p_full_causal import (
@@ -18,6 +25,25 @@ def test_top_p_mask_selects_minimal_prefix():
     probabilities = torch.tensor([[0.50, 0.30, 0.20]])
     assert top_p_mask(probabilities, 0.70).tolist() == [[True, True, False]]
     assert top_p_mask(probabilities, 1.0).tolist() == [[True, True, True]]
+
+
+def test_threshold_config_parsing_and_stable_key():
+    assert parse_p_setting("0.95:0.70") == (0.95, 0.70)
+    assert parse_p_setting("0.9,0.5") == (0.9, 0.5)
+    assert double_p_setting_key(0.90, 0.50) == "p1=0.9_p2=0.5"
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_p_setting("0.5:0.9")
+
+
+def test_ppl_setting_grid_rejects_duplicate_p1_values():
+    assert p2_by_unique_p1([(0.9, 0.5), (0.95, 0.7)]) == {
+        0.9: 0.5,
+        0.95: 0.7,
+    }
+    with pytest.raises(ValueError, match="unique p1"):
+        p2_by_unique_p1([(0.9, 0.5), (0.9, 0.6)])
+    with pytest.raises(ValueError, match="p2 <= p1"):
+        p2_by_unique_p1([(0.5, 0.9)])
 
 
 def test_prompt_cluster_summaries_preserve_counts_and_means():
@@ -72,7 +98,7 @@ def test_dense_thresholds_match_causal_gqa_attention():
         window_size=2,
     )
 
-    output, stats = _double_p_decode_output(
+    output, stats = double_p_attention(
         q_grouped=q_grouped,
         k_all=k_all,
         v_all=v_all,

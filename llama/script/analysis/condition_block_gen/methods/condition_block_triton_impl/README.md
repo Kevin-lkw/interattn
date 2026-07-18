@@ -826,7 +826,7 @@ CUDA-graph decode-only（128 fixed tokens，3 measured）：128K mixed
 结论：达到 selection ≥5% 的保留标准，但 e2e 只有约 1%，所以保持显式可选，
 不作为跨硬件默认路径。
 
-### Step 3：cache policy
+### Step 3：cache policy（已测试，不采用）
 
 对一次性流式 summary/page load 尝试 `.cg`/`evict_first`，对同层随后立即消费
 的 `s/delta/partial` 使用 `evict_last`。不把 128K summaries 设为 persisting
@@ -834,6 +834,19 @@ L2：单层 working set 已接近 128 MiB，而所有层总 summary 远超 80 Mi
 persisting 上限，强占 L2 还可能挤掉模型权重。
 
 保留标准：多轮 stage 与 decode-only 都同方向，且没有让 model GEMV 退化。
+
+Blackwell PTX 不允许在同一 load 上组合 `.cg` 与 `evict_first`，因此最终实验
+只使用 eviction hint：summary/representative `evict_first`，马上要消费的
+`s/delta/partial` store/load `evict_last`。两轮交替 cold-L2 A/B（mixed+TMA）：
+
+| stage | 64K baseline→policy | 128K baseline→policy |
+|---|---:|---:|
+| selection stats+reduce | 36.88→36.68 us（1.005x） | 51.17→51.47 us（0.994x） |
+| production fused attention | 57.76→57.34 us（1.007x） | 78.49→78.01 us（1.006x） |
+
+变化全部小于 1%，且 128K selection 方向相反，不满足保留标准。实验 kernel
+分支已撤回，只保留本记录。原因是 `s/delta/partial` 很小且本来就能停留在
+L2，而流式 summary 的访问顺序已经规则；硬件默认 cache policy 足够好。
 
 ### Step 4：multi-query/speculative amortization
 

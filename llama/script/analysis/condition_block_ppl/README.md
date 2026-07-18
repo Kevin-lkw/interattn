@@ -23,13 +23,17 @@ condition 的来源和诊断逻辑。
 ## Cluster 变体与 baseline
 
 - `condition_ksim_cluster.py` / `runner_ksim_cluster.py`：仅使用 K-similarity cluster。
-- `condition_ksim_condition.py` / `runner_condition_ksim_cluster.py`：在 K-similarity cluster 上应用 condition threshold。
+- `condition_ksim_condition.py` / `runner_condition_ksim_cluster.py`：
+  在 K-similarity cluster 上应用 condition threshold。
+- `runner_double_p_full_causal.py`：Double-P 的 full-causal PPL 扩展，供传统
+  fixed-chunk WikiText PPL 协议使用（eager PyTorch，无 Triton）。
 - `runner_quest.py`：QUEST PPL baseline。
 - `multisample/`：WikiText 多样本 PPL 对比，包含 condition-block、attention top-k、H2O、StreamLLM 和 QUEST。
 
 ## Bound 研究
 
-- `condition_bound/`：原始 condition bound、Bennett 变体、PPL sweep 和 kernel microbenchmark。
+- `condition_bound/`：原始 condition bound、Bennett 变体、PPL sweep 和
+  kernel microbenchmark。
 - `delta_bound/`：更紧 delta 估计的候选方案与 term decomposition。
 
 这些目录现在都是正常 Python package，建议使用 `-m` 运行，不再依赖从具体脚本路径启动。
@@ -45,6 +49,11 @@ python -m script.analysis.condition_block_ppl.condition_block --help
 # 多层 PPL sweep
 python -m script.analysis.condition_block_ppl.runner_cond_block --help
 
+# Double-P：传统 fixed-chunk/full-causal PPL
+python -m \
+  script.analysis.condition_block_ppl.multisample.run_double_p_full_causal \
+  --help
+
 # sink/recent block 固定展开的多层 PPL sweep
 python -m script.analysis.condition_block_ppl.runner_cond_block_sink_recent --help
 
@@ -56,6 +65,10 @@ python -m script.analysis.condition_block_ppl.condition_bound.hybrid_guarantee -
 ```
 
 默认结果路径和结果文件名没有随源码目录迁移而改变，因此已有结果仍可直接读取。
+
+Double-P 只通过 full-causal 扩展参与传统 fixed-chunk PPL：每个 scored
+query 都严格使用其 causal prefix，并按完整 cluster group 周期性重建索引。
+详细协议见 `aligned_ppl/README.md`。
 
 ## 共享基础设施
 

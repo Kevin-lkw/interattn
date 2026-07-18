@@ -19,6 +19,7 @@ LOCAL_PATCH_METHODS = {
     "attention_topk",
     "condition_block",
     "condition_block_triton",
+    "condition_block_triton_term1_softmax",
     "double_p",
     "quest",
 }
@@ -63,7 +64,11 @@ def validate_generation_args(args):
         raise ValueError("--limit must be > 0")
     if args.max_new_tokens is not None and args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be > 0")
-    if args.method in {"condition_block", "condition_block_triton"}:
+    if args.method in {
+        "condition_block",
+        "condition_block_triton",
+        "condition_block_triton_term1_softmax",
+    }:
         if args.budget is not None:
             raise ValueError("--budget is not used by condition_block; use --condition-block-size and --condition-eps.")
         if args.condition_block_size is None or args.condition_block_size <= 0:
@@ -225,7 +230,11 @@ def record_id(record, args, index):
 def output_path(args, benchmark_name):
     model_name = str(args.model).rstrip("/").split("/")[-1]
     method = build_method(args)
-    if method.kind in {"condition_block", "condition_block_triton"}:
+    if method.kind in {
+        "condition_block",
+        "condition_block_triton",
+        "condition_block_triton_term1_softmax",
+    }:
         filename = (
             f"{method.name}_block={method.condition_block_size}"
             f"_eps={method.condition_eps:g}.jsonl"

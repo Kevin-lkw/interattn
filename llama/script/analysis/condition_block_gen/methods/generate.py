@@ -45,6 +45,20 @@ def generate_with_method(model, tokenizer, input_ids, attention_mask, method, de
             device=device,
             dataset=dataset,
         )
+    if method.kind == "condition_block_triton_term1_softmax":
+        from .condition_block_triton_term1_softmax import (
+            generate_condition_block_cached as generate_term1_softmax_cached,
+        )
+
+        return generate_term1_softmax_cached(
+            model=model,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            method=method,
+            device=device,
+            dataset=dataset,
+        )
     if method.kind == "double_p":
         from .double_p import generate_double_p_cached
 

@@ -254,6 +254,11 @@ def parse_args():
     parser.add_argument("--suffix-tokens", type=int, default=0)
     parser.add_argument("--selected-ratios", nargs="+", type=float, default=[0.0, 0.05, 0.1, 0.25])
     parser.add_argument("--eps", type=float, default=0.1)
+    parser.add_argument(
+        "--term1-mass-exp",
+        action="store_true",
+        help="Benchmark the term1-softmax routing rule instead of the original score.",
+    )
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--q-heads", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=128)
@@ -458,8 +463,14 @@ def main():
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_stats_reduce",
+                "score_kind": "term1_softmax" if args.term1_mass_exp else "original",
                 "latency_ms": cuda_time_ms(
-                    lambda: _run_condition_block_selection_stats(q_grouped, prefix, workspace),
+                    lambda: _run_condition_block_selection_stats(
+                        q_grouped,
+                        prefix,
+                        workspace,
+                        term1_mass_exp=args.term1_mass_exp,
+                    ),
                     args.warmup,
                     args.iters,
                 ),
@@ -474,8 +485,14 @@ def main():
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "selection_materialize",
+                "score_kind": "term1_softmax" if args.term1_mass_exp else "original",
                 "latency_ms": cuda_time_ms(
-                    lambda: _select_prompt_blocks_triton(q_grouped, prefix, args.eps),
+                    lambda: _select_prompt_blocks_triton(
+                        q_grouped,
+                        prefix,
+                        args.eps,
+                        term1_mass_exp=args.term1_mass_exp,
+                    ),
                     args.warmup,
                     args.iters,
                 ),
@@ -483,7 +500,12 @@ def main():
             print(json.dumps(row), flush=True)
             handle.write(json.dumps(row) + "\n")
 
-            selected_actual, _, _, _, _ = _select_prompt_blocks_triton(q_grouped, prefix, args.eps)
+            selected_actual, _, _, _, _ = _select_prompt_blocks_triton(
+                q_grouped,
+                prefix,
+                args.eps,
+                term1_mass_exp=args.term1_mass_exp,
+            )
             torch.cuda.synchronize()
             actual_selected_ratio = float(selected_actual[0, 0, 0].float().mean().item())
             fused_workspace = {}
@@ -497,6 +519,7 @@ def main():
                 "n_blocks": int(prefix["block_valid_counts"].numel()),
                 "suffix_tokens": int(args.suffix_tokens),
                 "stage": "production_fused_selection_attention",
+                "score_kind": "term1_softmax" if args.term1_mass_exp else "original",
                 "eps": float(args.eps),
                 "actual_selected_ratio": actual_selected_ratio,
                 "latency_ms": cuda_time_ms(
@@ -511,6 +534,7 @@ def main():
                         store_selected=False,
                         output_dtype=dtype,
                         workspace=fused_workspace,
+                        term1_mass_exp=args.term1_mass_exp,
                     ),
                     args.warmup,
                     args.iters,

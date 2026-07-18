@@ -44,7 +44,17 @@ def parse_args():
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
-    parser.add_argument("--methods", nargs="+", default=["full", "condition_block_triton"], choices=["full", "condition_block", "condition_block_triton"])
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=["full", "condition_block_triton"],
+        choices=[
+            "full",
+            "condition_block",
+            "condition_block_triton",
+            "condition_block_triton_term1_softmax",
+        ],
+    )
     parser.add_argument("--contexts", nargs="+", type=int, default=[32768, 65536, 131072])
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--samples", type=int, default=1, help="Profiled samples per method/context after warmup.")
@@ -209,7 +219,11 @@ def run_generate(model, tokenizer, method, args, input_ids, attention_mask, deco
     if args.fixed_decode:
         model.generation_config.eos_token_id = None
         model.config.eos_token_id = None
-        if method.kind in {"condition_block", "condition_block_triton"}:
+        if method.kind in {
+            "condition_block",
+            "condition_block_triton",
+            "condition_block_triton_term1_softmax",
+        }:
             tokenizer.eos_token_id = None
     orig_forward = model.forward
     decode_timing = {"started": False, "start": None}

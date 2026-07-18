@@ -679,3 +679,56 @@ fused QKV / gate-up projection、编译整个 decoder layer、RoPE 与 cache
 
 **结论**：做方法/论文 → 选 A（数学清晰、改动可控、直接提高理论上限）；
 只追求绝对 decode 延迟 → 选 B（量化是仅剩的大杠杆）。
+
+## Term-1 softmax 实验（mass-exp）
+
+独立入口：
+`methods/condition_block_triton_term1_softmax.py`。原
+`condition_block_triton` 的默认公式和数值计算顺序保持不变。
+
+新入口采用 term-ablation 已通过 held-out matched-budget PPL gate 的规则：
+
+```text
+z_C     = log(size_C) + q @ k_bar_C
+term1_C = 2 B * softmax_C(z_C + delta_C)
+term2_C = 2 B_C * softmax_C(z_C) * tanh(delta_C / 2)
+```
+
+它对应 `full_mass_exp`：去掉原 term1 的 `cosh(delta)-1` 和显式 normalizer。
+Triton selection-stats kernel 直接归约 `z+delta`；finalize kernel 直接消费该
+softmax，不再计算 term1 的两次 `exp(±delta)`、`cosh` 和 `-1`。term2 保持
+不变。新旧公式通过 compile-time flag 生成独立 kernel variant。
+
+Sanity（Llama-3.1-8B-Instruct，block 32，eps 0.1，CUDA graph）：
+
+| 数据集 | 样本 | prediction 完全一致 | 原 score | 新 score |
+|---|---:|---:|---:|---:|
+| NarrativeQA | 10 | 10/10 | 43.30 | 43.30 |
+| GovReport | 10 | 9/10 | 24.00 | 24.31 |
+
+Synthetic mixed-routing reference 也通过：selected mask 与 PyTorch
+`full_mass_exp` 完全一致，hybrid output max-abs 约 `2.2e-5`。
+
+性能结论：**没有可测的端到端加速**。
+
+- 32K/64K/128K stage microbenchmark 中，selection 和 fused attention 的
+  新旧差异约在 0-2% 噪声内；
+- 64K、128 fixed-token decode-only，3 个 measured samples：原版平均
+  `2.0070 s`，新版本 `2.0031 s`，仅 `1.002x`；
+- LongBench 10-sample 平均：NarrativeQA `0.998x`，GovReport `0.999x`。
+
+原因是删掉的是 SFU 算术，但 selection kernel 的主成本仍是读取
+`k_bar/k_max/k_min` 并计算三组 query-summary dot product；端到端则由 model
+GEMV 主导。这个公式值得保留为更简单的实验/部署 score，但不能当作速度优化。
+若目标是继续降低 attention latency，仍应优先减少 selection summary IO
+（例如上节的 scalar-radius bound），而不是继续化简 term1 标量表达式。
+
+运行示例：
+
+```bash
+CONDITION_BLOCK_SKIP_STATS=1 CONDITION_BLOCK_CUDA_GRAPH=1 \
+python -m llama.script.analysis.condition_block_gen.longbench.run_all \
+  --device cuda:0 --datasets gov_report --limit 10 \
+  --method condition_block_triton_term1_softmax \
+  --condition-block-size 32 --condition-eps 0.1 --max-new-tokens 128
+```

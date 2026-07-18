@@ -63,6 +63,7 @@ def generate_condition_block_cached(
     method,
     device,
     dataset=None,
+    term1_mass_exp=False,
 ):
     if method.condition_delta_mode != "range_bound":
         raise ValueError("condition_block only supports delta_mode='range_bound'.")
@@ -76,6 +77,7 @@ def generate_condition_block_cached(
             attention_mask=attention_mask,
             method=method,
             dataset=dataset,
+            term1_mass_exp=term1_mass_exp,
         )
 
     prompt_len = int(input_ids.shape[1])
@@ -147,6 +149,7 @@ def generate_condition_block_cached(
         prompt_len=prompt_len,
         pos=total_len - 1,
         prompt_prefix_cache=prompt_prefix_cache,
+        term1_mass_exp=term1_mass_exp,
     )
     with condition_block_decode_context(runner):
         for _step in range(1, max_new_tokens):
@@ -189,6 +192,7 @@ def _generate_condition_block_cuda_graph(
     attention_mask,
     method,
     dataset=None,
+    term1_mass_exp=False,
 ):
     """Decode with one CUDA-graph replay per generated token.
 
@@ -257,6 +261,7 @@ def _generate_condition_block_cuda_graph(
         prompt_len=prompt_len,
         pos=prompt_len,
         prompt_prefix_cache={},
+        term1_mass_exp=term1_mass_exp,
     )
     runner.static_suffix = True
     runner.suffix_len_dev.fill_(1)
@@ -712,7 +717,11 @@ def _workspace_empty(workspace, key, shape, *, device, dtype):
 
 
 def _run_condition_block_selection_stats(
-    q_grouped, prefix, workspace=None, reduce_globals=True
+    q_grouped,
+    prefix,
+    workspace=None,
+    reduce_globals=True,
+    term1_mass_exp=False,
 ):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     if n_query != 1:
@@ -763,6 +772,7 @@ def _run_condition_block_selection_stats(
         BLOCK_G=triton.next_power_of_2(group_size),
         BLOCK_B=selection_chunk,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        TERM1_MASS_EXP=bool(term1_mass_exp),
         num_warps=_select_warps(n_blocks),
     )
     global_stats = None
@@ -790,12 +800,16 @@ def _run_condition_block_selection_stats(
     return q, s_cache, delta_cache, partial, global_stats, n_blocks, n_chunks
 
 
-def _select_prompt_blocks_triton(q_grouped, prefix, eps):
+def _select_prompt_blocks_triton(q_grouped, prefix, eps, term1_mass_exp=False):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     if n_query != 1:
         return _select_prompt_blocks_eager(q_grouped, prefix, eps)
     q, s_cache, delta_cache, _partial, global_stats, n_blocks, n_chunks = (
-        _run_condition_block_selection_stats(q_grouped, prefix)
+        _run_condition_block_selection_stats(
+            q_grouped,
+            prefix,
+            term1_mass_exp=term1_mass_exp,
+        )
     )
     rows = int(n_kv_heads * group_size)
     selection_chunk = _SELECT_CHUNK
@@ -819,6 +833,7 @@ def _select_prompt_blocks_triton(q_grouped, prefix, eps):
         float(eps),
         BLOCK_G=triton.next_power_of_2(group_size),
         BLOCK_B=selection_chunk,
+        TERM1_MASS_EXP=bool(term1_mass_exp),
         num_warps=4,
     )
     selected = selected.reshape(n_kv_heads, group_size, 1, n_blocks)
@@ -855,6 +870,7 @@ def _condition_block_selection_stats_kernel(
     BLOCK_G: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    TERM1_MASS_EXP: tl.constexpr,
 ):
     kv_head = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -881,8 +897,12 @@ def _condition_block_selection_stats_kernel(
     z = s + tl.log(tl.maximum(count, 1).to(tl.float32))[None, :]
     active_2d = g_mask[:, None] & active[None, :]
     z = tl.where(active_2d, z, -float("inf"))
-    cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
-    zc = z + tl.log(cosh_delta)
+    if TERM1_MASS_EXP:
+        # term1 = 2 B softmax(z + delta): no cosh or ``-1`` path.
+        zc = z + delta
+    else:
+        cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
+        zc = z + tl.log(cosh_delta)
     tl.store(s_cache_ptr + row[:, None] * n_blocks + b[None, :], s, mask=active_2d)
     tl.store(delta_cache_ptr + row[:, None] * n_blocks + b[None, :], delta, mask=active_2d)
     z_m = tl.max(z, axis=1)
@@ -951,6 +971,7 @@ def _condition_block_selection_finalize_kernel(
     eps: tl.constexpr,
     BLOCK_G: tl.constexpr,
     BLOCK_B: tl.constexpr,
+    TERM1_MASS_EXP: tl.constexpr,
 ):
     kv_head = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -969,11 +990,16 @@ def _condition_block_selection_finalize_kernel(
     z_l = tl.load(z_l_ptr + row, mask=g_mask, other=1.0)
     c_m = tl.load(c_m_ptr + row, mask=g_mask, other=0.0)
     c_l = tl.load(c_l_ptr + row, mask=g_mask, other=1.0)
-    cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
-    tanh_half = 2.0 / (1.0 + tl.exp(-delta)) - 1.0
     b_c = tl.load(v_norm_ptr + kv_head * n_blocks + b, mask=active, other=0.0)
     b_all = tl.load(v_norm_all_ptr + kv_head)
-    term1 = 2.0 * b_all * tl.exp(z - c_m[:, None]) * (cosh_delta - 1.0) / c_l[:, None]
+    if TERM1_MASS_EXP:
+        exp_neg_delta = tl.exp(-delta)
+        tanh_half = (1.0 - exp_neg_delta) / (1.0 + exp_neg_delta)
+        term1 = 2.0 * b_all * tl.exp(z + delta - c_m[:, None]) / c_l[:, None]
+    else:
+        cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
+        tanh_half = 2.0 / (1.0 + tl.exp(-delta)) - 1.0
+        term1 = 2.0 * b_all * tl.exp(z - c_m[:, None]) * (cosh_delta - 1.0) / c_l[:, None]
     term2 = 2.0 * b_c[None, :] * tl.exp(z - z_m[:, None]) * tanh_half / z_l[:, None]
     condition = tl.where(mask_2d, term1 + term2, 0.0)
     selected = (tl.sum(condition, axis=0) / group_size) > eps
@@ -993,6 +1019,7 @@ def _condition_block_decode_output(
     prompt_len,
     attention_dtype,
     workspace=None,
+    term1_mass_exp=False,
 ):
     n_kv_heads, group_size, n_query, head_dim = q_grouped.shape
     collect_stats = os.environ.get("CONDITION_BLOCK_SKIP_STATS") != "1"
@@ -1004,6 +1031,11 @@ def _condition_block_decode_output(
         and os.environ.get("CONDITION_BLOCK_COMPACT_SDPA_STAGE2") != "1"
         and os.environ.get("CONDITION_BLOCK_LEGACY_STAGE2") != "1"
     )
+    if term1_mass_exp and not use_fused_triton:
+        raise ValueError(
+            "term1-softmax requires the fused Triton stage2 path with "
+            "block_size 16 or 32."
+        )
     if use_fused_triton:
         output, selected = _condition_block_decode_output_fused_triton(
             q_grouped=q_grouped,
@@ -1016,6 +1048,7 @@ def _condition_block_decode_output(
             store_selected=collect_stats,
             output_dtype=attention_dtype,
             workspace=workspace,
+            term1_mass_exp=term1_mass_exp,
         )
         size = prompt_prefix["block_valid_counts"].view(1, -1)
         cluster_exists = size > 0
@@ -1103,11 +1136,16 @@ def _condition_block_decode_output_fused_triton(
     store_selected,
     output_dtype,
     workspace=None,
+    term1_mass_exp=False,
 ):
     n_kv_heads, group_size, _n_query, head_dim = q_grouped.shape
     q, s_cache, delta_cache, sel_partial, _global_stats, n_blocks, n_sel_chunks = (
         _run_condition_block_selection_stats(
-            q_grouped, prompt_prefix, workspace, reduce_globals=False
+            q_grouped,
+            prompt_prefix,
+            workspace,
+            reduce_globals=False,
+            term1_mass_exp=term1_mass_exp,
         )
     )
     rows = int(n_kv_heads * group_size)
@@ -1182,6 +1220,7 @@ def _condition_block_decode_output_fused_triton(
         BLOCK_SC=triton.next_power_of_2(n_sel_chunks),
         PAGE_SIZE=int(page_size),
         STORE_SELECTED=bool(store_selected),
+        TERM1_MASS_EXP=bool(term1_mass_exp),
         num_warps=_FINALIZE_WARPS,
     )
     out = _workspace_empty(
@@ -1266,6 +1305,7 @@ class ConditionBlockDecodeRunner:
         prompt_len,
         pos,
         prompt_prefix_cache,
+        term1_mass_exp=False,
     ):
         self.model_config = model_config
         self.module_to_layer_idx = {
@@ -1279,6 +1319,7 @@ class ConditionBlockDecodeRunner:
         self.prompt_len = int(prompt_len)
         self.pos = int(pos)
         self.prompt_prefix_cache = prompt_prefix_cache
+        self.term1_mass_exp = bool(term1_mass_exp)
         self.workspace_by_layer = {}
         self.stats_by_layer = {}
         self.aggregate_stats = {}
@@ -1394,6 +1435,7 @@ class ConditionBlockDecodeRunner:
             prompt_len=self.prompt_len,
             attention_dtype=query.dtype,
             workspace=self.workspace_by_layer.setdefault(int(layer_idx), {}),
+            term1_mass_exp=self.term1_mass_exp,
         )
         output = output.reshape(n_heads, q_len, head_dim).permute(1, 0, 2).unsqueeze(0)
 

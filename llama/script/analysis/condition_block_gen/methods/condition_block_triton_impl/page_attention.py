@@ -67,6 +67,7 @@ def _condition_block_finalize_attention_kernel(
     BLOCK_SC: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     STORE_SELECTED: tl.constexpr,
+    TERM1_MASS_EXP: tl.constexpr,
 ):
     """Finalize routing and immediately consume it for hybrid attention."""
     kv_head = tl.program_id(0)
@@ -122,21 +123,37 @@ def _condition_block_finalize_attention_kernel(
     c_m = tl.where(m_mask, c_m, 0.0)
     c_l = tl.where(m_mask, c_l, 1.0)
 
-    cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
-    tanh_half = 2.0 / (1.0 + tl.exp(-delta)) - 1.0
     b_c = tl.load(
         v_norm_ptr + kv_head * n_blocks + block_idx,
         mask=active_block,
         other=0.0,
     ).to(tl.float32)
     b_all = tl.load(v_norm_all_ptr + kv_head).to(tl.float32)
-    term1 = (
-        2.0
-        * b_all
-        * tl.exp(z - c_m[:, None])
-        * (cosh_delta - 1.0)
-        / c_l[:, None]
-    )
+    if TERM1_MASS_EXP:
+        # Deployable term-1 simplification:
+        #   2 B softmax(log(p_hat) + delta)
+        # = 2 B softmax(z + delta), because logsumexp(z) is a row constant.
+        # This removes cosh(delta), the ``-1`` subtraction, and their explicit
+        # normalizer.  The selection-stats partials in c_m/c_l normalize
+        # z + delta for this variant.
+        exp_neg_delta = tl.exp(-delta)
+        tanh_half = (1.0 - exp_neg_delta) / (1.0 + exp_neg_delta)
+        term1 = (
+            2.0
+            * b_all
+            * tl.exp(z + delta - c_m[:, None])
+            / c_l[:, None]
+        )
+    else:
+        cosh_delta = 0.5 * (tl.exp(delta) + tl.exp(-delta))
+        tanh_half = 2.0 / (1.0 + tl.exp(-delta)) - 1.0
+        term1 = (
+            2.0
+            * b_all
+            * tl.exp(z - c_m[:, None])
+            * (cosh_delta - 1.0)
+            / c_l[:, None]
+        )
     term2 = (
         2.0
         * b_c[None, :]

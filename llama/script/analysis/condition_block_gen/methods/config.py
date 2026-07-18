@@ -39,7 +39,13 @@ def build_method(args):
         elif quest_page_size is not None:
             budget = 1.0 / int(quest_page_size)
     elif (
-        args.method not in {"condition_block", "condition_block_triton", "double_p"}
+        args.method
+        not in {
+            "condition_block",
+            "condition_block_triton",
+            "condition_block_triton_term1_softmax",
+            "double_p",
+        }
         and budget is None
     ):
         budget = 1.0
@@ -79,6 +85,7 @@ def add_method_args(parser):
             "h2o",
             "condition_block",
             "condition_block_triton",
+            "condition_block_triton_term1_softmax",
             "double_p",
             "quest",
         ],

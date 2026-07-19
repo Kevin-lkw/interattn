@@ -89,6 +89,23 @@ oracle-delta gain flows through it (oracle-t1 ~= oracle-full, 0.36–0.93x). Con
 a better delta only pays through term 1's top-tail ordering of `log p_hat + delta`;
 global rank metrics (Spearman) mislead here.
 
+The follow-up experiment plan and consolidated implementation now live in
+[`term_ablation/`](term_ablation/README.md). It separates local top-k prediction from
+single-block marginal gain and matched-k hybrid error, and tests exact/deployable
+simplifications of both terms before any PPL run.
+
+The local result said that term 1 carries the strongest ranking signal and that
+`0.25 * term2` improves five-window block-16 post-`W_o` error by about 4-8%. The
+held-out PPL gate does **not** preserve that gain: weight 0.25 is worse at budgets
+0.20-0.30, while weight 0.50 has one unresolved 3% improvement at budget 0.25 and no
+consistent advantage. Term1-only and term2-only are both much worse in PPL.
+
+The safe result is the mass-channel simplification with the original term2 weight:
+`2B softmax(log p_hat + delta) + term2`. On five held-out 1024-token Llama-3.1-8B
+windows, its matched-budget PPL ratio stays within `0.99988-1.00015` of the original
+condition. See [`term_ablation/`](term_ablation/README.md) for the setup, paired
+intervals, and full table.
+
 **Verdict.** Better storable delta is effectively open in the regime that matters:
 worst-case hardness is real and the measured geometry is adversarial (high-rank hull,
 heavy-tailed spectrum), so every certified bound stays ~4–5x loose and the certificate

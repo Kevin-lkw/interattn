@@ -276,6 +276,24 @@ def _build_block_prefix_tensors(k_all, v_all, block_size):
     }
 
 
+def _condition_score_for_blocks(
+    *,
+    p_tensor,
+    z_logits,
+    delta,
+    b_c,
+    b_all,
+    cluster_exists,
+):
+    """Compute the default two-term block condition score."""
+    del z_logits, cluster_exists
+    denom = (p_tensor * torch.cosh(delta)).sum(dim=-1).clamp_min(1e-30)
+    return p_tensor * (
+        2.0 * b_all.unsqueeze(-1) * (torch.cosh(delta) - 1.0) / denom.unsqueeze(-1)
+        + 2.0 * b_c * torch.tanh(delta / 2.0)
+    )
+
+
 def _batched_hybrid_outputs_for_queries(
     *,
     q_pos,
@@ -336,10 +354,13 @@ def _batched_hybrid_outputs_for_queries(
     z_logits = torch.log(size_float).view(1, n_query, n_blocks) + s_c
     z_logits = z_logits.masked_fill(~cluster_exists.unsqueeze(0), float("-inf"))
     p_tensor = torch.softmax(z_logits, dim=-1)
-    denom = (p_tensor * torch.cosh(delta)).sum(dim=-1).clamp_min(1e-30)
-    condition = p_tensor * (
-        2.0 * b_all.unsqueeze(-1) * (torch.cosh(delta) - 1.0) / denom.unsqueeze(-1)
-        + 2.0 * b_c * torch.tanh(delta / 2.0)
+    condition = _condition_score_for_blocks(
+        p_tensor=p_tensor,
+        z_logits=z_logits,
+        delta=delta,
+        b_c=b_c,
+        b_all=b_all,
+        cluster_exists=cluster_exists,
     )
     if share_selection_across_heads:
         selected = (condition.mean(dim=0, keepdim=True) > eps) & cluster_exists.unsqueeze(0)

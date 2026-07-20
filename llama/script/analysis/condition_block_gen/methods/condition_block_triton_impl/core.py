@@ -28,6 +28,7 @@ _SELECT_CHUNK = int(os.environ.get("CONDITION_BLOCK_SELECT_CHUNK", "16"))
 _SELECT_WARPS = os.environ.get("CONDITION_BLOCK_SELECT_WARPS")
 _FINALIZE_CHUNK = int(os.environ.get("CONDITION_BLOCK_FINALIZE_CHUNK", "32"))
 _FINALIZE_WARPS = int(os.environ.get("CONDITION_BLOCK_FINALIZE_WARPS", "4"))
+_FUSED_PAGE_SIZES = (16, 32, 64)
 
 
 def _select_warps(n_blocks):
@@ -213,7 +214,7 @@ def _generate_condition_block_cuda_graph(
         raise ValueError("CONDITION_BLOCK_CUDA_GRAPH=1 requires CONDITION_BLOCK_SKIP_STATS=1.")
     if int(method.full_attention_layers) != 0:
         raise ValueError("CUDA-graph decode supports full_attention_layers=0 only.")
-    if int(method.condition_block_size) not in (16, 32) or any(
+    if int(method.condition_block_size) not in _FUSED_PAGE_SIZES or any(
         os.environ.get(flag) == "1"
         for flag in (
             "CONDITION_BLOCK_DENSE_STAGE2",
@@ -1108,7 +1109,7 @@ def _condition_block_decode_output(
     use_fused_triton = (
         q_grouped.is_cuda
         and n_query == 1
-        and int(block_size) in (16, 32)
+        and int(block_size) in _FUSED_PAGE_SIZES
         and os.environ.get("CONDITION_BLOCK_DENSE_STAGE2") != "1"
         and os.environ.get("CONDITION_BLOCK_COMPACT_SDPA_STAGE2") != "1"
         and os.environ.get("CONDITION_BLOCK_LEGACY_STAGE2") != "1"
@@ -1116,17 +1117,17 @@ def _condition_block_decode_output(
     if os.environ.get("CONDITION_BLOCK_MIXED_SUMMARIES") == "1" and not use_fused_triton:
         raise ValueError(
             "CONDITION_BLOCK_MIXED_SUMMARIES=1 requires the fused Triton "
-            "stage2 path with block_size 16 or 32."
+            "stage2 path with block_size 16, 32, or 64."
         )
     if os.environ.get("CONDITION_BLOCK_TMA_BOUNDS") == "1" and not use_fused_triton:
         raise ValueError(
             "CONDITION_BLOCK_TMA_BOUNDS=1 requires the fused Triton stage2 "
-            "path with block_size 16 or 32."
+            "path with block_size 16, 32, or 64."
         )
     if term1_mass_exp and not use_fused_triton:
         raise ValueError(
             "term1-softmax requires the fused Triton stage2 path with "
-            "block_size 16 or 32."
+            "block_size 16, 32, or 64."
         )
     if use_fused_triton:
         output, selected = _condition_block_decode_output_fused_triton(

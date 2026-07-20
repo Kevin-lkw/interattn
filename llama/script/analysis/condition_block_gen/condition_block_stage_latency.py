@@ -131,7 +131,8 @@ def _dummy_selected_sparse_attention_kernel(
     softmax_m = new_m
 
     # Selected blocks: exact token attention, using the same 16-token MMA tile
-    # as the production kernel. PAGE_SIZE=32 therefore consumes two tiles.
+    # as the production kernel. Larger pages therefore consume multiple
+    # BLOCK_N tiles without splitting the page in Python.
     for local_block in tl.static_range(0, BLOCK_N):
         page_selected = tl.sum(
             (selected & (n_off == local_block)).to(tl.int32), axis=0

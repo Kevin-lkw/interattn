@@ -6,16 +6,45 @@
 - `page_attention.py`：当前 fast path；融合 representative、selected page、suffix 和 online softmax。
 - `legacy.py`：dense、compact SDPA 及旧 Triton 实现，仅用于回归对齐和实验开关。
 
-Fast path 支持 `block_size=16/32`。底层 Tensor Core tile 固定为 16 tokens：
-
-- 16-token selected page 使用一次 MMA tile。
-- 32-token selected page 使用两次 MMA tile，并在 kernel 内做 online-softmax 合并。
+Fast path 支持 `block_size=16/32/64`。`PAGE_SIZE` 是 Triton compile-time
+常量；selected page 在 kernel 内作为一个连续 tile 载入和消费，不会在 Python
+层拆成多个 attention 调用。编译器仍可把一次 `tl.dot` lower 成多个硬件 MMA。
 
 顶层 `condition_block_triton.py` 只保留兼容导出，现有 CLI/import 不需要修改。
 
 Stats 默认开启，用于输出等效 budget。实现中 stats 计数延迟到样本结束后
 materialize，避免 decode 每层每步 `.item()` 同步；纯测速可设置
 `CONDITION_BLOCK_SKIP_STATS=1` 关闭。
+
+## Native block 64（128K 可选）
+
+生产 fused kernel 与 CUDA-graph decode 已扩展到原生 `block_size=64`。公式不变，
+变化只有 prompt partition：representative/bounds 的数量减半，但更大 cluster 的
+min/max bound 会更松，因此相同 `eps` 下可能展开更多 token。实现和验证脚本在
+`block64_experiment/`。
+
+Synthetic dense-reference sanity 覆盖整块/非整块 prompt、suffix 1/33、全部展开和
+全部 representative：selected mask 全部一致，BF16 output max-abs
+`2.44e-4` 至 `4.88e-4`。真实 LongBench（每数据集 20 条，eps 0.1）：
+
+| dataset | block32 score | block64 score | delta | block32→64 budget |
+|---|---:|---:|---:|---:|
+| NarrativeQA | 38.66 | 38.84 | +0.18 | 0.207→0.246 |
+| GovReport | 24.51 | 24.22 | -0.29 | 0.176→0.285 |
+
+这里的质量 run 开启 stats，不用于报告性能。独占 GPU 7 的 CUDA-graph
+decode-only（LongBench-v2，128 fixed tokens，1 warmup + 3 measured，stats off）：
+
+| context | block32 | block64 | speedup |
+|---:|---:|---:|---:|
+| 64K | 2.0613 s | 2.0662 s | 0.998x |
+| 128K | 2.1850 s | 2.1296 s | **1.026x** |
+
+cold-L2 stage 的收益更高，但代表 kernel 上限而非 e2e：128K selection
+`63.55→41.35 us`（1.537x），dummy 0% attention `64.19→45.25 us`
+（1.418x）；真实 production stage `96.04→66.04 us`（1.454x）。e2e 只剩
+2.6%，因为模型 GEMV 仍占主导，而且 block64 的实际 selected-token IO 增加。
+因此 block32 继续作为默认；block64 仅推荐给 ≥128K 且已验证质量/budget 的配置。
 
 ## Post-prefill StaticCache
 
@@ -537,7 +566,7 @@ Python，host/launch 开销压缩为单次 graph 启动。
   replay 其余 token。
 - 停止条件改为生成后截断：greedy 下与逐 step early-stop 输出完全一致。
 - 限制：`CONDITION_BLOCK_SKIP_STATS=1`、`full_attention_layers=0`、fused
-  stage2（block 16/32）、batch 1。
+  stage2（block 16/32/64）、batch 1。
 
 Sanity check：
 

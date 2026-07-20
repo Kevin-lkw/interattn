@@ -21,10 +21,13 @@ for gpu in "$@"; do
   gpu_args+=" $gpu"
 done
 
-command="cd '$repo' && PYTHONPATH='$repo' '$python' -m llama.script.analysis.condition_block_gen.longbench.efficient_triton_sweep.run --gpus$gpu_args --output-root '$output' 2>&1 | tee '$output/tmux_driver.log'"
+run_module="llama.script.analysis.condition_block_gen.longbench.efficient_triton_sweep.run"
+summary_module="llama.script.analysis.condition_block_gen.longbench.efficient_triton_sweep.summarize"
+command="cd '$repo' && { PYTHONPATH='$repo' '$python' -m '$run_module' --gpus$gpu_args --output-root '$output' && PYTHONPATH='$repo' '$python' -m '$summary_module' --result-root '$output'; } 2>&1 | tee '$output/tmux_driver.log'"
 mkdir -p "$output"
 tmux new-session -d -s "$session" -n sweep "$command"
 
 echo "started tmux session: $session"
 echo "attach: tmux attach -t $session"
 echo "driver log: $output/tmux_driver.log"
+echo "summary after completion: $output/sweep_summary/RESULTS.md"

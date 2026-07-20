@@ -28,7 +28,8 @@ Run or resume on at most four exclusive GPUs in tmux:
 
 The scheduler assigns one complete `(block_size, eps)` configuration to a GPU,
 loads the model once per configuration, and starts the next queued job when a
-GPU finishes.  Existing IDs are skipped by the standard LongBench runner.
+GPU finishes. Existing IDs are skipped by the standard LongBench runner. The
+tmux entry point runs the summarizer automatically after all jobs finish.
 
 Summarize accuracy, completeness and observed latency:
 

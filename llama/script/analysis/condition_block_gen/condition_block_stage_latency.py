@@ -265,6 +265,14 @@ def parse_args():
         action="store_true",
         help="Use the experimental packed-bounds TMA selection kernel.",
     )
+    parser.add_argument(
+        "--bf16-k-bar",
+        action="store_true",
+        help=(
+            "Store k_bar in BF16 on top of --mixed-summaries. The kernel still "
+            "computes the condition in FP32 after loading the quantized mean."
+        ),
+    )
     parser.add_argument("--contexts", nargs="+", type=int, default=[32768, 65536, 131072])
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--suffix-tokens", type=int, default=0)
@@ -324,6 +332,7 @@ def build_synthetic_prefix(
     device,
     summary_dtype=torch.float32,
     mixed_summaries=False,
+    bf16_k_bar=False,
 ):
     n_blocks = math.ceil(context_tokens / block_size)
     total_tokens = n_blocks * block_size
@@ -351,7 +360,7 @@ def build_synthetic_prefix(
     if mixed_summaries:
         if summary_dtype != torch.float32:
             raise ValueError("mixed summaries require --summary-dtype float32")
-        k_bar_dtype = torch.float32
+        k_bar_dtype = torch.bfloat16 if bf16_k_bar else torch.float32
         v_bar_dtype = torch.bfloat16
         bound_dtype = dtype
     else:
@@ -486,6 +495,8 @@ def main():
     summary_dtype = torch.bfloat16 if args.summary_dtype == "bfloat16" else torch.float32
     if args.mixed_summaries and summary_dtype != torch.float32:
         raise ValueError("--mixed-summaries cannot be combined with --summary-dtype bfloat16")
+    if args.bf16_k_bar and not args.mixed_summaries:
+        raise ValueError("--bf16-k-bar requires --mixed-summaries")
     l2_flush = None
     if args.cold_l2:
         l2_flush = torch.empty(
@@ -505,6 +516,7 @@ def main():
                 device=device,
                 summary_dtype=summary_dtype,
                 mixed_summaries=args.mixed_summaries,
+                bf16_k_bar=args.bf16_k_bar,
             )
             q_grouped = torch.randn(
                 (args.kv_heads, group_size, 1, args.head_dim),
@@ -525,6 +537,7 @@ def main():
                 "block_size": int(args.block_size),
                 "summary_dtype": args.summary_dtype,
                 "mixed_summaries": args.mixed_summaries,
+                "bf16_k_bar": args.bf16_k_bar,
                 "cold_l2": args.cold_l2,
                 "tma_bounds": args.tma_bounds,
                 "tma_persist_chunks": int(
@@ -554,6 +567,7 @@ def main():
                 "block_size": int(args.block_size),
                 "summary_dtype": args.summary_dtype,
                 "mixed_summaries": args.mixed_summaries,
+                "bf16_k_bar": args.bf16_k_bar,
                 "cold_l2": args.cold_l2,
                 "tma_bounds": args.tma_bounds,
                 "tma_persist_chunks": int(
@@ -595,6 +609,7 @@ def main():
                 "block_size": int(args.block_size),
                 "summary_dtype": args.summary_dtype,
                 "mixed_summaries": args.mixed_summaries,
+                "bf16_k_bar": args.bf16_k_bar,
                 "cold_l2": args.cold_l2,
                 "tma_bounds": args.tma_bounds,
                 "tma_persist_chunks": int(
@@ -634,6 +649,7 @@ def main():
                     "block_size": int(args.block_size),
                     "summary_dtype": args.summary_dtype,
                     "mixed_summaries": args.mixed_summaries,
+                    "bf16_k_bar": args.bf16_k_bar,
                     "n_blocks": int(prefix["block_valid_counts"].numel()),
                     "suffix_tokens": int(args.suffix_tokens),
                     "cold_l2": args.cold_l2,
@@ -669,6 +685,7 @@ def main():
                     "block_size": int(args.block_size),
                     "summary_dtype": args.summary_dtype,
                     "mixed_summaries": args.mixed_summaries,
+                    "bf16_k_bar": args.bf16_k_bar,
                     "n_blocks": int(prefix["block_valid_counts"].numel()),
                     "suffix_tokens": int(args.suffix_tokens),
                     "stage": "dummy_sparse_attention",

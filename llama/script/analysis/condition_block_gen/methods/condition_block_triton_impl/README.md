@@ -855,6 +855,55 @@ CUDA-graph decode-only（128 fixed tokens，3 measured）：128K mixed
 结论：达到 selection ≥5% 的保留标准，但 e2e 只有约 1%，所以保持显式可选，
 不作为跨硬件默认路径。
 
+### Step 2b：BF16 `k_bar` storage（已实现，可选、近似）
+
+在 exact mixed-summary layout 上进一步把 `k_bar` 从 FP32 改为 BF16：
+
+```bash
+CONDITION_BLOCK_MIXED_SUMMARIES=1 \
+CONDITION_BLOCK_K_BAR_DTYPE=bfloat16
+```
+
+只改变 block mean 的存储；`k_max/k_min`、`v_bar`、value norm、condition
+公式、selected-page attention 和 suffix attention 都不变。kernel 从 HBM load
+BF16 mean 后仍转成 FP32 计算 `q @ k_bar`。这不是严格等价优化：`k_bar` 是
+FP32 累积得到的均值，存成 BF16 会有量化误差，因此保持 opt-in。
+128K、8 KV heads、head_dim 128 时，block32 每层 `k_bar` 从 16 MiB 降到
+8 MiB（32 层共省 256 MiB），block64 从 8 MiB 降到 4 MiB（共省 128 MiB）；
+相同字节也会从每层每个 decode step 的 selection HBM stream 中移除。
+
+Synthetic paired sanity 覆盖 block32/64、ordinary/TMA bounds：selected mask
+全部 0 mismatch，`s/delta` max-abs 为 `0.0016–0.0027`，fused BF16 output
+max-abs ≤`2.44e-4`。真实 block64、eps 0.1、每数据集 20 条：
+
+| dataset | FP32 `k_bar` | BF16 `k_bar` | delta | exact pred | budget FP32→BF16 |
+|---|---:|---:|---:|---:|---:|
+| NarrativeQA | 38.84 | 38.84 | 0.00 | 18/20 | 0.2460→0.2454 |
+| GovReport | 24.22 | 24.27 | +0.05 | 6/20 | 0.28453→0.28451 |
+
+低 exact-pred 主要来自 greedy decode 放大浮点微差；平均分数与实际 budget 没有
+系统性退化。独占 GPU 7 的 cold-L2 stage（mixed baseline，非 TMA）：
+
+| block/context | selection FP32→BF16 | speedup | fused FP32→BF16 | speedup |
+|---|---:|---:|---:|---:|
+| block32 / 64K | 39.10→33.11 us | 1.181x | 60.66→55.61 us | 1.091x |
+| block32 / 128K | 55.43→49.94 us | 1.110x | 82.09→77.57 us | 1.058x |
+| block64 / 64K | 30.72→28.41 us | 1.081x | 49.16→46.59 us | 1.055x |
+| block64 / 128K | 39.36→33.30 us | 1.182x | 61.28→56.06 us | 1.093x |
+
+与 TMA bounds 叠加不划算：block64 的 64K fused 只有 1.001x，128K 是
+0.991x；TMA 已改变 selection load 的瓶颈结构。CUDA-graph decode-only，
+block64、128 fixed tokens、3 measured：
+
+| context | FP32 `k_bar` | BF16 `k_bar` | speedup |
+|---:|---:|---:|---:|
+| 64K | 2.0589 s | 2.0452 s | 1.007x |
+| 128K | 2.1072 s | 2.0928 s | 1.007x |
+
+结论：attention stage 明确变快且 summary 显存继续下降，但 e2e 只有约 0.7%，
+接近 run noise，原因仍是 model GEMV 主导。保留为研究/显存 opt-in，不设为默认，
+也不与 TMA 同时推荐。实现和复现实验位于 `kbar_bf16_experiment/`。
+
 ### Step 3：cache policy（已测试，不采用）
 
 对一次性流式 summary/page load 尝试 `.cg`/`evict_first`，对同层随后立即消费

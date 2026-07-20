@@ -74,6 +74,14 @@ def parse_args():
         action="store_true",
         help="Set CONDITION_BLOCK_TMA_BOUNDS=1 for packed Hopper/Blackwell bounds loads.",
     )
+    parser.add_argument(
+        "--bf16-k-bar",
+        action="store_true",
+        help=(
+            "Set CONDITION_BLOCK_K_BAR_DTYPE=bfloat16. Requires "
+            "--mixed-summaries and may change routing."
+        ),
+    )
     parser.add_argument("--triton-chunk-blocks", type=int, default=64)
     parser.add_argument("--hf-repo", default=None, help="Override LongBench v2 HF repo. Default tries THUDM then zai-org.")
     parser.add_argument("--split", default="train")
@@ -306,6 +314,10 @@ def main():
         os.environ["CONDITION_BLOCK_MIXED_SUMMARIES"] = "1"
     if args.tma_bounds:
         os.environ["CONDITION_BLOCK_TMA_BOUNDS"] = "1"
+    if args.bf16_k_bar:
+        if not args.mixed_summaries:
+            raise ValueError("--bf16-k-bar requires --mixed-summaries")
+        os.environ["CONDITION_BLOCK_K_BAR_DTYPE"] = "bfloat16"
     os.environ.setdefault("CONDITION_BLOCK_TRITON_CHUNK_BLOCKS", str(args.triton_chunk_blocks))
 
     repo, dataset = load_longbench_v2(args.hf_repo, args.split)
@@ -402,6 +414,7 @@ def main():
                     payload["condition_eps"] = args.condition_eps
                     payload["mixed_summaries"] = args.mixed_summaries
                     payload["tma_bounds"] = args.tma_bounds
+                    payload["bf16_k_bar"] = args.bf16_k_bar
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                     handle.flush()
                     print(json.dumps(payload, ensure_ascii=False), flush=True)

@@ -411,11 +411,12 @@ def _ensure_paged_layout(x, block_size):
 def _summary_storage_dtypes(source_dtype):
     """Choose summary storage dtypes without changing fused-kernel arithmetic.
 
-    The production kernel consumes ``k_bar`` in FP32, but ``v_bar`` is rounded
+    The exact mixed layout keeps ``k_bar`` in FP32, while ``v_bar`` is rounded
     to BF16 immediately before the representative-value dot product.  The
     coordinate extrema are values copied from the source K tensor, so storing
-    them in that source dtype is lossless.  This mixed layout therefore removes
-    bytes that the fused path would otherwise widen and then narrow again.
+    them in that source dtype is lossless.  The optional BF16 ``k_bar`` layout
+    reduces IO further, but is approximate because the block mean was
+    accumulated in FP32.
 
     ``CONDITION_BLOCK_SUMMARY_DTYPE`` remains the older uniform, potentially
     approximate layout.  Mixing the two modes would make the accuracy contract
@@ -424,6 +425,17 @@ def _summary_storage_dtypes(source_dtype):
     summary_dtype_name = os.environ.get("CONDITION_BLOCK_SUMMARY_DTYPE", "float32")
     summary_dtype = getattr(torch, summary_dtype_name)
     mixed = os.environ.get("CONDITION_BLOCK_MIXED_SUMMARIES") == "1"
+    k_bar_dtype_name = os.environ.get("CONDITION_BLOCK_K_BAR_DTYPE", "float32")
+    if k_bar_dtype_name not in ("float32", "bfloat16"):
+        raise ValueError(
+            "CONDITION_BLOCK_K_BAR_DTYPE must be float32 or bfloat16, got "
+            f"{k_bar_dtype_name!r}."
+        )
+    if not mixed and k_bar_dtype_name != "float32":
+        raise ValueError(
+            "CONDITION_BLOCK_K_BAR_DTYPE=bfloat16 requires "
+            "CONDITION_BLOCK_MIXED_SUMMARIES=1."
+        )
     if not mixed:
         return summary_dtype, summary_dtype, summary_dtype
     if summary_dtype != torch.float32:
@@ -431,7 +443,7 @@ def _summary_storage_dtypes(source_dtype):
             "CONDITION_BLOCK_MIXED_SUMMARIES=1 requires "
             "CONDITION_BLOCK_SUMMARY_DTYPE=float32 (or unset)."
         )
-    return torch.float32, torch.bfloat16, source_dtype
+    return getattr(torch, k_bar_dtype_name), torch.bfloat16, source_dtype
 
 
 def _build_prompt_blocks(k_all, v_all, block_size):

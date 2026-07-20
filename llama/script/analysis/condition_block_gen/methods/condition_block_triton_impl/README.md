@@ -16,6 +16,59 @@ Stats 默认开启，用于输出等效 budget。实现中 stats 计数延迟到
 materialize，避免 decode 每层每步 `.item()` 同步；纯测速可设置
 `CONDITION_BLOCK_SKIP_STATS=1` 关闭。
 
+## 当前推荐：128K long-context preset
+
+当前实测最优组合已经收敛到单一入口 `best_long_context/`：
+
+```text
+block_size=64, eps=0.1
+mixed summaries + BF16 k_bar
+post-prefill StaticCache
+CUDA Graph decode
+stats off
+TMA bounds off
+```
+
+复现 latency 时直接使用 `longbench_v2_latency.py
+--best-long-context-config`；LongBench generation 使用
+`best_long_context.run_longbench`。preset 没有继续携带历史
+`torch.compile` selection 或 production chunk-size knob：前者在 CUDA fused
+selection 下不可达，后者只影响显式 legacy stage2。清理同时删除了 core 中从未
+被调用的旧 selection kernel，共净删约 200 行，不删除 dense/compact/legacy
+reference，因为它们仍用于数值回归。
+
+完整 release sanity（独占 GPU 7）：
+
+- block64 dense reference：4/4 cases selected mask 0 mismatch，output max-abs
+  ≤`4.88e-4`；
+- BF16 `k_bar`：block32/64 × ordinary/TMA 4/4 cases selected mask 0
+  mismatch，output max-abs ≤`2.44e-4`；
+- LongBench-v2 eager vs CUDA Graph：32K、64K、131,064 prompt 均强制生成
+  8 tokens，3/3 token sequences 完全一致；
+- LongBench paired quality：NarrativeQA/GovReport 各 50 条、MultiNews 20 条，
+  共 240 次生成，无 NaN/OOM/crash。
+
+| dataset | samples | block32 score | preset score | delta | block32→preset budget |
+|---|---:|---:|---:|---:|---:|
+| NarrativeQA | 50 | 27.15 | 28.46 | +1.31 | 0.188→0.227 |
+| GovReport | 50 | 23.80 | 23.43 | -0.37 | 0.173→0.275 |
+| MultiNews | 20 | 20.92 | 21.46 | +0.54 | 0.607→0.780 |
+
+质量没有系统性退化，但这不是 matched-budget 对比：block64 的 bound 更松，
+实际展开明显增加。尤其 MultiNews budget 已到 0.78，因此该 preset 只推荐给
+约 128K 的 latency 场景；短/中 context 或高展开数据继续使用 block32，并根据
+质量要求调 eps。
+
+清理后的 CUDA-graph decode-only（128 fixed tokens，1 warmup + 3 measured）：
+
+| context | preset mean | preset median | 先前 block32 baseline | speedup |
+|---:|---:|---:|---:|---:|
+| 64K | 1.9969 s | 1.9944 s | 2.0613 s | 1.032x（跨 run，接近噪声） |
+| 128K | 2.0907 s | 2.0924 s | 2.1850 s | **1.045x** |
+
+清理前同配置的 128K 是 2.0928s，说明重构/删死代码没有 latency regression。
+完整命令和逐项结果见 `best_long_context/README.md`。
+
 ## Native block 64（128K 可选）
 
 生产 fused kernel 与 CUDA-graph decode 已扩展到原生 `block_size=64`。公式不变，
@@ -87,7 +140,7 @@ max_new_tokens: 128 fixed decode
 block_size: 32
 eps: 0.1
 stats: disabled
-selection: compiled
+selection: fused Triton
 
 context   old Triton   post-static Triton   full attention
 32K       6.05s        5.41s                5.23s
@@ -107,8 +160,6 @@ KV/cache profiler category:
 
 ```bash
 CONDITION_BLOCK_SKIP_STATS=1 \
-CONDITION_BLOCK_COMPILE_SELECTION=1 \
-CONDITION_BLOCK_TRITON_CHUNK_BLOCKS=64 \
 CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE=1
 ```
 
@@ -139,7 +190,6 @@ python -m llama.script.analysis.condition_block_gen.longbench_v2_latency \
   --condition-block-size 32 \
   --condition-eps 0.1 \
   --skip-stats \
-  --compile-selection \
   --fixed-decode \
   --decode-only-timing \
   --output /tmp/lb2_decode_only_32k_128k.jsonl
@@ -306,7 +356,6 @@ Run production decode-only profiling on the original generate path:
 ```bash
 CUDA_VISIBLE_DEVICES=<gpu> PYTHONPATH=/scratch1/liankewei/interattn \
 CONDITION_BLOCK_SKIP_STATS=1 \
-CONDITION_BLOCK_COMPILE_SELECTION=1 \
 CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE=1 \
 python -m llama.script.analysis.condition_block_gen.longbench_v2_latency \
   --device cuda:0 \
@@ -317,7 +366,6 @@ python -m llama.script.analysis.condition_block_gen.longbench_v2_latency \
   --condition-block-size 32 \
   --condition-eps 0.1 \
   --skip-stats \
-  --compile-selection \
   --fixed-decode \
   --decode-only-timing \
   --profile \
@@ -351,7 +399,7 @@ max_new_tokens = 128
 block_size = 32
 eps = 0.1
 stats disabled
-compiled selection enabled
+fused Triton selection enabled
 post-prefill StaticCache enabled
 ```
 

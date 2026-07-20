@@ -63,7 +63,6 @@ def parse_args():
     parser.add_argument("--condition-eps", type=float, default=0.1)
     parser.add_argument("--full-attention-layers", type=int, default=0)
     parser.add_argument("--skip-stats", action="store_true", help="Set CONDITION_BLOCK_SKIP_STATS=1 for condition-block methods.")
-    parser.add_argument("--compile-selection", action="store_true", help="Set CONDITION_BLOCK_COMPILE_SELECTION=1 for Triton condition-block.")
     parser.add_argument(
         "--mixed-summaries",
         action="store_true",
@@ -82,7 +81,14 @@ def parse_args():
             "--mixed-summaries and may change routing."
         ),
     )
-    parser.add_argument("--triton-chunk-blocks", type=int, default=64)
+    parser.add_argument(
+        "--best-long-context-config",
+        action="store_true",
+        help=(
+            "Apply the measured best preset: block64, eps=0.1, mixed summaries, "
+            "BF16 k_bar, post-prefill StaticCache, CUDA graph, and stats off."
+        ),
+    )
     parser.add_argument("--hf-repo", default=None, help="Override LongBench v2 HF repo. Default tries THUDM then zai-org.")
     parser.add_argument("--split", default="train")
     parser.add_argument("--record-offset", type=int, default=0)
@@ -305,11 +311,17 @@ def run_generate(model, tokenizer, method, args, input_ids, attention_mask, deco
 
 def main():
     args = parse_args()
+    if args.best_long_context_config:
+        from .methods.condition_block_triton_impl.best_long_context.config import (
+            apply_latency_preset,
+            apply_process_environment,
+        )
+
+        args = apply_latency_preset(args)
+        apply_process_environment(cuda_graph=True, collect_stats=False)
     set_seed(42)
     if args.skip_stats:
         os.environ["CONDITION_BLOCK_SKIP_STATS"] = "1"
-    if args.compile_selection:
-        os.environ["CONDITION_BLOCK_COMPILE_SELECTION"] = "1"
     if args.mixed_summaries:
         os.environ["CONDITION_BLOCK_MIXED_SUMMARIES"] = "1"
     if args.tma_bounds:
@@ -318,7 +330,6 @@ def main():
         if not args.mixed_summaries:
             raise ValueError("--bf16-k-bar requires --mixed-summaries")
         os.environ["CONDITION_BLOCK_K_BAR_DTYPE"] = "bfloat16"
-    os.environ.setdefault("CONDITION_BLOCK_TRITON_CHUNK_BLOCKS", str(args.triton_chunk_blocks))
 
     repo, dataset = load_longbench_v2(args.hf_repo, args.split)
     args.output.parent.mkdir(parents=True, exist_ok=True)

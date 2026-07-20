@@ -41,7 +41,6 @@ def parse_args():
     parser.add_argument("--condition-block-size", type=int, default=32)
     parser.add_argument("--condition-eps", type=float, default=0.1)
     parser.add_argument("--selected-ratios", nargs="+", type=float, default=[0.0, 0.05, 0.1, 0.25])
-    parser.add_argument("--triton-chunk-blocks", type=int, default=64)
     parser.add_argument("--hf-repo", default=None)
     parser.add_argument("--split", default="train")
     parser.add_argument("--record-offset", type=int, default=0)
@@ -188,8 +187,6 @@ def main():
     args = parse_args()
     set_seed(42)
     os.environ["CONDITION_BLOCK_SKIP_STATS"] = "1"
-    os.environ["CONDITION_BLOCK_COMPILE_SELECTION"] = "1"
-    os.environ.setdefault("CONDITION_BLOCK_TRITON_CHUNK_BLOCKS", str(args.triton_chunk_blocks))
     os.environ.setdefault("CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE", "1")
     args.output.parent.mkdir(parents=True, exist_ok=True)
 

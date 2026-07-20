@@ -599,7 +599,11 @@ def main():
                 term1_mass_exp=args.term1_mass_exp,
             )
             torch.cuda.synchronize()
-            actual_selected_ratio = float(selected_actual[0, 0, 0].float().mean().item())
+            # GQA query heads within one KV group share routing. Report all KV
+            # heads rather than the historical head-0-only statistic, which
+            # can be badly misleading near the epsilon threshold.
+            selected_by_kv_head = selected_actual[:, 0, 0].float().mean(dim=-1)
+            actual_selected_ratio = float(selected_by_kv_head.mean().item())
             fused_workspace = {}
             suffix_len_dev = torch.full(
                 (), int(args.suffix_tokens), dtype=torch.int32, device=device
@@ -621,6 +625,8 @@ def main():
                 "score_kind": "term1_softmax" if args.term1_mass_exp else "original",
                 "eps": float(args.eps),
                 "actual_selected_ratio": actual_selected_ratio,
+                "actual_selected_ratio_min": float(selected_by_kv_head.min().item()),
+                "actual_selected_ratio_max": float(selected_by_kv_head.max().item()),
                 "latency_ms": cuda_time_ms(
                     lambda: _condition_block_decode_output_fused_triton(
                         q_grouped=q_grouped,

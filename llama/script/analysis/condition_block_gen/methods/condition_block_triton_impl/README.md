@@ -461,6 +461,15 @@ Stage microbench:
 | 64K | 0.068 ms | 0.218 ms | 0.031 ms | 0.031 ms | 0.040 ms |
 | 128K | 0.073 ms | 0.403 ms | 0.031 ms | 0.043 ms | 0.111 ms |
 
+The dummy ratios remain useful kernel-isolation inputs, but the production
+routing in this synthetic benchmark is not representative: independent random
+clusters make each softmax mass scale approximately as `1/n_blocks`, so a fixed
+epsilon can cross abruptly from many selected blocks to none. Production
+theoretical-attainment claims must use captured real-model masks. The corrected
+benchmark is in `real_attention_benchmark/`; its block64/eps0.1 five-record
+result is 2.42x/3.70x/5.45x production attention speedup at 32K/64K/128K,
+reaching 73%/66%/67% of the executable fixed-real-mask ceiling.
+
 Decode-only full vs Triton:
 
 | context | full decode | Triton decode | Triton vs full |

@@ -78,8 +78,9 @@ Related files:
 - `longbench/summarize_double_p.py`: one-setting report.
 - `longbench/summarize_double_p_sweep.py`: paper-threshold sweep, CSVs, and
   macro plots.
-- `longbench/plot_double_p_tasks.py`: one comparison plot per task and the
-  joint ConditionBlock/Double-P Pareto frontier.
+- `longbench/plot_double_p_tasks.py`: comparison plots for tasks with
+  ConditionBlock results, showing the separate ConditionBlock and Double-P
+  curves without a joint frontier overlay.
 
 ## PPL workflows
 

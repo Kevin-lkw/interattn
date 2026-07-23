@@ -170,19 +170,19 @@ The summary reports both the repository-aligned 16-task macro average and the
 protocol adds `trec`, `samsum`, and `passage_count` to that paper subset.
 
 After the per-dataset `eval_dataset_plot.py` summaries exist, generate a clean
-4-by-4 task overview plus one presentation plot per task with:
+overview of the tasks that have ConditionBlock results plus one presentation
+plot for each of those tasks with:
 
 ```bash
 conda run -n nanogpt python -m \
   llama.script.analysis.condition_block_gen.longbench.plot_double_p_tasks
 ```
 
-These plots use a log-scale decode budget, show the measured Double-P point and
-the dense score, retain the available fixed-budget baselines, and collapse the
-available eager/Triton ConditionBlock sweeps into one non-dominated Pareto
-frontier. Where both methods are available, the dark dashed curve is the joint
-ConditionBlock/Double-P frontier, so its marker colors identify which method
-owns each task-specific budget region. The raw per-dataset plots remain
+These plots use a log-scale decode budget, show all measured Double-P points
+and the dense score, retain the available fixed-budget baselines, and collapse
+the available eager/Triton ConditionBlock sweeps into one non-dominated Pareto
+frontier. They do not draw a combined ConditionBlock/Double-P frontier. Tasks
+without ConditionBlock results are skipped. The raw per-dataset plots remain
 unchanged under each dataset's `eval_plots/` directory.
 
 The Double-P paper does not name a separate low-budget preset. Its Figure 10

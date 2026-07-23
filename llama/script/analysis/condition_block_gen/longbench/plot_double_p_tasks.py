@@ -40,10 +40,6 @@ CONDITION_STYLE = {
     "color": "#E45756",
     "marker": "o",
 }
-JOINT_STYLE = {
-    "label": "CB/Double-P joint Pareto",
-    "color": "#111827",
-}
 DOUBLE_P_COLOR = "#0891B2"
 FULL_COLOR = "#111827"
 
@@ -132,12 +128,18 @@ def load_dataset(root, dataset, p1, p2):
     double_p_rows = [
         row for row in rows if row.get("method") == "double_p" and valid_point(row)
     ]
+    condition_rows = [
+        row
+        for row in rows
+        if row.get("method") in CONDITION_METHODS and valid_point(row)
+    ]
     return {
         "dataset": dataset,
         "rows": rows,
         "full": full_rows[0],
         "double_p": select_double_p(rows, p1, p2),
         "double_p_rows": double_p_rows,
+        "condition_rows": condition_rows,
     }
 
 
@@ -168,9 +170,7 @@ def draw_panel(
     rows = task["rows"]
     full = task["full"]
     double_p = task["double_p"]
-    condition_rows = [
-        row for row in rows if row.get("method") in CONDITION_METHODS
-    ]
+    condition_rows = task["condition_rows"]
     double_p_points = best_at_each_budget(task["double_p_rows"])
     for method, style in CURVE_METHODS.items():
         plot_curve(ax, [row for row in rows if row.get("method") == method], style)
@@ -203,18 +203,6 @@ def draw_panel(
             [float(row["score"]) for row in double_p_frontier],
             color=DOUBLE_P_COLOR,
             linewidth=1.5,
-            zorder=4,
-        )
-    if condition_points and double_p_points:
-        joint_frontier = pareto_frontier(condition_rows + double_p_points)
-        ax.plot(
-            [budget(row) for row in joint_frontier],
-            [float(row["score"]) for row in joint_frontier],
-            color=JOINT_STYLE["color"],
-            linestyle="--",
-            linewidth=1.9,
-            alpha=0.72,
-            label=JOINT_STYLE["label"],
             zorder=4,
         )
     ax.scatter(
@@ -279,8 +267,6 @@ def ordered_legend(tasks):
             labels.append(style["label"])
     if present & CONDITION_METHODS:
         labels.append(CONDITION_STYLE["label"])
-    if present & CONDITION_METHODS and "double_p" in present:
-        labels.append(JOINT_STYLE["label"])
     labels.extend(["Double-P", "Full attention"])
     return labels
 
@@ -297,7 +283,7 @@ def legend_handles(axes, labels):
 
 
 def plot_grid(path, tasks, dpi):
-    columns = 4
+    columns = 3
     rows = math.ceil(len(tasks) / columns)
     fig, axes = plt.subplots(
         rows,
@@ -331,7 +317,7 @@ def plot_grid(path, tasks, dpi):
         frameon=False,
     )
     fig.suptitle(
-        "LongBench per-task comparison (log decode budget)",
+        "LongBench tasks with ConditionBlock results (log decode budget)",
         fontsize=17,
         y=0.995,
     )
@@ -366,10 +352,16 @@ def main():
     output_dir = args.output_dir or root / "double_p_summary"
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"p1={args.p1:g}_p2={args.p2:g}"
-    tasks = [load_dataset(root, dataset, args.p1, args.p2) for dataset in args.datasets]
+    loaded_tasks = [
+        load_dataset(root, dataset, args.p1, args.p2) for dataset in args.datasets
+    ]
+    tasks = [task for task in loaded_tasks if task["condition_rows"]]
+    skipped = [task["dataset"] for task in loaded_tasks if not task["condition_rows"]]
+    if not tasks:
+        raise ValueError("No requested task has a valid ConditionBlock result")
 
-    grid_path = output_dir / f"{stem}_per_task_comparison.png"
-    individual_dir = output_dir / f"{stem}_per_task"
+    grid_path = output_dir / f"{stem}_condition_tasks_comparison.png"
+    individual_dir = output_dir / f"{stem}_condition_tasks"
     individual_dir.mkdir(parents=True, exist_ok=True)
     plot_grid(grid_path, tasks, args.plot_dpi)
     for task in tasks:
@@ -380,6 +372,8 @@ def main():
         )
     print(f"Saved per-task grid: {grid_path}")
     print(f"Saved {len(tasks)} individual plots: {individual_dir}")
+    if skipped:
+        print(f"Skipped {len(skipped)} tasks without ConditionBlock results: {skipped}")
 
 
 if __name__ == "__main__":

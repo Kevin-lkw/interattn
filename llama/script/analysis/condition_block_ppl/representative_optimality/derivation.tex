@@ -1,0 +1,135 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage[margin=1in]{geometry}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+
+\title{Is the arithmetic mean the optimal cluster representative?}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Setup}
+
+Fix a cluster $C$ with $n=|C|$ keys $k_i$ and values $v_i$. For a query $q$ write the
+scaled scores $s_i = q^\top k_i/\sqrt{d}$ and the within-cluster softmax weights and
+value
+\[
+  w_i(q) = \frac{e^{s_i}}{\sum_{j\in C} e^{s_j}}, \qquad
+  u_C(q) = \sum_{i\in C} w_i(q)\, v_i .
+\]
+The exact contribution of $C$ to attention is its mass $Z_C(q)=\sum_i e^{s_i}$ and its
+value $u_C(q)$. The method stores a query-independent representative $(k^\ast,v^\ast)$ and
+approximates
+\[
+  \hat Z_C(q) = n\, e^{q^\top k^\ast/\sqrt d}, \qquad \hat u_C = v^\ast,
+\]
+so that $\hat o = \sum_C \hat p_C v^\ast_C$ with $\hat p_C \propto \hat Z_C$. The current
+choice is $k^\ast=\bar k=\frac1n\sum_i k_i$, $v^\ast=\bar v=\frac1n\sum_i v_i$. We ask,
+for the \emph{query distribution $\mathcal Q$ that actually compresses $C$}, whether these
+minimize the true output error, and how the certificate changes off the mean.
+
+Let $\delta_C(q) = \max_i |s_i - q^\top\bar k/\sqrt d|$ and $B_C=\max_i\|v_i\|$. The
+current certificate for the value channel is $\|\bar v - u_C\|\le 2B_C\tanh(\delta_C/2)$
+and for the mass channel $2B(\cosh\delta_C-1)/S_\delta$.
+
+\section{The value representative}
+
+\begin{proposition}[MMSE storable value]\label{prop:value}
+Among query-independent $v^\ast$, the minimiser of $\mathbb E_{q\sim\mathcal Q}\|v^\ast-u_C(q)\|_2^2$ is
+\[
+  \boxed{\;v^\ast_C = \mathbb E_{q\sim\mathcal Q}[u_C(q)] = \sum_{i\in C}\bar w_i\, v_i,\qquad
+  \bar w_i = \mathbb E_{q\sim\mathcal Q}[w_i(q)]\;}
+\]
+a convex combination ($\bar w_i\ge0$, $\sum_i\bar w_i=1$), hence one stored vector. The
+uniform mean $\bar v$ is optimal iff $\bar w_i\equiv 1/n$.
+\end{proposition}
+\begin{proof}
+For a random vector $U=u_C(q)$ the constant minimising $\mathbb E\|c-U\|^2$ is
+$c=\mathbb E U$; here $\mathbb E U=\sum_i \mathbb E[w_i]\,v_i$ by linearity. Each $w_i(q)\in[0,1]$
+and $\sum_i w_i=1$ pointwise, so $\bar w$ is a probability vector.
+\end{proof}
+
+Thus $\bar v$ is optimal only under a symmetric query law; when the compressing queries
+attend some keys more than others on average ($\bar w\neq\text{uniform}$), the
+attention-weighted centroid strictly reduces the expected value error. The irreducible
+floor is the query variance $\mathbb E\|u_C-v^\ast\|^2 = \mathbb E\|u_C\|^2-\|v^\ast\|^2$;
+the oracle $u_C(q)$ attains zero and is the ceiling.
+
+\begin{corollary}[Certificate: mean is worst-case optimal, $v^\ast$ is average-case optimal]
+\label{cor:value-cert}
+For any storable convex weight $a$ (so $v^\ast=\sum_i a_i v_i$),
+\[
+  \|v^\ast-u_C\| = \Big\|\sum_i (a_i-w_i)(v_i-c)\Big\| \le B_C^{(c)}\sum_i|a_i-w_i|
+    = 2B_C^{(c)}\,\mathrm{TV}(a,w),
+\]
+with $B_C^{(c)}=\max_i\|v_i-c\|$. The uniform $a=1/n$ is the Chebyshev centre of the set
+of $\delta$-reachable weights $\{w(q):|s_i-\bar s|\le\delta\}$, hence minimises
+$\max_q\mathrm{TV}(a,w)$ and recovers $2B_C\tanh(\delta_C/2)$. Any $\bar w\neq$ uniform has
+$\max_q\mathrm{TV}(\bar w,w)\le 2\tanh(\delta_C/2)$ (triangle inequality), i.e. the
+certificate keeps the same TV form with a worst-case constant at most doubled, while the
+\emph{expected} error strictly drops.
+\end{corollary}
+
+This is the precise sense in which ``the bound changes'': $\bar v$ optimises the
+worst-case certificate, $v^\ast$ optimises the actual (average) error. Under the stated
+objective (actual error, certificate a valid/computable constraint) $v^\ast$ dominates.
+
+\section{The key representative}
+
+\begin{proposition}[Mass bias and loss of the $\cosh$ certificate]\label{prop:key}
+For $k^\ast=\bar k+\Delta$ and $\mu(q)=q^\top\Delta/\sqrt d$,
+\[
+  \frac{\hat Z_C(k^\ast)}{Z_C} = e^{\mu(q)}\,\frac{\hat Z_C(\bar k)}{Z_C},\qquad
+  \frac{\hat Z_C(\bar k)}{Z_C}=\frac{1}{\tfrac1n\sum_i e^{x_i}},\ \ x_i=s_i-q^\top\bar k/\sqrt d .
+\]
+At $k^\ast=\bar k$ the deviations are mean-zero ($\frac1n\sum_i x_i=0$), which is exactly
+the hypothesis of $\frac1n\sum_i e^{x_i}\le\cosh\delta_C$. Any $\Delta\neq0$ (i) makes the
+per-query mass estimate first-order biased by $e^{\mu(q)}$, and (ii) violates mean-zero, so
+the mass certificate must be re-derived as $\frac1n\sum_i e^{x_i}\le e^{\mu}\cosh\delta_C'$,
+generally looser.
+\end{proposition}
+\begin{proof}
+$\hat Z_C(k^\ast)=n e^{q^\top k^\ast/\sqrt d}=e^{\mu} n e^{q^\top\bar k/\sqrt d}
+=e^{\mu}\hat Z_C(\bar k)$, and $Z_C=e^{q^\top\bar k/\sqrt d}\sum_i e^{x_i}$. The bound
+$\frac1n\sum e^{x_i}\le\cosh\delta$ under $|x_i|\le\delta,\ \sum x_i=0$ is tight at the
+two-point law $\pm\delta$; dropping $\sum x_i=0$ shifts the extremiser and adds the $e^\mu$
+factor.
+\end{proof}
+
+The $\Delta$ minimising the mean log-mass error $\mathbb E_{\mathcal Q}\big[\log Z_C-\log\hat Z_C(k^\ast)\big]^2$
+solves the $q$-weighted normal equations
+$\mathbb E_{\mathcal Q}\big[(\log\tfrac{Z_C}{n}-q^\top k^\ast/\sqrt d)\,q\big]=0$; it can shrink
+the \emph{average} bias but not the per-query one, and forfeits the clean certificate. The
+attention-weighted key $k^\ast=\sum_i\bar w_i k_i$ is a cheap heuristic surrogate.
+
+\section{Coupling of the two channels}
+
+\begin{proposition}[Why the channels cannot be optimised independently]\label{prop:joint}
+Writing $\hat o-o=\sum_C(\hat p_C-p_C)u_C+\sum_C\hat p_C(v^\ast_C-u_C)$, the first (mass)
+and second (value) sums share the normaliser and, under the structured compressing-query
+law, are anti-correlated: a mass over-estimate on $C$ inflates $\hat p_C$ exactly where the
+value residual $v^\ast_C-u_C$ is systematically signed, partially cancelling. Hence
+optimising $v^\ast$ at fixed $k^\ast=\bar k$ is the safe first target; a joint $(k^\ast,v^\ast)$
+change must be scored on the full error, with the joint oracle $(Z_C,u_C)$ (zero error) as
+ceiling.
+\end{proposition}
+
+This matches the earlier estimator-correction finding that a per-query first-order value
+fix hurts the total error; Proposition~\ref{prop:value} differs in using a fixed
+$\mathcal Q$-averaged reweighting, which is untested and is the object of the offline study.
+
+\section{Predictions to test offline}
+\begin{enumerate}
+\item $v^\ast=\sum_i\bar w_i v_i$ (compress-distribution weights) reduces the true output
+  error over $\bar v$, and closes a measurable fraction of the $\bar v\!\to\!u_C$ gap.
+\item Using the compressing-query law $\mathcal Q$ beats an all-query average $\bar w^{\text{all}}$.
+\item The key surrogate $k^\ast=\sum_i\bar w_i k_i$ helps the mass estimate marginally but
+  loosens the certificate; the anti-correlation of Prop.~\ref{prop:joint} may erase the
+  joint gain.
+\end{enumerate}
+
+\end{document}

@@ -77,24 +77,25 @@ Relative true error `||o_hat-o||/||o||` at layer 15:
 - The value channel generally has more headroom than mass (`oracle_u < oracle_m`), but the
   storable `v*` captures only ~1/2 of it — the rest is per-query (`u_C(q)`), not storable.
 
-A cheap **storable proxy** recovers the whole gain: `v_qmean = sum_i softmax(q_bar.k_i) v_i`
-with `q_bar` the mean calibration-query direction (one vector per head) matches `v_all`
-at every layer (e.g. L10: 0.1652 vs 0.1659). This makes `v*` deployable and is what
-Stage 4 uses.
+A cheap proxy `v_qmean = sum_i softmax(q_bar.k_i) v_i` with `q_bar` the mean query
+direction (one vector per head) matches `v_all` at every layer (e.g. L10: 0.1652 vs
+0.1659) — but note `v*` is only defined once you have `q_bar`, and whether `q_bar` is
+available before inference is exactly the deployability question that sinks this (see
+Stage 4 verdict).
 
-**Verdict:** avg V is near-optimal, not optimal — an attention-weighted value centroid is a
-small, consistent, bound-preserving improvement (one stored vector); avg K is effectively
-optimal for deployment.
+**Verdict (offline):** avg V is near-optimal, not optimal — an attention-weighted value
+centroid is a small, consistent, bound-preserving improvement in true error (one stored
+vector); avg K is effectively optimal for deployment.
 
 Per-layer TSVs: `result/representative_optimality/<model>/layer<L>_block<B>/offline.tsv`.
 
-## Stage 4 — matched-budget PPL (`ppl.py`) — PASS
+## Stage 4 — matched-budget PPL (`ppl.py`) — NO-GO for deployment
 
 Paired PPL: at each eps the model runs twice (stock `v_bar` vs a monkeypatched hybrid
 using `v* = sum_t softmax(q_bar.k_t) v_t`, `q_bar` = mean query direction of the head over
-the window, within-cluster weights over visible tokens only → leakage-free). Selection is
-independent of the value representative, so both runs share the exact same budget — a clean
-paired matched-budget test. Only `runner_cond_block._batched_hybrid_outputs_for_queries` is
+the window, within-cluster weights over visible tokens only). Selection is independent of
+the value representative, so both runs share the exact same budget — a clean paired
+matched-budget test. Only `runner_cond_block._batched_hybrid_outputs_for_queries` is
 monkeypatched; no existing file is edited.
 
 ```
@@ -108,14 +109,23 @@ Llama-2-7b, block 10, wikitext aligned, 4 windows, teacher PPL 8.30:
 |---:|---:|---:|---:|---:|---:|
 | 8 | 0.169 | 1018.5 | 601.5 | 0.591 | (collapse regime, both unusable) |
 | 4 | 0.184 |  26.66 | 21.09 | 0.791 | (collapse regime) |
-| 2 | 0.198 |   8.86 |  8.64 | 0.975 | **39%** |
-| 1 | 0.217 |   8.46 |  8.40 | 0.993 | **37%** |
+| 2 | 0.198 |   8.86 |  8.64 | 0.975 | 39% |
+| 1 | 0.217 |   8.46 |  8.40 | 0.993 | 37% |
 
-`v*` lowers PPL at **every eps and every one of the 4 windows** (all `dNLL < 0`). In the
-usable regime (PPL near teacher, budget ~0.2) it consistently closes ~37-39% of the
-student-teacher gap; at aggressive budgets it partially rescues the collapse (ratio
-0.59-0.79). The single-layer ~5% error gain compounds across layers into a stable PPL win.
-`v*` is one stored vector, cheap (one `q_bar` per head, available at prefill), and preserves
-the certificate. Caveat: `q_bar` here is taken from the eval window itself (a low-capacity
-1-vector/head statistic whose generalisation the offline held-out split already confirmed);
-a fully held-out calibration of `q_bar` is the natural follow-up before deployment.
+`v*` lowers PPL at every eps and every window, closing ~37-39% of the student-teacher gap
+in the usable regime. **BUT this number is an oracle upper bound, not a deployable result.**
+`q_bar = q_pos.mean(dim=1)` is the mean over the eval window's OWN queries, including the
+future positions relative to each scored token — so the representative is tuned on the very
+queries it is evaluated on (in-sample + mild future leakage). At real decode time `q_bar`
+would have to be built from EARLIER queries (prompt / prefill) and applied to later decode
+queries; that prompt→decode transfer of `q_bar` is not something we can rely on (RoPE phase
+differs between prompt and decode positions; untested), and it is the whole basis of the
+gain.
+
+**Verdict: NO-GO.** The only measured PPL win from the attention-weighted centroid `v*`
+requires an oracle `q_bar` that is not available before inference. The honest deployable
+`q_bar` (calibrated from prior queries) is judged unreliable, so `v*` is **not adopted** —
+keep `v_bar`. avg V therefore stands as the deployment representative despite being offline-
+suboptimal, and avg K was already effectively optimal. (`offline.py`'s held-out even/odd
+`q_bar` result is honest but only single-layer error; the PPL-level held-out `q_bar` test
+was not pursued given the transfer is not trusted.)

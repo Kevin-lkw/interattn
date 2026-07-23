@@ -34,6 +34,16 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warm-l2", action="store_true", help="Skip the per-iteration L2 flush.")
+    parser.add_argument(
+        "--w-dtype",
+        default="float32",
+        choices=["float32", "bfloat16"],
+        help=(
+            "Storage dtype for the diag_ell w vector. bfloat16 rounds w UP by a "
+            "2^-7 relative bump before casting, so the stored value is >= the "
+            "exact w and the delta stays a strict upper bound."
+        ),
+    )
     parser.add_argument("--l2-flush-mib", type=int, default=256)
     parser.add_argument("--output", type=Path, default=Path("/tmp/ball_bench_selection.jsonl"))
     return parser.parse_args()
@@ -42,7 +52,7 @@ def parse_args():
 def eager_diag_ell_delta(q_grouped, prefix, scale):
     w, rho = diag_ell_stats(prefix)
     qf = q_grouped.float()
-    qw = torch.sqrt(torch.einsum("gsqd,gbd->gsqb", qf.pow(2), w.pow(2)))
+    qw = torch.sqrt(torch.einsum("gsqd,gbd->gsqb", qf.pow(2), w.float().pow(2)))
     return rho[:, None, None, :] * qw * scale
 
 
@@ -75,7 +85,10 @@ def main():
             device=device,
             dtype=torch.bfloat16,
         )
-        diag_ell_stats(prefix)  # build w/rho outside the timed region
+        w, rho = diag_ell_stats(prefix)  # build w/rho outside the timed region
+        if args.w_dtype == "bfloat16":
+            # Round-up cast keeps delta a strict over-estimate (sound).
+            prefix["diag_ell_stats"] = ((w * (1.0 + 2.0**-7)).to(torch.bfloat16), rho)
 
         ws_box, ws_diag = {}, {}
         _, s_box, delta_box, _, glob_box, _, _ = core._run_condition_block_selection_stats(

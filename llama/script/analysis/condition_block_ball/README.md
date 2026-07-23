@@ -349,6 +349,48 @@ median-tightness win — it comes from the shape of its delta distribution
 feeding the condition score (sharper separation of the top tail), which the
 matched-budget PPL/LongBench gates measure directly.
 
+### Official vs-full attention timing (decode attribution methodology)
+
+`run_attribution.py` wraps `condition_block_decode_attribution.py` — the exact
+methodology behind the impl README's box "vs full attention" table (clean
+decode wall from an unprofiled run, per-kernel device-side times from a
+separate profiled run; CUDA graph, post-prefill StaticCache, stats off,
+GPU 7 exclusive, 128 fixed tokens). The box/full baselines reproduce the
+recorded numbers within <1% (full decode 22.27/31.69/49.61 ms/step vs recorded
+22.26/31.73/49.57; box attention 1686/2009/2890 us/step vs recorded
+1691/2016/2897).
+
+| context | full attn us/step | box attn | diag_ell attn | box vs full | **diag_ell vs full** | diag_ell vs box |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32K | 2613 | 1686 | 1341 | 1.55x | **1.95x** | 1.26x |
+| 64K | 7227 | 2009 | 1644 | 3.60x | **4.40x** | 1.22x |
+| 128K | 13366 | 2890 | 2201 | 4.63x | **6.07x** | 1.31x |
+
+Per-kernel at 128K: selection 1484 -> 1014 us/step (1.46x, matching the in-situ
+profile), finalize 1320 -> 1102 (1.20x, fewer selected pages at the same eps).
+Decode e2e vs full: 1.51x / 2.01x / 2.87x (box: 1.47x / 2.01x / 2.86x — the
+attention win is GEMV-diluted, as always). Against the diag_ell read-volume
+ceiling 1/(s + 1.5/B) ~ 16-20x, the realized 6.07x is ~1/3 — the remaining gap
+is small-read bandwidth efficiency, unchanged from the box analysis.
+
+### BF16 `w` storage (optional, still a strict bound)
+
+Unlike BF16 `k_bar` (approximate), `w` can be stored in BF16 with a round-up
+cast (`w * (1 + 2^-7)` before casting), which over-estimates delta by <=1% and
+therefore keeps the bound valid. `bench_selection.py --w-dtype bfloat16`,
+cold-L2:
+
+| context | diag_ell FP32-w | diag_ell BF16-w | increment | vs box |
+|---:|---:|---:|---:|---:|
+| 32K | 25.6 us | 24.1 us | +6.3% | 1.44x |
+| 64K | 31.7 us | 29.6 us | +7.0% | 1.39x |
+| 128K | 48.2 us | 44.5 us | +8.4% | 1.43x |
+
+The byte-count theory would allow +33%; the realized +6-8% shows the kernel is
+increasingly latency-bound as reads shrink (same pattern as BF16 summaries on
+the box kernel). Not yet wired into the production runner; adopting it needs
+only the cheap selection-parity gate since delta changes by <=1% relative.
+
 ## Final summary (diag_ell round)
 
 All gates passed; the strict-bound diag_ell selection is quality-neutral or
@@ -359,11 +401,12 @@ better at matched budget and reduces the attention phase by 1.32x in situ:
 - Whole attention phase at 128K in situ: 3.15 -> 2.39 ms/step (**1.32x**,
   vs a fixed-selected-ratio theoretical 1.30x — slightly above because the
   sharper delta also selects fewer pages at the same eps).
-- Combined with the box path's measured 4.62x attention-phase advantage over
-  full attention at 128K, the estimated cumulative attention-phase speedup is
-  ~6.1x, roughly 1/3 of the diag_ell read-volume ceiling 1/(s + 1.5/B) ~
-  16-20x; the remaining gap is small-read bandwidth efficiency (~60% of peak),
-  the same limitation documented for the box kernels.
+- Official vs-full attention-phase speedup (decode-attribution methodology,
+  baselines reproduced within <1%): **1.95x / 4.40x / 6.07x** at 32K/64K/128K
+  (box: 1.55x / 3.60x / 4.63x), roughly 1/3 of the diag_ell read-volume
+  ceiling 1/(s + 1.5/B) ~ 16-20x; the remaining gap is small-read bandwidth
+  efficiency (~60% of peak), the same limitation documented for the box
+  kernels.
 - e2e decode is unchanged (1.00-1.01x): model GEMV dominates, as throughout
   this project.
 

@@ -18,7 +18,13 @@ import sys
 
 from ..condition_block_gen.longbench import run_all
 from ..condition_block_gen.methods.condition_block_triton_impl import core
-from .gen_selection import select_prompt_blocks_ball
+from .gen_selection import select_prompt_blocks_ball, select_prompt_blocks_diag_ell
+
+SELECTIONS = {
+    "ball": select_prompt_blocks_ball,
+    "diag_ell": select_prompt_blocks_diag_ell,
+    "box": None,
+}
 
 
 def main():
@@ -28,14 +34,14 @@ def main():
         idx = argv.index("--selection")
         selection = argv[idx + 1]
         argv = argv[:idx] + argv[idx + 2 :]
-    if selection not in ("ball", "box"):
-        raise ValueError(f"--selection must be ball or box, got {selection!r}")
+    if selection not in SELECTIONS:
+        raise ValueError(f"--selection must be one of {sorted(SELECTIONS)}, got {selection!r}")
 
     os.environ["CONDITION_BLOCK_LEGACY_STAGE2"] = "1"
     if os.environ.get("CONDITION_BLOCK_CUDA_GRAPH") == "1":
         raise ValueError("CUDA graph requires the fused path; unset CONDITION_BLOCK_CUDA_GRAPH.")
-    if selection == "ball":
-        core._select_prompt_blocks = select_prompt_blocks_ball
+    if SELECTIONS[selection] is not None:
+        core._select_prompt_blocks = SELECTIONS[selection]
     print(f"[ball] selection={selection}, legacy stage2 forced")
 
     sys.argv = [sys.argv[0], *argv, "--method", "condition_block_triton"]

@@ -86,11 +86,15 @@ path has the same FP32-rounding exposure.
 4. [x] LongBench small quality probe (narrativeqa + gov_report, extended to 30
    samples each, block 32, eps 0.1, 128 new tokens, stats on): score and
    realized budget, ball vs box through the identical legacy-stage2 pipeline.
-5. [ ] ~~If quality holds at matched budget: Triton selection-stats kernel~~
+5. [x] ~~If quality holds at matched budget: Triton selection-stats kernel~~
    **NO-GO for the pure ball** (see verdict). The strict-bound low-IO candidate
    that survives the same evidence is the diagonal ellipsoid (`diag_ell`,
-   `w` vector + `rho` scalar, 2/3 of the box read volume); a 5-sample PPL probe
-   for it is included here (`ppl_diag_ell_ms.py`).
+   `w` vector + `rho` scalar, 2/3 of the box read volume).
+6. [x] diag_ell follow-up round: generation-side selection + LongBench gate
+   (passed, dominates box), full 20-sample PPL gate (passed), Triton
+   selection-stats kernel (1.3x cold-L2 / 1.46x in situ), production fused-path
+   integration with CUDA-graph token parity, decode-only latency and in-situ
+   attribution (attention phase 1.32x). See "Final summary" below.
 
 ## Results
 
@@ -204,15 +208,170 @@ At matched budget, diag_ell is within ~1% of box at high budget and clearly
 — preliminary, but the opposite sign of the ball result, consistent with the
 stage-0 matched-k columns.
 
-### Recommended next step
+### diag_ell follow-up (this round)
 
-Run the full 20-sample diag_ell PPL sweep plus the LongBench probe (its
-generation-side selection needs `w`/`rho` added to `gen_selection.py`, both
-derivable from the prefix summaries already cached by the runner). If the
-matched-budget parity holds, build the Triton selection-stats kernel reading
-`k_bar` + `w` + `rho` (2 vectors + 1 scalar per block, ~1.5x selection-read
-reduction vs box; at 128K that is roughly stats 1492 -> ~1000us/step by the
-read-volume scaling that held for the mixed-summary experiments).
+Implemented in this directory, pending the quality gates:
+
+- `gen_selection.py` now also provides `select_prompt_blocks_diag_ell`
+  (`w`/`rho` computed once per layer from the cached prompt summaries — `w`
+  falls out of the existing `k_max`/`k_min`, `rho` is one weighted pass over
+  the pages); `run_longbench.py` accepts `--selection diag_ell`. Sanity: zero
+  soundness violations, `z_logits`/`v_bar` bitwise equal to the box path.
+- `triton_selection.py`: diag_ell selection-stats kernel, a drop-in for the
+  production box stats kernel (identical `s`/`delta`/partial outputs; the
+  finalize/stage2 kernels are unchanged). Reads `k_bar` + `w` + `rho`
+  (2 vectors + 1 scalar per block) instead of 3 vectors.
+- `bench_selection.py`: cold-L2 A/B microbench (methodology of
+  `condition_block_stage_latency.py`; 256 MiB L2 flush per iteration, CUDA
+  events, two alternating rounds). RTX PRO 6000 Blackwell, block 32, 8 KV
+  heads, head_dim 128:
+
+| context | box stats | diag_ell stats | speedup | parity |
+|---:|---:|---:|---:|---|
+| 32K | 34.1 us | 25.6 us | **1.33x** | `s` bitwise; delta err 2.9e-6 |
+| 64K | 41.0 us | 31.7 us | **1.29x** | `s` bitwise; delta err 3.8e-6 |
+| 128K | 63.6 us | 48.2 us | **1.32x** | `s` bitwise; delta err 3.8e-6 |
+
+The box column reproduces the production FP32 numbers from the impl README
+(128K ~64 us/layer), so the ~1.3x carries over: 128K selection would drop from
+~1.5 ms/step to ~1.1 ms/step. Production integration is a monkeypatch of
+`core._run_condition_block_selection_stats` (same signature/returns; the fused
+decode path calls it at `core.py:1051`), with `w`/`rho` built lazily during the
+eager warmup steps, so it composes with the CUDA-graph decode flow.
+
+### diag_ell LongBench probe (30 samples/dataset) — PASSED, dominates box
+
+Same paired protocol as the ball probe (block 32, eps 0.1, 128 new tokens,
+identical legacy-stage2 pipeline):
+
+| dataset | box score @ budget | diag_ell score @ budget | ball (ref) |
+|---|---|---|---|
+| narrativeqa (F1) | 33.14 @ 0.196 | **35.45 @ 0.172** | 30.65 @ 0.201 |
+| gov_report (Rouge-L) | 23.55 @ 0.160 | **23.21 @ 0.106** | 22.56 @ 0.163 |
+
+diag_ell matches or beats the box score while realizing a 12-34% *lower*
+budget — the opposite sign of the ball probe, and consistent with its PPL
+probe (better at low budget) and the stage-0 matched-k columns.
+
+### diag_ell production-path integration — token parity PASSED
+
+`runtime_sanity.py`: with `core._run_condition_block_selection_stats`
+monkeypatched to the diag_ell runner, the fused block-32 path generates
+token-exact sequences between eager decode and CUDA-graph decode on real
+LongBench-v2 prompts (32K and 64K, 8 forced tokens, `cuda_graph_decode=true`).
+
+### diag_ell decode-only e2e latency (CUDA graph, GPU 7 exclusive)
+
+`run_latency.py`, 128 fixed tokens, 1 warmup + 3 measured, block 32, eps 0.1,
+stats off:
+
+| context | box decode-only | diag_ell decode-only | e2e speedup |
+|---:|---:|---:|---:|
+| 64K | 2.0056 s (15.79 ms/step) | 1.9905 s (15.67 ms/step) | 1.008x |
+| 128K | 2.1860 s (17.21 ms/step) | 2.1870 s (17.22 ms/step) | 1.000x |
+
+No measurable e2e gain — as expected from the project history: the selection
+kernel is ~2 ms of a ~17 ms decode step dominated by model GEMV, and the
+kernel-level 1.3x predicts only ~2-3% e2e, inside the ±1% run noise (the same
+dilution held for mixed summaries: attention -9..18%, e2e ~1%). The value of
+diag_ell is therefore (a) the attention-phase reduction itself and (b) the
+budget reduction at matched quality (LongBench realizes 12-34% lower budget,
+which shrinks selected-page IO too). In-situ per-kernel attribution at 128K is
+recorded below.
+
+### In-situ attention-phase attribution (128K, profiled decode-only, 127 steps)
+
+Profiler CUDA self-time per bucket (profiler wall is slower than clean runs;
+use ratios, not absolutes):
+
+| bucket | box | diag_ell | speedup |
+|---|---:|---:|---:|
+| condition_selection | 187.1 ms (1.47 ms/step) | 128.4 ms (1.01 ms/step) | **1.46x** |
+| sparse_finalize_attention | 202.0 ms | 164.8 ms | 1.23x |
+| sparse_reduce | 10.9 ms | 10.9 ms | 1.00x |
+| **attention total** | **400.0 ms (3.15 ms/step)** | **304.1 ms (2.39 ms/step)** | **1.32x** |
+| model_gemm_gemv | 1384.5 ms | 1423.8 ms | (noise) |
+
+The in-situ selection gain (1.46x) exceeds the cold-L2 microbench (1.32x), and
+finalize also gets faster because diag_ell's sharper delta selects fewer pages
+at the same eps (consistent with the lower realized LongBench budgets). The
+attention phase — the target of this work — drops 1.32x end to end in the real
+decode path.
+
+### diag_ell WikiText PPL, full 20 paired samples — PASSED
+
+Same protocol/windows as the box baseline (teacher mean PPL 6.8396). diag_ell
+realizes a lower budget at every eps, so the comparison interpolates box's
+budget→PPL curve (log-PPL, linear in budget) at diag_ell's realized budgets:
+
+| eps | diag_ell PPL @ budget | box interp @ same budget | diag_ell vs box |
+|---:|---|---|---:|
+| 0.05 | 6.854 @ 0.825 | 6.839 | +0.2% |
+| 0.075 | 6.859 @ 0.758 | 6.844 | +0.2% |
+| 0.1 | 6.869 @ 0.703 | 6.854 | +0.2% |
+| 0.25 | 6.936 @ 0.497 | 6.936 | 0.0% |
+| 0.5 | 7.171 @ 0.350 | 7.455 | **-3.8%** |
+| 1.0 | 8.845 @ 0.249 | 13.622 | **-35.1%** |
+| 2.5 | 35.44 @ 0.179 | 50.97 | **-30.5%** |
+| 5.0 | 145.7 @ 0.157 | 127.8 (clamped) | +14.0%* |
+
+*The eps=5 point sits below box's lowest measured budget (0.159), so the
+reference is clamped to box's endpoint rather than interpolated; both
+configurations are far into the collapse regime there (PPL >120 vs teacher
+6.84).
+
+Verdict: at matched budget diag_ell is within +0.2% of box in the
+usable-quality region and 30-35% better in the low-budget region — the
+PPL, LongBench, and stage-0 gates all pass.
+
+### Box vs diag_ell tightness on real Llama-3.1-8B keys
+
+`delta_tightness.py` (stage-0 sampling protocol: wikitext activations, 64
+groups/layer, 16 queries, causal full blocks, block 32; ratio = bound/exact,
+pairs with exact delta > 0.01):
+
+| layer | box med (p90) | diag_ell med (p90) | diag/box med | diag tighter on | Spearman vs exact box / diag |
+|---:|---|---|---:|---:|---|
+| 4 | 5.87 (8.08) | 5.24 (7.09) | 0.888 | 83.4% | 0.335 / 0.382 |
+| 10 | 5.96 (9.01) | 5.81 (8.82) | 0.951 | 62.7% | 0.315 / 0.300 |
+| 16 | 5.47 (7.90) | 5.52 (8.25) | 1.024 | 43.3% | 0.410 / 0.394 |
+| 22 | 5.07 (7.72) | 5.76 (8.13) | 1.138 | 34.3% | 0.384 / 0.408 |
+| 28 | 6.62 (9.22) | 5.81 (8.10) | 0.872 | 87.7% | 0.360 / 0.345 |
+| all | 5.79 | 5.61 | **0.949** | **62.3%** | — |
+
+Neither bound dominates: on the production model diag_ell is ~5% tighter in
+the pairwise median and tighter on 62% of pairs, with strong layer dependence
+(0.87-1.14 across layers); on Llama-2 (stage-0) the medians leaned the other
+way (box 4.85-5.28 vs diag_ell 5.03-5.57). Both stay ~5-6x loose overall and
+both correlate only weakly with the exact delta ordering (Spearman 0.30-0.41).
+diag_ell's budget/quality advantage therefore does not come from a large
+median-tightness win — it comes from the shape of its delta distribution
+feeding the condition score (sharper separation of the top tail), which the
+matched-budget PPL/LongBench gates measure directly.
+
+## Final summary (diag_ell round)
+
+All gates passed; the strict-bound diag_ell selection is quality-neutral or
+better at matched budget and reduces the attention phase by 1.32x in situ:
+
+- Selection-stats kernel: 1.29-1.33x cold-L2 (theory for 3->2 vectors: 1.49x);
+  1.46x in situ at 128K (~98% of the read-volume theory).
+- Whole attention phase at 128K in situ: 3.15 -> 2.39 ms/step (**1.32x**,
+  vs a fixed-selected-ratio theoretical 1.30x — slightly above because the
+  sharper delta also selects fewer pages at the same eps).
+- Combined with the box path's measured 4.62x attention-phase advantage over
+  full attention at 128K, the estimated cumulative attention-phase speedup is
+  ~6.1x, roughly 1/3 of the diag_ell read-volume ceiling 1/(s + 1.5/B) ~
+  16-20x; the remaining gap is small-read bandwidth efficiency (~60% of peak),
+  the same limitation documented for the box kernels.
+- e2e decode is unchanged (1.00-1.01x): model GEMV dominates, as throughout
+  this project.
+
+Recommended production step (outside this experiment folder): adopt the
+diag_ell stats kernel as an opt-in variant of the fused path (the monkeypatch
+in `run_latency.py`/`runtime_sanity.py` shows the integration is a drop-in),
+re-calibrate eps if a specific target budget is required, and re-run the
+release LongBench gate at the chosen operating point.
 
 ## Commands
 

@@ -17,7 +17,12 @@ import torch
 
 from ..condition_block_gen.methods.condition_block_triton_impl import core
 from ..condition_block_ppl import runner_cond_block as rcb
-from .gen_selection import ball_radius, select_prompt_blocks_ball
+from .gen_selection import (
+    ball_radius,
+    diag_ell_stats,
+    select_prompt_blocks_ball,
+    select_prompt_blocks_diag_ell,
+)
 from .ppl_condition import ball_delta_for_queries, diag_ell_delta_for_queries
 
 
@@ -160,7 +165,22 @@ def check_gen_harness(device):
     assert torch.equal(all_sel, exists_mask), "eps=0 must select every existing block"
     assert not none_sel.any(), "eps=1e9 must select nothing"
     ratio = (ball_delta[exists] / exact_delta[exists].clamp_min(1e-6)).median().item()
-    print(f"[gen] parity ok, radius/delta sound, median ball/exact={ratio:.2f}, eps extremes ok")
+
+    diag = select_prompt_blocks_diag_ell(q, prefix, eps=0.1)
+    for name, index in (("z_logits", 1), ("v_bar", 2), ("size", 3), ("cluster_exists", 4)):
+        assert torch.equal(diag[index], box[index]), f"diag_ell {name} differs from box path"
+    w, rho = diag_ell_stats(prefix)
+    diag_delta = (
+        rho[:, None, None, :]
+        * torch.sqrt(torch.einsum("gsqd,gbd->gsqb", qf.pow(2), w.pow(2)))
+        / scale
+    )
+    assert (diag_delta[exists] >= exact_delta[exists] - 1e-4).all(), "diag_ell delta unsound"
+    ratio_diag = (diag_delta[exists] / exact_delta[exists].clamp_min(1e-6)).median().item()
+    print(
+        f"[gen] parity ok, radius/delta sound, median ball/exact={ratio:.2f} "
+        f"diag_ell/exact={ratio_diag:.2f}, eps extremes ok"
+    )
 
 
 def main():

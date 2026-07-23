@@ -19,8 +19,8 @@ FRACS = [0.05, 0.1, 0.2]
 PCA_MS = (1, 2, 4)
 EIG_RS = (2, 4)
 BOX_CAL = 5.0  # offline-fit median box/oracle ratio; score-only, not a bound
-KINDS = ("box", "ball", "diag_ell", "moment", "moment_diag", "eig2", "eig4",
-         "moment_orc", "pca1", "pca2", "pca4", "box_cal", "oracle")
+KINDS = ("box", "ball", "diag_ell", "min_box_ell", "moment", "moment_diag",
+         "eig2", "eig4", "moment_orc", "pca1", "pca2", "pca4", "box_cal", "oracle")
 
 
 def block_deltas(qf, kc, s_c, scale, range_bound_delta):
@@ -34,6 +34,9 @@ def block_deltas(qf, kc, s_c, scale, range_bound_delta):
     w = kd.abs().max(dim=0).values.clamp_min(1e-6)
     rho = float((kd / w).norm(dim=-1).max())
     out["diag_ell"] = rho * float((qf * w).norm()) / scale
+    # min of two valid upper bounds is a valid (tighter) upper bound; box wins when q
+    # is axis-sparse, the w-ellipsoid wins when q is spread. Free if k_max/k_min+rho read.
+    out["min_box_ell"] = min(out["box"], out["diag_ell"])
     cov = kd.T @ kd / n
     D = torch.diagonal(cov)
     lam = float(torch.linalg.matrix_norm(cov - torch.diag(D), ord=2))

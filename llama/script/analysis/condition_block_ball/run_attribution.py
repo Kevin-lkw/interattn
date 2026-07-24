@@ -22,11 +22,9 @@ def main():
         idx = argv.index("--selection")
         selection = argv[idx + 1]
         argv = argv[:idx] + argv[idx + 2 :]
-    if selection not in ("box", "diag_ell", "diag_ell_v2", "diag_ell_v3", "diag_ell_v4"):
-        raise ValueError(
-            "--selection must be box, diag_ell, diag_ell_v2, diag_ell_v3 or "
-            f"diag_ell_v4, got {selection!r}"
-        )
+    valid = ("box", "diag_ell", "diag_ell_v2", "diag_ell_v3", "diag_ell_v4", "diag_ell_split")
+    if selection not in valid:
+        raise ValueError(f"--selection must be one of {valid}, got {selection!r}")
 
     os.environ["CONDITION_BLOCK_SKIP_STATS"] = "1"
     os.environ["CONDITION_BLOCK_POST_PREFILL_STATIC_CACHE"] = "1"
@@ -47,6 +45,12 @@ def main():
 
         core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v3
         core._condition_block_decode_output_fused_triton = decode_output_fused_v2
+    elif selection == "diag_ell_split":
+        from .triton_finalize_v3 import decode_output_fused_split
+        from .triton_selection_v3 import run_selection_stats_diag_ell_v3
+
+        core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v3
+        core._condition_block_decode_output_fused_triton = decode_output_fused_split
     print(f"[ball] attribution selection={selection}, CUDA graph + StaticCache + stats off")
 
     sys.argv = [sys.argv[0], *argv]

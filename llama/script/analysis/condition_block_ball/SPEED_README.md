@@ -221,13 +221,26 @@ stats + finalize v2, clean attribution):
 | 64K | 1104 | **6.55x** | 15.16 |
 | 128K | 1504 | **8.88x** | 16.67 |
 
+### Two-stream finalize (2026-07-24) — current best
+
+Splitting finalize into a uniform rep kernel + a page-parallel exact kernel
+(cluster-busting b % P_B ownership; full record in the main README) fixed
+the serial page walk the eps-knob diagnostic exposed (pages: ~500 us/step
+at 128K on ~37 us of bytes). Current totals (v3 stats + split finalize,
+clean attribution):
+
+| context | attention us/step | vs full attn | e2e ms/step |
+|---:|---:|---:|---:|
+| 32K | 689 | **3.79x** | 14.33 |
+| 64K | 948 | **7.62x** | 15.10 |
+| 128K | 1364 | **9.80x** | 16.53 |
+
 Remaining attention-side levers:
 
-1. The selected-page path inside finalize (serial data-dependent page loop)
-   — the only thing left between 903 us and its ~370 us byte bound at 128K;
-   needs list compaction / stream specialization, or the fusion below.
-2. Stats+finalize fusion: removes the s/delta round trip (would put
-   selection ~1.09x of full/B) and is the only fix for the 32K launch floor.
+1. Per-page latency inside the page kernel (one 8 KB + 8 KB chain per hit):
+   prefetch across a program's own hits, or absorb into fusion.
+2. Stats+finalize fusion: removes the s/delta round trip and the 32K launch
+   floor; both component kernels are now persistent-shaped and clean.
 3. block 64 (halves summary count; needs a fresh quality/budget gate).
 
 ## 4. What dominates end to end

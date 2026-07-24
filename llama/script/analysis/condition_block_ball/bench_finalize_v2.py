@@ -45,6 +45,12 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--parity-only", action="store_true")
+    parser.add_argument(
+        "--impl",
+        default="v2",
+        choices=["v2", "split"],
+        help="Candidate implementation to compare against the production kernel.",
+    )
     parser.add_argument("--l2-flush-mib", type=int, default=256)
     parser.add_argument("--output", type=Path, default=Path("/tmp/ball_bench_finalize_v2.jsonl"))
     return parser.parse_args()
@@ -56,6 +62,11 @@ def main():
     torch.manual_seed(0)
     os.environ["CONDITION_BLOCK_BALL_W_DTYPE"] = "bfloat16"
     core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v3
+    global decode_output_fused_v2
+    if args.impl == "split":
+        from .triton_finalize_v3 import decode_output_fused_split
+
+        decode_output_fused_v2 = decode_output_fused_split
     l2_flush = torch.empty(
         (args.l2_flush_mib * 1024 * 1024 // 4,), device=device, dtype=torch.float32
     )

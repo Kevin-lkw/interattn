@@ -643,6 +643,37 @@ compact the selected list first so page fetches pipeline, split the
 rep-stream and page-stream into specialized kernels, or take both into the
 stats+finalize fusion.
 
+### Two-stream finalize (2026-07-24, `triton_finalize_v3.py`) — adopted
+
+The eps-knob diagnostic pinned the cost: at eps 1e9 (no pages) finalize is
+only 197/270/401 us/step — the rep stream is fine; the selected-page path
+adds ~400/420/500 us at eps 0.1 on ~37 us worth of bytes (real selections
+cluster, the unluckiest per-chunk program walks 2-4 pages serially, the wave
+waits), and explodes to ~2 ms at eps 0.01.
+
+Split (`--selection diag_ell_split`, runtime_sanity `--fin-split`): kernel A
+streams v_bar + condition + selection (uniform, persistent-safe) and stores
+the group-shared mask; kernel B owns block b at program b % P_B, so adjacent
+clustered pages land in distinct programs (critical path ~1 page), takes
+suffix tiles round-robin, and both write disjoint slots of one partial array
+merged by a single reduce. Deterministic, no atomics. Gates: selected sets
+bitwise vs production incl. the all-blocks stress eps, output <= 6.8e-5,
+eager-vs-graph token parity exact. In-situ (GEMV canary clean):
+
+| context | finalize us/step (fin-v2 -> split) | attention total | vs full attn |
+|---:|---|---|---:|
+| 32K | 596 -> **360** (1.66x) | 689 (sel 203 / fin 360 / red 127) | **3.79x** |
+| 64K | 693 -> **481** (1.44x) | 948 | **7.62x** |
+| 128K | 903 -> **692** (1.30x) | 1364 | **9.80x** |
+
+The wider reduce (P_A + P_B = 256 partials) costs +70 us at 128K, more than
+covered. Real-tensor first-step bench agrees directionally (+3-7%; its cold
+L2 and 1-token suffix dilute the page share — trust the in-situ numbers).
+At eps 0.01 the split's benefit is far larger (the serial page walk was
+~2 ms/step). Remaining finalize gap vs the no-page floor (692 vs ~401+B
+overhead) is per-page latency in B (one 8 KB k + 8 KB v chain per page) —
+further gains would need page prefetch across B's own hits or the fusion.
+
 ## Final summary (diag_ell round)
 
 All gates passed; the strict-bound diag_ell selection is quality-neutral or

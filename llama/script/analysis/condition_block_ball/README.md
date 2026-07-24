@@ -507,6 +507,99 @@ In-situ selection at 128K drops 976 -> 828 us/step (-15%, matching the
 cold-L2 -17%); finalize/reduce are unchanged (999/86 us). e2e stays on the
 GEMV wall as always. Data: `cb_attr_ball_diag_mixed_bf16w_bf16kbar.jsonl`.
 
+## Selection-stage restructure toward full-attention/B (v2 -> v3)
+
+Goal (2026-07-24): bring the selection-stats kernel to ~full attention /
+block_size — at 128K that is 13366/32 = **418 us/step** (13.1 us/layer);
+baseline after the dtype rounds was 828 us/step (efficiency ~41% of peak vs
+flash's 71%, bytes already at the floor).
+
+Step A — config sweep (20 configs, `SELECT_CHUNK` x `SELECT_WARPS`,
+cold-L2): the existing kernel already sits at its optimum (c16_w2, 37.1 us at
+128K). Bigger chunks catastrophically regress (chunk 64 -> 63 us, 128 ->
+492 us): the broadcast-multiply-sum form materializes (G, B, D) FP32
+intermediates, so registers scale with the tile and spill. Side finding: the
+auto warp heuristic (8 below 1024 blocks) is stale after the dtype shrink —
+`CONDITION_BLOCK_SELECT_WARPS=2` is ~20% faster at 32K.
+
+Step B v2 (`triton_selection_v2.py`) — persistent grid, same math: best
+config only *ties* v1 (36.1 vs 35.2 us; parity gated). Conclusion: the
+bottleneck is the register wall of the compute formulation, not the grid.
+
+Step B v3 (`triton_selection_v3.py`) — tensor-core rewrite: `s` and
+`q^2.w^2` become `tl.dot` MMA (register footprint decoupled from the tile),
+persistent span loop with software pipelining. Strictness is preserved: the
+stored summary becomes `w2 = bf16(w*w)` — any positive weight keeps the
+w-weighted Cauchy-Schwarz bound valid as long as `rho` is computed against
+the *stored* value (it is) — and the delta scale carries a (1+2^-8)
+inflation covering the BF16 rounding of q^2. Deltas differ from v1 by
+~2^-8 in *both* directions (different valid weight), so borderline
+selections can flip either way. Gates all green (`bench_selection_v3.py`):
+soundness against dense exact deviations 0 violations at every context,
+`s` matches v1 to 1.8e-7, delta matches its torch reference to 5.7e-6,
+eager-vs-CUDA-graph token parity exact. Config landscape is flat
+(28.3-30.3 us across 12 configs at 128K); default b32_s3_w4_p48.
+
+In-situ decode attribution (three independent clean runs agreed to the
+microsecond; GEMV canary 10.80/10.88/10.97 ms/step):
+
+| context | selection us/step (v1 -> v3) | attention total | vs full attn |
+|---:|---|---|---:|
+| 32K | 444 -> **202** (2.20x) | 1237 -> 945 | 2.77x |
+| 64K | 477 -> **332** (1.44x) | 1381 -> 1207 | 5.99x |
+| 128K | 828 -> **516** (1.60x) | 1913 -> 1490 | **8.97x** |
+
+Bonus: finalize dropped too (999 -> 887 us at 128K) because its inline
+re-reduce of the selection partials shrank (BLOCK_SC 256 -> 64 via P=48).
+
+Quality smoke (fused path, eps 0.1, canonical eval.py, matched IDs — same
+protocol as the BF16-k_bar gate): narrativeqa 200 samples F1 29.42 @ budget
+0.1727 (FP32 29.11 @ 0.1731, v1-BF16 29.36 @ 0.1733; 181/200 predictions
+identical to v1), gov_report 140 samples Rouge-L 33.63 @ 0.1404 (FP32
+33.40, v1 33.51). Parity-or-better at equal budget on both — the ±2^-8
+selection flips are quality-neutral. PASS.
+
+### Gap analysis vs the full/B target
+
+- **128K: 516 vs 418 us/step = 1.23x — essentially reached.** Exact
+  decomposition: 1.23 = 1.135 (bytes: 19.05 MB/layer streamed vs the
+  16.78 MB full/B equivalent — the excess is the s/delta cache write
+  2.10 MB, the structural price of the 3-kernel split, plus rho 0.13 MB and
+  partials) x 1.076 (bandwidth efficiency 66% of peak vs flash's 71%).
+  The kernel is no longer meaningfully less efficient than flash.
+- **64K: 332 vs 226 = 1.47x** (efficiency 51%: 9.6 MB/layer is getting too
+  small to amortize) and **32K: 202 vs 82 = 2.5x** (latency floor: 43% at
+  4.9 MB/layer). The full/B target scales *down* linearly with context but
+  fixed per-kernel costs do not — below ~64K the target is unreachable for
+  any standalone selection kernel.
+- Remaining lever: fusing stats+finalize would remove the s/delta round
+  trip (-13.5% bytes), landing ~455 us/step at 128K (1.09x of target), and
+  is also the only fix for the 32K floor. Beyond that, only hierarchical
+  selection changes the byte count.
+
+## Next: finalize restructure, then fusion (decided 2026-07-24)
+
+Reading the production finalize kernel (`page_attention.py`): its heavy math
+is already `tl.dot` MMA (no v3-style register wall), but its *grid* has the
+same disease v1 stats had — (head, chunk) programs each touching ~13 KB
+(v_bar tile 8 KB + s/delta 1 KB + inline partial re-reduce 4 KB) with no
+loop to pipeline, plus the entire generated suffix processed serially by the
+last chunk's single program. Measured ~30% of its byte bound (887 us/step at
+128K). Plan: apply the v3 surgery — persistent span loop with pipelined
+v_bar streaming, one partial re-reduce per program instead of per chunk,
+suffix sliced across programs and merged in the out-reduce, FINALIZE_CHUNK
+re-swept. Expected ~450-550 us/step at 128K (attention -> ~12-13x vs full).
+
+Ordering rationale (finalize BEFORE fusion): (a) the prize is bigger —
+finalize's efficiency deficit is worth ~350-450 us/step vs ~100-150 for
+fusion's s/delta round trip + launch; fusing an inefficient finalize just
+inherits its structure. (b) True fusion needs selection's global stats
+before the routing decision — a grid-wide barrier, only feasible in the
+cooperative persistent-program shape; a persistent finalize is therefore the
+prerequisite, not the alternative. (c) The restructure is math-identical and
+cheaply gated; fusion changes execution architecture and should merge two
+already-clean components.
+
 ## Final summary (diag_ell round)
 
 All gates passed; the strict-bound diag_ell selection is quality-neutral or

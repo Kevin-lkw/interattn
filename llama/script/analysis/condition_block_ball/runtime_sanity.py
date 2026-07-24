@@ -57,6 +57,8 @@ def parse_args():
     parser.add_argument("--eps", type=float, default=0.1)
     parser.add_argument("--split", default="train")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--v2", action="store_true", help="Use the persistent v2 stats kernel.")
+    parser.add_argument("--v3", action="store_true", help="Use the tensor-core v3 stats kernel.")
     return parser.parse_args()
 
 
@@ -91,7 +93,16 @@ def _generate(model, tokenizer, method, args, input_ids, attention_mask, *, cuda
 def main():
     args = parse_args()
     set_seed(args.seed)
-    core._run_condition_block_selection_stats = run_selection_stats_diag_ell
+    if args.v3:
+        from .triton_selection_v3 import run_selection_stats_diag_ell_v3
+
+        core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v3
+    elif args.v2:
+        from .triton_selection_v2 import run_selection_stats_diag_ell_v2
+
+        core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v2
+    else:
+        core._run_condition_block_selection_stats = run_selection_stats_diag_ell
     gen_args = SimpleNamespace(
         model=args.model,
         device=args.device,

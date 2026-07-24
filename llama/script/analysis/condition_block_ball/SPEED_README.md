@@ -186,12 +186,34 @@ from it, so delta stays a strict bound around the stored center.
   the approximate center accepted, the measured dtype-exhausted ceiling at
   128K moves to **~7.0x**.
 
-Remaining attention-side levers after the dtype rounds:
+### v3 tensor-core selection kernel (2026-07-24)
 
-1. Finalize restructuring (wider tiles / persistent programs): the largest
-   lever left, ~2-3x on finalize if it reached flash-level efficiency.
-2. block 64 (halves summary count; needs a fresh quality/budget gate).
-3. The 32K latency floor remains binding regardless of bytes.
+The selection-stats kernel was restructured to `tl.dot` MMA with a
+persistent pipelined loop (`triton_selection_v3.py`; full record and gap
+analysis in the main README). Strict bound kept (stored `w2` weight + rho
+from it + (1+2^-8) inflation). Clean in-situ attribution (GEMV canary
+10.8-11.0, three agreeing runs):
+
+| context | selection us/step | attention us/step | vs full attn | e2e ms/step |
+|---:|---:|---:|---:|---:|
+| 32K | 444 -> **202** | 945 | **2.77x** | 15.67 |
+| 64K | 477 -> **332** | 1207 | **5.99x** | 15.32 |
+| 128K | 828 -> **516** | 1490 | **8.97x** | 16.72 |
+
+Selection now runs at 66% of peak bandwidth at 128K (flash: 71%) — 1.23x
+above the full-attention/B time target, decomposed as 1.135x bytes (the
+s/delta cache round trip of the 3-kernel split) x 1.076x efficiency. The
+earlier "dtype-exhausted ~7.0x" attention ceiling was a statement about
+dtype levers only; kernel restructuring moved the measured phase to 8.97x.
+
+Remaining attention-side levers:
+
+1. Finalize restructuring — now 60% of the attention phase (887 us vs
+   selection's 516 at 128K) and still at ~30% of its byte bound; the same
+   MMA/persistent treatment applies.
+2. Stats+finalize fusion: removes the s/delta round trip (would put
+   selection ~1.09x of full/B) and is the only fix for the 32K launch floor.
+3. block 64 (halves summary count; needs a fresh quality/budget gate).
 
 ## 4. What dominates end to end
 

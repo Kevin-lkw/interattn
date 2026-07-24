@@ -38,8 +38,15 @@ def main():
     if not eps_values:
         raise ValueError("--eps-list needs at least one value")
 
-    core._run_condition_block_selection_stats = run_selection_stats_diag_ell
-    print(f"[ball] diag_ell fused sweep, eps={eps_values}", flush=True)
+    use_v3 = "--v3" in argv
+    if use_v3:
+        argv.remove("--v3")
+        from .triton_selection_v3 import run_selection_stats_diag_ell_v3
+
+        core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v3
+    else:
+        core._run_condition_block_selection_stats = run_selection_stats_diag_ell
+    print(f"[ball] diag_ell fused sweep (v3={use_v3}), eps={eps_values}", flush=True)
     for eps in eps_values:
         print(f"=== diag_ell sweep eps={eps} ===", flush=True)
         sys.argv = [

@@ -445,6 +445,62 @@ increasingly latency-bound as reads shrink (same pattern as BF16 summaries on
 the box kernel). Not yet wired into the production runner; adopting it needs
 only the cheap selection-parity gate since delta changes by <=1% relative.
 
+### BF16 `k_bar` storage (approximate center, delta still strict around it)
+
+The last remaining stats-stream dtype lever (2026-07-24). Storage uses the
+pre-existing core knob `CONDITION_BLOCK_K_BAR_DTYPE=bfloat16` (requires
+`CONDITION_BLOCK_MIXED_SUMMARIES=1`); the diag_ell kernel, eager selection and
+`diag_ell_stats` consume it unchanged (all loads upcast to FP32). Soundness
+structure: `w` and `rho` are computed **from the stored BF16 center**, so
+`delta = rho * ||q x w|| / sqrt(d)` remains a *strict* bound on the score
+deviation around the stored center — the only approximation is the center
+itself (`s` shifts by the k_bar rounding, so masses and scores shift by
+~2^-8 relative; the mean-zero property behind the cosh term now holds only up
+to that rounding). Incompatible with the legacy eager stage2 (core rejects
+MIXED there), so all checks below run the fused production path.
+
+Sanity (full stack `MIXED=1` + BF16 `k_bar` + BF16 `w`): `sanity.py` all
+green (delta soundness zero violations against the stored center, box parity,
+eps extremes); `runtime_sanity.py` eager vs CUDA-graph token parity exact at
+32K/64K with the graph active.
+
+Quality smoke (fused path, eps 0.1, scored with canonical `eval.py` against
+the FP32 sweep reference on matched sample IDs — larger and
+pipeline-identical, so not comparable to the 30-sample legacy-probe table
+above):
+
+| dataset | n | FP32 score @ budget | BF16-k_bar score @ budget | identical preds |
+|---|---:|---|---|---:|
+| narrativeqa (F1) | 200 | 29.11 @ 0.1731 | **29.36 @ 0.1733** | 176/200 |
+| gov_report (Rouge-L) | 140 | 33.40 @ 0.1402 | **33.51 @ 0.1406** | 11/140 |
+
+Score and budget are parity-or-better on both datasets (gov_report's low
+identical-prediction count is expected: one token flip cascades through a
+500-token summary; the score is what matters). Full PPL / 16-dataset gates
+deliberately skipped this round (small sanity only); the PPL harness has an
+env-gated BF16-k_bar cast (`ppl_condition.py`) if a deeper gate is wanted.
+
+Selection-stats kernel, cold-L2 (`bench_selection.py --w-dtype bfloat16
+--k-bar-dtype bfloat16`, same-session A/B):
+
+| context | diag_ell BF16-w | + BF16 k_bar | increment |
+|---:|---:|---:|---:|
+| 32K | 24.0 us | 21.7 us | +9% |
+| 64K | 29.4 us | 23.8 us | +19% |
+| 128K | 44.7 us | 37.0 us | +17% |
+
+Byte theory allows +32% at 128K (stats stream 26.4 -> 18.0 MB/layer); the
+realized +17% is the familiar latency-bound halving, but a clearly larger
+increment than the BF16-w step.
+
+In-situ decode attribution for this config is still pending: the one attempt
+(2026-07-24) ran time-sliced against a co-tenant process that had landed on
+GPU 7 mid-run (all categories uniformly ~2.2x slow, GEMV 23.8 ms/step vs the
+usual 10.8) and was discarded. Extrapolating the cold-L2 kernel increment
+onto the last clean attribution (stats ~976 us/step at 128K) puts the
+attention phase at ~1.86 ms/step, ~7.2x vs full — to be confirmed on an
+exclusive GPU.
+
 ## Final summary (diag_ell round)
 
 All gates passed; the strict-bound diag_ell selection is quality-neutral or

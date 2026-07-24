@@ -158,13 +158,35 @@ the earlier fixed-efficiency "reasonable ceiling" of ~8.4x was optimistic —
 128K**, and essentially all remaining headroom (finalize now runs at ~26% of
 its new byte bound) is kernel-structural, not dtype.
 
-Remaining attention-side levers after the dtype round:
+### BF16 `k_bar` round (2026-07-24)
+
+The last stats-stream dtype lever, measured and quality-gated (see the main
+README's BF16 `k_bar` section for the full record). Config:
+`CONDITION_BLOCK_K_BAR_DTYPE=bfloat16` on top of mixed summaries + BF16 `w`.
+The stored center is approximate (~2^-8 relative) but `w`/`rho` are computed
+from it, so delta stays a strict bound around the stored center.
+
+- Quality: fused-path LongBench smoke vs the FP32 sweep reference on matched
+  IDs — narrativeqa 200 samples 29.11 -> 29.36 F1, gov_report 140 samples
+  33.40 -> 33.51 Rouge-L, budgets within +0.03% relative; sanity + CUDA-graph
+  token parity all green. PASS.
+- Selection kernel, cold-L2: 24.0 -> 21.7 / 29.4 -> 23.8 / 44.7 -> 37.0 us at
+  32K/64K/128K (**+9% / +19% / +17%**; byte theory +32% at 128K — stats
+  stream 26.4 -> 18.0 MB/layer, the same latency-bound halving as every
+  dtype step). The summary read cost per block drops to 516 B ~ 1 BF16
+  token (K+V), i.e. the stats byte floor now sits essentially at the
+  "full-attention / block-size" level (see the selection-vs-full/B analysis).
+- In-situ attribution: pending an exclusive GPU (the first attempt was
+  time-sliced against a co-tenant process and discarded). Extrapolating the
+  kernel increment onto the last clean run: stats ~976 -> ~810 us/step at
+  128K, attention ~2.03 -> ~1.86 ms/step, **~7.2x vs full (estimate)**.
+
+Remaining attention-side levers after the dtype rounds:
 
 1. Finalize restructuring (wider tiles / persistent programs): the largest
    lever left, ~2-3x on finalize if it reached flash-level efficiency.
-2. BF16 `k_bar` (approximate, opt-in): small further stats reduction.
-3. block 64 (halves summary count; needs a fresh quality/budget gate).
-4. The 32K latency floor remains binding regardless of bytes.
+2. block 64 (halves summary count; needs a fresh quality/budget gate).
+3. The 32K latency floor remains binding regardless of bytes.
 
 ## 4. What dominates end to end
 

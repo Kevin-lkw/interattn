@@ -45,6 +45,16 @@ def parse_args():
             "exact w and the delta stays a strict upper bound."
         ),
     )
+    parser.add_argument(
+        "--k-bar-dtype",
+        default="float32",
+        choices=["float32", "bfloat16"],
+        help=(
+            "Storage dtype for k_bar (approximate when bfloat16: the rounded "
+            "center shifts s slightly; w/rho are computed against the stored "
+            "center so delta stays a strict bound around it)."
+        ),
+    )
     parser.add_argument("--l2-flush-mib", type=int, default=256)
     parser.add_argument("--output", type=Path, default=Path("/tmp/ball_bench_selection.jsonl"))
     return parser.parse_args()
@@ -88,7 +98,9 @@ def main():
         )
         if args.w_dtype == "bfloat16":
             os.environ["CONDITION_BLOCK_BALL_W_DTYPE"] = "bfloat16"
-        diag_ell_stats(prefix)  # build w/rho outside the timed region
+        if args.k_bar_dtype == "bfloat16":
+            prefix["k_bar"] = prefix["k_bar"].to(torch.bfloat16)
+        diag_ell_stats(prefix)  # build w/rho outside the timed region (from the stored k_bar)
 
         ws_box, ws_diag = {}, {}
         _, s_box, delta_box, _, glob_box, _, _ = core._run_condition_block_selection_stats(
@@ -123,6 +135,8 @@ def main():
             "context": context,
             "n_blocks": n_blocks,
             "cold_l2": not args.warm_l2,
+            "w_dtype": args.w_dtype,
+            "k_bar_dtype": args.k_bar_dtype,
             "box_us": box_us,
             "diag_ell_us": diag_us,
             "speedup": box_us / diag_us,

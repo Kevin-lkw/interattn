@@ -16,6 +16,7 @@ to the saved box-condition summaries.
 """
 
 import math
+import os
 
 import torch
 
@@ -99,6 +100,11 @@ def _batched_hybrid_outputs_ball(
     k_sum = _gather_prefix(prefix["k_cumsum"], prefix_idx)
     v_sum = _gather_prefix(prefix["v_cumsum"], prefix_idx)
     k_bar = k_sum / size_float.view(1, n_query, n_blocks, 1)
+    if os.environ.get("CONDITION_BLOCK_K_BAR_DTYPE") == "bfloat16":
+        # Mirror the decode-side BF16 k_bar storage: the rounded center is used
+        # for s_c AND for the deviation stats (w/rho), so delta stays a strict
+        # bound around the stored center; only the center itself is approximate.
+        k_bar = k_bar.to(torch.bfloat16).float()
     v_bar = v_sum / size_float.view(1, n_query, n_blocks, 1)
 
     s_c = (q_pos[:, :, None, :] * k_bar).sum(dim=-1) / scale

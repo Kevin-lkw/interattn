@@ -59,6 +59,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--v2", action="store_true", help="Use the persistent v2 stats kernel.")
     parser.add_argument("--v3", action="store_true", help="Use the tensor-core v3 stats kernel.")
+    parser.add_argument(
+        "--finv2", action="store_true", help="Also use the persistent finalize (implies --v3)."
+    )
     return parser.parse_args()
 
 
@@ -93,7 +96,13 @@ def _generate(model, tokenizer, method, args, input_ids, attention_mask, *, cuda
 def main():
     args = parse_args()
     set_seed(args.seed)
-    if args.v3:
+    if args.finv2:
+        from .triton_finalize_v2 import decode_output_fused_v2
+        from .triton_selection_v3 import run_selection_stats_diag_ell_v3
+
+        core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v3
+        core._condition_block_decode_output_fused_triton = decode_output_fused_v2
+    elif args.v3:
         from .triton_selection_v3 import run_selection_stats_diag_ell_v3
 
         core._run_condition_block_selection_stats = run_selection_stats_diag_ell_v3

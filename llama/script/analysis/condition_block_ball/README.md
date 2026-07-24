@@ -600,6 +600,49 @@ prerequisite, not the alternative. (c) The restructure is math-identical and
 cheaply gated; fusion changes execution architecture and should merge two
 already-clean components.
 
+### Finalize v2 results (2026-07-24, `triton_finalize_v2.py`)
+
+Implementation: persistent (head, P) grid, span loop over chunks,
+selection-partial re-reduce once per program, suffix tiles distributed
+round-robin (no serial tail), stage2 reduce over P partials. Parity gates
+all green: `selected` sets bitwise identical to the production kernel at
+every context including a stress eps that selects ALL 32768 blocks (full
+page-loop exercise); output max err <= 3.6e-5 (FP32 merge-reorder noise, two
+orders below BF16 output granularity); eager-vs-graph token parity exact.
+
+**Key negative finding: persistence (span > 1) is wrong for finalize.**
+Unlike stats (uniform work per block), finalize's selected-page work is
+data-dependent and clustered on real prompts; consolidating chunks into
+fewer programs serializes those page fetches and the in-situ numbers invert
+the cold-L2 microbench (which selects almost no pages on synthetic data —
+a measured methodology trap). In-situ finalize us/step:
+
+| config | 32K | 64K | 128K |
+|---|---:|---:|---:|
+| production kernel | 688 | 796 | 887 |
+| v2 P=48 (span 1/2/3) | 595 | 849 | 990 |
+| **v2 P=128 (span=1, adopted)** | **596** | **693** | 903 |
+| v2 P=64/BLOCK=64 | 719 | 844 | 1006 |
+
+Adopted config `P=128/BLOCK=32` keeps the original chunk-level parallelism
+(span=1) and banks the two unconditional wins — parallel suffix and
+one-shot partial re-reduce: finalize **+15% at 32K and 64K**, tie at 128K
+(903 vs 887; page-fetch latency dominates there and this surgery does not
+touch it). Full v4 path (v3 stats + finalize v2, GEMV canary clean):
+
+| context | attention us/step (sel/fin/red) | vs full attn | e2e ms/step |
+|---:|---|---:|---:|
+| 32K | 853 (203/596/55) | **3.06x** | 14.30 |
+| 64K | 1104 (331/693/80) | **6.55x** | 15.16 |
+| 128K | 1504 (515/903/86) | **8.88x** | 16.67 |
+
+Remaining finalize headroom at 128K (~30% of its byte bound) is the
+selected-page path itself: pages arrive via a serial data-dependent while
+loop with one PAGE_SIZE tile per iteration. Ideas for a next round:
+compact the selected list first so page fetches pipeline, split the
+rep-stream and page-stream into specialized kernels, or take both into the
+stats+finalize fusion.
+
 ## Final summary (diag_ell round)
 
 All gates passed; the strict-bound diag_ell selection is quality-neutral or

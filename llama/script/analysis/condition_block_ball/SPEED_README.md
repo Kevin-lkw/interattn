@@ -206,11 +206,26 @@ s/delta cache round trip of the 3-kernel split) x 1.076x efficiency. The
 earlier "dtype-exhausted ~7.0x" attention ceiling was a statement about
 dtype levers only; kernel restructuring moved the measured phase to 8.97x.
 
+### Finalize v2 (persistent grid, 2026-07-24)
+
+Applied the v3 surgery to finalize (`triton_finalize_v2.py`; full record in
+the main README). Outcome: span>1 persistence HURTS finalize in situ
+(selected-page work is data-dependent and clustered — a cold-L2 blind
+spot); the adopted P=128/span=1 config banks the unconditional wins only
+(parallel suffix + one-shot partial re-reduce). Current totals (v4 = v3
+stats + finalize v2, clean attribution):
+
+| context | attention us/step | vs full attn | e2e ms/step |
+|---:|---:|---:|---:|
+| 32K | 853 | **3.06x** | 14.30 |
+| 64K | 1104 | **6.55x** | 15.16 |
+| 128K | 1504 | **8.88x** | 16.67 |
+
 Remaining attention-side levers:
 
-1. Finalize restructuring — now 60% of the attention phase (887 us vs
-   selection's 516 at 128K) and still at ~30% of its byte bound; the same
-   MMA/persistent treatment applies.
+1. The selected-page path inside finalize (serial data-dependent page loop)
+   — the only thing left between 903 us and its ~370 us byte bound at 128K;
+   needs list compaction / stream specialization, or the fusion below.
 2. Stats+finalize fusion: removes the s/delta round trip (would put
    selection ~1.09x of full/B) and is the only fix for the 32K launch floor.
 3. block 64 (halves summary count; needs a fresh quality/budget gate).

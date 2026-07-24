@@ -70,6 +70,8 @@ path has the same FP32-rounding exposure.
   to `longbench.run_all`. `--selection box` runs the identical pipeline with the
   original box selection for a paired baseline.
 - `sanity.py` — soundness and parity checks (see plan below).
+- `SPEED_README.md` — dedicated speed analysis: diag_ell attention-phase and
+  end-to-end speedups vs full attention, and the dominant cost inside each.
 
 ## Plan
 
@@ -168,6 +170,58 @@ earlier term-decomposition work showed the selection gain lives almost entirely
 in term 1's query-adaptive `log p_hat + delta` top-tail ordering. diag_ell
 keeps per-dimension anisotropy (`w`) and query dependence (`||q * w||`) and
 stays at box-level selection quality with 2/3 of the reads.
+
+## Full LongBench eps sweep (16 datasets, production Triton path)
+
+`run_sweep.py`: all 16 English+code LongBench datasets, full test sets
+(3,750 samples/eps), eps grid {0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
+2.5, 5}, block 32, stats on. diag_ell ran through the production fused Triton
+path with the diag_ell stats kernel; the box baseline was completed with the
+same `condition_block_triton` method (the historical box sweep covered only
+the 9 long-text datasets; the 7 short/code datasets were filled with
+`run_condition_block_triton_eps.sh`). Both sides scored with the canonical
+`longbench/eval.py` (its newline truncation for trec/triviaqa/samsum matters:
+an ad-hoc scorer without it under-scores by tens of points).
+
+Macro average over 16 datasets; budget = decode-only equivalent budget
+(step-0 prefill excluded — the recorded per-sample budget is inflated by
+1/n_steps amortization on short-output datasets and by degenerate long
+outputs in the collapse regime, which also explains the apparent
+budget-vs-eps non-monotonicity; pure selection budget is strictly monotone):
+
+| eps | box score @ budget | diag_ell score @ budget |
+|---:|---|---|
+| 0.005 | 49.11 @ 0.705 | 49.33 @ 0.636 |
+| 0.01 | 49.28 @ 0.586 | 49.24 @ 0.509 |
+| 0.025 | 49.29 @ 0.415 | 49.15 @ 0.338 |
+| 0.05 | 49.13 @ 0.294 | 49.00 @ 0.226 |
+| 0.1 | 48.76 @ 0.193 | 48.45 @ 0.142 |
+| 0.25 | 47.93 @ 0.105 | 47.11 @ 0.080 |
+| 0.5 | 46.49 @ 0.071 | 44.27 @ 0.060 |
+| 1.0 | 42.96 @ 0.056 | 39.62 @ 0.052 |
+
+Interpolating box's macro curve at diag_ell's realized budgets, diag_ell is
+within ±0.1 at high budget and +0.1..+0.4 ahead through the low-budget range
+(clearly ahead at the collapse edge) — on the 16-dataset macro, diag_ell sits
+on the Pareto frontier across the whole usable range while reading 1/3 fewer
+selection bytes per block.
+
+Per-category pattern (see `pareto_16ds_final.png` / `cmp16.json` in the
+session scratchpad; regenerate from the raw jsonl):
+
+- Retrieval-style QA (narrativeqa, qasper, multifieldqa_en, hotpotqa,
+  2wikimqa, musique, triviaqa): diag_ell on the frontier — reaches the score
+  plateau at 20-30% lower budget; box shows mid-budget collapse dips.
+- Summarization (gov_report, qmsum, multi_news, samsum): box marginally
+  ahead at matched budget in the low-budget band (<=0.5 Rouge-L); broad
+  coverage favors the sign-adaptive box delta.
+- Short/code tasks (trec, passage_count, passage_retrieval_en, lcc,
+  repobench-p): the two are indistinguishable (both near the full-attention
+  score down to very low budgets).
+
+Raw outputs: `result/generate/diag_ell_sweep/` (diag_ell, + `eval.json`) and
+`result/generate/Llama-3.1-8B-Instruct/longbench/` (box,
+`eval_full_v2.json`).
 
 ## Verdict
 

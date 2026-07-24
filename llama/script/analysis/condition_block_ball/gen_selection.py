@@ -14,6 +14,8 @@ likewise reuses `k_max`/`k_min` built once per layer). Decode prompt blocks are
 fixed, so the summaries never change within a sample.
 """
 
+import os
+
 import torch
 
 
@@ -49,7 +51,13 @@ def ball_radius(prefix):
 
 
 def diag_ell_stats(prefix):
-    """Per-(kv-head, block) `w` vector and `rho` scalar, cached in the prefix."""
+    """Per-(kv-head, block) `w` vector and `rho` scalar, cached in the prefix.
+
+    ``CONDITION_BLOCK_BALL_W_DTYPE=bfloat16`` stores `w` in BF16 after a
+    round-up bump. The bound stays strict for *any* positive weight vector as
+    long as ``rho`` is computed with the same stored `w` (weighted
+    Cauchy-Schwarz), so `rho` is derived from the cast value.
+    """
     stats = prefix.get("diag_ell_stats")
     if stats is None:
         k_bar = prefix["k_bar"].float()
@@ -57,7 +65,9 @@ def diag_ell_stats(prefix):
             prefix["k_max"].float() - k_bar,
             k_bar - prefix["k_min"].float(),
         ).clamp_min(1e-6)  # (kv, n_blocks, d)
-        rho = _masked_weighted_radius(prefix, inv_w2=w.pow(-2))
+        if os.environ.get("CONDITION_BLOCK_BALL_W_DTYPE") == "bfloat16":
+            w = (w * (1.0 + 2.0**-7)).to(torch.bfloat16)
+        rho = _masked_weighted_radius(prefix, inv_w2=w.float().pow(-2))
         stats = (w, rho)
         prefix["diag_ell_stats"] = stats
     return stats
@@ -72,7 +82,7 @@ def _ball_delta(q_grouped, prefix, scale):
 def _diag_ell_delta(q_grouped, prefix, scale):
     w, rho = diag_ell_stats(prefix)
     qw = torch.sqrt(
-        torch.einsum("gsqd,gbd->gsqb", q_grouped.float().pow(2), w.pow(2)).clamp_min(0.0)
+        torch.einsum("gsqd,gbd->gsqb", q_grouped.float().pow(2), w.float().pow(2)).clamp_min(0.0)
     ).to(q_grouped.dtype)
     return rho.to(q_grouped.dtype)[:, None, None, :] * qw / scale
 

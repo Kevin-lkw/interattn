@@ -10,6 +10,7 @@ the eager diag_ell reference.
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -85,10 +86,9 @@ def main():
             device=device,
             dtype=torch.bfloat16,
         )
-        w, rho = diag_ell_stats(prefix)  # build w/rho outside the timed region
         if args.w_dtype == "bfloat16":
-            # Round-up cast keeps delta a strict over-estimate (sound).
-            prefix["diag_ell_stats"] = ((w * (1.0 + 2.0**-7)).to(torch.bfloat16), rho)
+            os.environ["CONDITION_BLOCK_BALL_W_DTYPE"] = "bfloat16"
+        diag_ell_stats(prefix)  # build w/rho outside the timed region
 
         ws_box, ws_diag = {}, {}
         _, s_box, delta_box, _, glob_box, _, _ = core._run_condition_block_selection_stats(

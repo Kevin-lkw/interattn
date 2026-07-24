@@ -172,7 +172,7 @@ def check_gen_harness(device):
     w, rho = diag_ell_stats(prefix)
     diag_delta = (
         rho[:, None, None, :]
-        * torch.sqrt(torch.einsum("gsqd,gbd->gsqb", qf.pow(2), w.pow(2)))
+        * torch.sqrt(torch.einsum("gsqd,gbd->gsqb", qf.pow(2), w.float().pow(2)))
         / scale
     )
     assert (diag_delta[exists] >= exact_delta[exists] - 1e-4).all(), "diag_ell delta unsound"

@@ -493,13 +493,19 @@ Byte theory allows +32% at 128K (stats stream 26.4 -> 18.0 MB/layer); the
 realized +17% is the familiar latency-bound halving, but a clearly larger
 increment than the BF16-w step.
 
-In-situ decode attribution for this config is still pending: the one attempt
-(2026-07-24) ran time-sliced against a co-tenant process that had landed on
-GPU 7 mid-run (all categories uniformly ~2.2x slow, GEMV 23.8 ms/step vs the
-usual 10.8) and was discarded. Extrapolating the cold-L2 kernel increment
-onto the last clean attribution (stats ~976 us/step at 128K) puts the
-attention phase at ~1.86 ms/step, ~7.2x vs full — to be confirmed on an
-exclusive GPU.
+Official decode attribution (exclusive GPU 7, GEMV canary 10.8-11.0 ms/step
+confirming no co-tenant; a first attempt that ran time-sliced against a
+process that landed on GPU 7 mid-run was discarded):
+
+| context | attention us/step (+BF16 w -> +BF16 k_bar) | vs full attn | e2e ms/step |
+|---:|---|---:|---:|
+| 32K | 1308 -> 1236 | 2.00x -> **2.11x** | 14.69 |
+| 64K | 1540 -> 1381 | 4.69x -> **5.23x** | 15.42 |
+| 128K | 2026 -> 1913 | 6.60x -> **6.99x** | 17.09 |
+
+In-situ selection at 128K drops 976 -> 828 us/step (-15%, matching the
+cold-L2 -17%); finalize/reduce are unchanged (999/86 us). e2e stays on the
+GEMV wall as always. Data: `cb_attr_ball_diag_mixed_bf16w_bf16kbar.jsonl`.
 
 ## Final summary (diag_ell round)
 

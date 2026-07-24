@@ -176,10 +176,15 @@ from it, so delta stays a strict bound around the stored center.
   dtype step). The summary read cost per block drops to 516 B ~ 1 BF16
   token (K+V), i.e. the stats byte floor now sits essentially at the
   "full-attention / block-size" level (see the selection-vs-full/B analysis).
-- In-situ attribution: pending an exclusive GPU (the first attempt was
-  time-sliced against a co-tenant process and discarded). Extrapolating the
-  kernel increment onto the last clean run: stats ~976 -> ~810 us/step at
-  128K, attention ~2.03 -> ~1.86 ms/step, **~7.2x vs full (estimate)**.
+- In-situ attribution (exclusive GPU, GEMV canary 10.8-11.0 ms/step):
+  attention 1308 -> 1236 / 1540 -> 1381 / 2026 -> 1913 us/step at
+  32K/64K/128K, i.e. **2.11x / 5.23x / 6.99x vs full** (from 2.00/4.69/6.60).
+  Selection at 128K: 976 -> 828 us/step (-15%, matching cold-L2); finalize
+  unchanged (999 us) and is now clearly the dominant attention kernel at
+  every context. e2e 14.69/15.42/17.09 ms/step — flat, GEMV wall.
+  The *sound*-dtype ceiling stays ~6.6x (BF16 k_bar is approximate); with
+  the approximate center accepted, the measured dtype-exhausted ceiling at
+  128K moves to **~7.0x**.
 
 Remaining attention-side levers after the dtype rounds:
 
